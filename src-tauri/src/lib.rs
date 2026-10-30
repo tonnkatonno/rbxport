@@ -32,6 +32,7 @@ mod diagnostics;
 mod explorer;
 mod device_library;
 mod link;
+mod local_api;
 mod rx3_link;
 mod network_labels;
 pub mod logging;
@@ -439,6 +440,8 @@ pub fn run() {
             screen_cache::initialize(app.handle());
             // Listens only in a debug build asked to (`RBXPORT_TEST_PORT`).
             crate::test_port::start(app.handle());
+            // This fork only: a local API for a companion app, off unless RBXPORT_API_PORT is set.
+            crate::local_api::start(app.handle());
             // AppleScript: the bridge to the window, and on macOS the
             // scriptable classes, before any Apple Event can arrive.
             crate::scripting::install(app.handle());
