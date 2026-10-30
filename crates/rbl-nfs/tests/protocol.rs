@@ -628,8 +628,11 @@ fn attributes_describe_a_read_only_tree() {
     reader.u32().unwrap(); // uid: the host's
     reader.u32().unwrap(); // gid: the host's
     assert_eq!(reader.u32().unwrap(), 40_000, "size");
-    reader.u32().unwrap(); // blocksize: the host's
-    reader.u32().unwrap(); // rdev: the host's
+    // A Windows host shows what rekordbox on Windows showed a CDJ-2000NXS2: 512-byte blocks, rdev 1.
+    let (blocksize, rdev) = (reader.u32().unwrap(), reader.u32().unwrap());
+    if cfg!(windows) {
+        assert_eq!((blocksize, rdev), (512, 1), "rekordbox on Windows: 512-byte blocks, rdev 1");
+    }
     reader.u32().unwrap(); // blocks: the host's
     assert_eq!(reader.u32().unwrap(), 2, "fsid, as rekordbox reports it");
 
@@ -641,7 +644,8 @@ fn attributes_describe_a_read_only_tree() {
     let mut reader = ok_reader(&reply);
     assert_eq!(reader.u32().unwrap(), nfs_status::OK);
     assert_eq!(reader.u32().unwrap(), 2, "directory");
-    assert_eq!(reader.u32().unwrap(), 0o040_755, "rekordbox's export root showed 041ed");
+    let mode = if cfg!(windows) { 0o040_666 } else { 0o040_755 };
+    assert_eq!(reader.u32().unwrap(), mode, "rekordbox's export root showed 041ed on macOS, 040666 on Windows");
 }
 
 /// Reads a whole file using the CDJ's 32 KB request size, continuing until

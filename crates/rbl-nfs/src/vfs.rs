@@ -129,14 +129,18 @@ impl Stat {
     /// A plain readable file of `size` bytes, changed at `modified`: what a
     /// node given its size at insertion reports.
     pub fn plain(size: u64, modified: u32) -> Self {
+        // On a Windows host rekordbox reported 512-byte blocks and an rdev of 1 to a CDJ-2000NXS2 [OBS capture
+        // 2026-10-30]. That player sizes its READs from the block size: 16 KiB at 512, 2 KiB at 4096 (the product is
+        // 8 MiB both ways), and at 2 KiB a FLAC is read through in 25 s per pass and never finishes loading.
+        let (blocksize, rdev) = if cfg!(windows) { (512, 1) } else { (4096, 0) };
         Self {
             size,
             mode: 0o100_444,
             nlink: 1,
             uid: 0,
             gid: 0,
-            blocksize: 4096,
-            rdev: 0,
+            blocksize,
+            rdev,
             blocks: u32::try_from(size.div_ceil(512)).unwrap_or(u32::MAX),
             accessed: modified,
             modified,
@@ -148,6 +152,23 @@ impl Stat {
     /// not the host's, so they carry what rekordbox's export root showed a
     /// player in the capture: mode `041ed`, two links, 64 bytes.
     pub fn directory(modified: u32) -> Self {
+        if cfg!(windows) {
+            // What rekordbox on Windows showed a CDJ-2000NXS2 [OBS capture 2026-10-30]: mode `040666`, one link, no
+            // size, one 512-byte block, rdev 1.
+            return Self {
+                size: 0,
+                mode: 0o040_666,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                blocksize: 512,
+                rdev: 1,
+                blocks: 1,
+                accessed: modified,
+                modified,
+                changed: modified,
+            };
+        }
         Self {
             size: 64,
             mode: 0o040_755,
