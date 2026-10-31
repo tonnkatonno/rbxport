@@ -45,6 +45,7 @@ mod browse_settings;
 mod protocol;
 mod relocate;
 mod sync_window;
+mod next_window;
 mod report;
 mod scripting;
 mod device_settings;
@@ -484,7 +485,7 @@ pub fn run() {
         // Windows, where the main window's close box is the way out).
         .on_window_event(|window, event| {
             if window.label() == MAIN_WINDOW && matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
-                for label in [crate::preferences::WINDOW, crate::sync_window::WINDOW, crate::log_window::WINDOW] {
+                for label in [crate::preferences::WINDOW, crate::sync_window::WINDOW, crate::next_window::WINDOW, crate::log_window::WINDOW] {
                     if let Some(extra) = window.app_handle().get_webview_window(label) {
                         let _ = extra.close();
                     }
@@ -619,6 +620,8 @@ pub fn run() {
             relocate::relocate_by_location,
             preferences::open_preferences,
             sync_window::open_sync_window,
+            next_window::open_next_window,
+            next_window::suggest_next,
             report::open_report_window,
             report::report_attachment,
             report::open_report_attachment,

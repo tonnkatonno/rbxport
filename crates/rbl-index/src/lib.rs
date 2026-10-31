@@ -21,6 +21,7 @@ pub mod folder;
 pub mod key;
 mod load;
 mod related;
+pub mod suggest;
 pub mod smart;
 pub mod strings;
 pub mod testing;

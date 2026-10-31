@@ -14,7 +14,7 @@ import type {
   ExportProgress, ExportReport, ExplorerChildren, ExplorerRoot, FilterValues, FolderPlaylistReport, Phrase, ImportReport,
   DatabaseDrive, EditHistoryState, ItunesLibrary, LibraryProblem, LibrarySummary, LinkPeerSeen, Meters,
   LinkStatus, MissingExportFile, MissingTrack, MissingTracks, PreviewState, UnanalysedTracks, ReferenceStickSettings, RelocateReport, RowDto, ScriptRequest, Tick,
-  TreeNode, ViewHandle,
+  TreeNode, ViewHandle, NextResult,
   SelectionDetails, TrackDetails, TrackLookups,
 } from "./types";
 import { tauriInvoke } from "./invoke";
@@ -570,6 +570,11 @@ async function realBackend(): Promise<Backend> {
       await invoke<void>("open_sync_window");
       return true;
     },
+    openNextWindow: async () => {
+      await invoke<void>("open_next_window");
+      return true;
+    },
+    suggestNext: (playlist, seed, mode, limit) => invoke<NextResult>("suggest_next", { playlist, seed, mode, limit: limit ?? null }),
     syncDevices: (playlists, destinations, defaults, automatic, ejectAfterSync, deleteUnlistedMusic, compatibilityFormat, verifyAll) =>
       invoke<SyncDeviceReport[]>("sync_devices", {
         playlists,

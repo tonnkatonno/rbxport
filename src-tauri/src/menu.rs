@@ -123,6 +123,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     build_with_labels(app, &Labels::new())
 }
 
+#[allow(clippy::too_many_lines, reason = "one block per menu, and that is the whole function")]
 fn build_with_labels<R: Runtime>(app: &AppHandle<R>, labels: &Labels) -> tauri::Result<Menu<R>> {
     let settings = MenuItemBuilder::with_id("settings", label(labels, "Settings…"))
         .accelerator("CmdOrCtrl+,")
@@ -219,6 +220,12 @@ fn build_with_labels<R: Runtime>(app: &AppHandle<R>, labels: &Labels) -> tauri::
         .item(
             &MenuItemBuilder::with_id("sub", label(labels, "Sub-Browser Window"))
                 .accelerator("CmdOrCtrl+B")
+                .build(app)?,
+        )
+        // Fork only: what to play after a playlist's last track (see `next_window.rs`).
+        .item(
+            &MenuItemBuilder::with_id("next-window", label(labels, "Next Window"))
+                .accelerator("Shift+CmdOrCtrl+N")
                 .build(app)?,
         )
         .separator()
@@ -503,6 +510,16 @@ pub fn on_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
             let full = window.is_fullscreen().unwrap_or(false);
             let _ = window.set_fullscreen(!full);
         }
+        return;
+    }
+    // Opened here rather than in the webview, which has no part in it.
+    if id == "next-window" {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = crate::next_window::open_next_window(app.clone()).await {
+                tracing::warn!(%error.message, "the Next window did not open");
+            }
+        });
         return;
     }
     let _ = app.emit(EVENT, id);

@@ -29,6 +29,8 @@ const report = window.location.hash.startsWith("#report");
 const preferences = window.location.hash.startsWith("#preferences");
 const sync = window.location.hash.startsWith("#sync");
 const log = window.location.hash.startsWith("#log");
+// Fork only: the Next window, `#next` (see `views/next/NextWindow.tsx`).
+const next = window.location.hash.startsWith("#next");
 
 function mount(view: ReactNode) {
   root.render(
@@ -50,6 +52,7 @@ function secondaryWindow(): Promise<ReactNode> | null {
   if (sync) return import("./views/sync/SyncWindow").then(({ SyncWindow }) => <SyncWindow />);
   if (report) return import("./views/report/ReportBug").then(({ ReportWindow }) => <ReportWindow />);
   if (log) return import("./views/log/LogView").then(({ LogWindow }) => <LogWindow />);
+  if (next) return import("./views/next/NextWindow").then(({ NextWindow }) => <NextWindow />);
   return null;
 }
 
@@ -57,6 +60,6 @@ function secondaryWindow(): Promise<ReactNode> | null {
 // production bundle can share code back into this module, so a top-level await
 // on that dynamic import would leave both sides waiting and the window blank.
 const view = secondaryWindow();
-const browse = preferences || sync || log ? Promise.resolve() : syncRekordboxBrowseAtStartup().catch(() => {});
+const browse = preferences || sync || log || next ? Promise.resolve() : syncRekordboxBrowseAtStartup().catch(() => {});
 const mainWindow = view ?? import("./app/App").then(({ App }) => <App />);
 void Promise.all([mainWindow, browse]).then(([element]) => mount(element));

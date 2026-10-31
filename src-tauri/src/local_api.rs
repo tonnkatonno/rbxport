@@ -361,6 +361,7 @@ fn add_tracks(app: &AppHandle, state: &AppState, id: &str, body: &[u8], allow_wr
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

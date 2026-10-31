@@ -132,6 +132,41 @@ export interface ListTotals {
   bytes: number;
 }
 
+/** How the next track is played with the last one. */
+export type NextMode = "transition" | "double";
+
+export interface NextTrack {
+  id: string;
+  title: string;
+  artist: string;
+  key: string;
+  bpm: number;
+  /** Mixed In Key energy read from the comment; 0 when there is none. */
+  energy: number;
+  lengthSec: number;
+}
+
+export interface NextItem {
+  track: NextTrack;
+  /** 0 to 100. */
+  score: number;
+  keyDistance: number;
+  /** SAME, STEP, PARALLEL, ENERGY_BOOST, JAWS or MOOD_SHIFTER. */
+  transition: string;
+  bpmDiffPct: number;
+  energyDiff: number;
+  /** How many times it came right after the seed in the library's own playlists and history sessions. */
+  followed: number;
+}
+
+export interface NextResult {
+  playlistId: string;
+  playlistName: string;
+  tracks: NextTrack[];
+  seed: NextTrack | null;
+  items: NextItem[];
+}
+
 export interface TreeNode {
   id: string;
   name: string;
@@ -924,6 +959,19 @@ export interface Backend {
    * manager over itself instead.
    */
   openSyncWindow(): Promise<boolean>;
+  /**
+   * Opens the Next window (what to play after a playlist's last track), or
+   * brings the open one to the front. False in a browser, where there are no
+   * windows. Fork only.
+   */
+  openNextWindow(): Promise<boolean>;
+  /**
+   * A playlist as it is now, the seed the suggestions follow (its last track
+   * unless `seed` names one) and the tracks of the library that fit it, best
+   * first. `mode` is a plain transition or a double drop (two tracks at once:
+   * a tighter tempo, energy and key).
+   */
+  suggestNext(playlist: string, seed: string | null, mode: NextMode, limit?: number): Promise<NextResult>;
   openReportWindow(): Promise<boolean>;
   reportAttachment(): Promise<string>;
   openReportAttachment(attachment: string): Promise<void>;
