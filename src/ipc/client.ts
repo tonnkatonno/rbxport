@@ -14,7 +14,7 @@ import type {
   ExportProgress, ExportReport, ExplorerChildren, ExplorerRoot, FilterValues, FolderPlaylistReport, Phrase, ImportReport,
   DatabaseDrive, EditHistoryState, ItunesLibrary, LibraryProblem, LibrarySummary, LinkPeerSeen, Meters,
   LinkStatus, MissingExportFile, MissingTrack, MissingTracks, PreviewState, UnanalysedTracks, ReferenceStickSettings, RelocateReport, RowDto, ScriptRequest, Tick,
-  TreeNode, ViewHandle, NextResult,
+  TreeNode, ViewHandle, NextBuild, NextResult,
   SelectionDetails, TrackDetails, TrackLookups,
 } from "./types";
 import { tauriInvoke } from "./invoke";
@@ -575,6 +575,7 @@ async function realBackend(): Promise<Backend> {
       return true;
     },
     suggestNext: (playlist, seed, mode, limit) => invoke<NextResult>("suggest_next", { playlist, seed, mode, limit: limit ?? null }),
+    buildNext: (playlist, seed, pattern, length, variety) => invoke<NextBuild>("build_next", { playlist, seed, pattern, length, variety }),
     syncDevices: (playlists, destinations, defaults, automatic, ejectAfterSync, deleteUnlistedMusic, compatibilityFormat, verifyAll) =>
       invoke<SyncDeviceReport[]>("sync_devices", {
         playlists,
@@ -644,6 +645,7 @@ async function realBackend(): Promise<Backend> {
       deletePlaylist: (id) => invoke<EditHistoryState>("delete_playlist", { id }),
       undoEdit: () => invoke<EditHistoryState>("undo_edit"),
       redoEdit: () => invoke<EditHistoryState>("redo_edit"),
+      createPlaylistWithTracks: (name, tracks) => invoke<number>("create_playlist_with_tracks", { name, tracks }),
       addTracksToPlaylist: (playlist, tracks, allowDuplicates) =>
         invoke<number>("add_tracks_to_playlist", { playlist, tracks, allowDuplicates }),
       playlistDuplicates: (playlist, tracks) =>

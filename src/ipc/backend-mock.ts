@@ -1031,6 +1031,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       await bump(false);
       return announceHistory();
     },
+    createPlaylistWithTracks: () => Promise.reject(new Error("Building a playlist requires the desktop app.")),
     addTracksToPlaylist: (playlist, tracks, allowDuplicates = false) => {
       // The real backend refuses while Rekordbox holds the database; the mock
       // never does, so the happy path is what `pnpm dev:mock` exercises.
@@ -2111,6 +2112,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     openSyncWindow: () => wait(false),
     openNextWindow: () => wait(false),
     suggestNext: (playlist) => wait({ playlistId: playlist, playlistName: "Preview", tracks: [], seed: null, items: [] }),
+    buildNext: () => Promise.reject(new Error("Building a playlist requires the desktop app.")),
     // Stick after stick, each announced before and after, as the real run
     // is. A destination that is not a mock device is a stick that was
     // pulled: its entry carries the error and the others their reports.

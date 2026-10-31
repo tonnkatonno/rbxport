@@ -1,16 +1,20 @@
 /**
- * The Next window: what to play after a playlist's last track.
+ * The Next window: what to play after a playlist's last track, and a chain built from it.
  *
  * Fork only. Pick a plain playlist and the window lists it beside the tracks of the library that fit its last one (or the
  * track clicked in the list): a plain transition, or a double drop, which is stricter about tempo, energy and key because
  * the two tracks play at once. A preview plays a suggestion without loading it, and "Add" puts it at the end of the
  * playlist through the ordinary edit, so the window asks again when `library:changed` arrives and the list grows in step
  * with the library, in rbxport or from another program.
+ *
+ * "Build" makes a whole run of tracks from the same start: a pattern of `T` (transition) and `D` (double drop), one letter
+ * a track, repeating to the length asked for. The chain is only shown until "Create playlist" makes a playlist of it (the
+ * start track first), or "Add all" puts it at the end of the playlist picked.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { getBackend } from "@/ipc/client";
-import type { NextMode, NextResult, NextTrack, TreeNode } from "@/ipc/types";
+import type { NextBuild, NextMode, NextResult, NextTrack, TreeNode } from "@/ipc/types";
 import { useTranslation } from "@/i18n";
 import { refusal } from "@/lib/menu";
 import { startWindowDrag } from "@/lib/windowDrag";
@@ -22,28 +26,46 @@ import styles from "./NextWindow.module.css";
 const STORAGE_KEY = "rbxport.next";
 /** How many suggestions one request asks for. */
 const LIMIT = 80;
+/** The most tracks one build makes, as the backend allows. */
+const MAX_LENGTH = 60;
+const DEFAULT_PATTERN = "DT";
+const DEFAULT_LENGTH = 8;
+
+type View = "suggest" | "build";
 
 function message(error: unknown): string {
   if (error && typeof error === "object" && "message" in error && typeof error.message === "string") return error.message;
   return String(error);
 }
 
-/** What the window remembers between runs: the playlist and the mode. */
-function remembered(): { playlist: string; mode: NextMode } {
+interface Remembered {
+  playlist: string;
+  mode: NextMode;
+  view: View;
+  pattern: string;
+  length: number;
+}
+
+/** What the window remembers between runs. */
+function remembered(): Remembered {
+  const plain: Remembered = { playlist: "", mode: "transition", view: "suggest", pattern: DEFAULT_PATTERN, length: DEFAULT_LENGTH };
   try {
-    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}") as { playlist?: unknown; mode?: unknown };
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}") as Partial<Record<keyof Remembered, unknown>>;
     return {
-      playlist: typeof stored.playlist === "string" ? stored.playlist : "",
+      playlist: typeof stored.playlist === "string" ? stored.playlist : plain.playlist,
       mode: stored.mode === "double" ? "double" : "transition",
+      view: stored.view === "build" ? "build" : "suggest",
+      pattern: typeof stored.pattern === "string" && stored.pattern.length > 0 ? stored.pattern : plain.pattern,
+      length: typeof stored.length === "number" && stored.length >= 1 ? Math.min(MAX_LENGTH, Math.floor(stored.length)) : plain.length,
     };
   } catch {
-    return { playlist: "", mode: "transition" };
+    return plain;
   }
 }
 
-function remember(playlist: string, mode: NextMode): void {
+function remember(state: Remembered): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ playlist, mode }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   } catch { /* Private browsing or a full quota: the choice is just not kept. */ }
 }
 
@@ -56,15 +78,25 @@ function tempo(track: NextTrack): string {
   return track.bpm > 0 ? track.bpm.toFixed(2) : "";
 }
 
+/** The letters a pattern may hold, with the separators the backend ignores. */
+const PATTERN_OK = /^[TtDd\s,\-/>+·]*[TtDd][TtDd\s,\-/>+·]*$/;
+
 export function NextWindow() {
   const t = useTranslation();
   const initial = useMemo(remembered, []);
   const [lists, setLists] = useState<TreeNode[] | null>(null);
   const [playlist, setPlaylist] = useState(initial.playlist);
   const [mode, setMode] = useState<NextMode>(initial.mode);
+  const [view, setView] = useState<View>(initial.view);
+  const [pattern, setPattern] = useState(initial.pattern);
+  const [length, setLength] = useState(initial.length);
   // The track the suggestions follow; null is the playlist's last one, and follows it as tracks are added.
   const [seed, setSeed] = useState<string | null>(null);
   const [result, setResult] = useState<NextResult | null>(null);
+  const [built, setBuilt] = useState<NextBuild | null>(null);
+  // Counts the "Shuffle" presses: each one picks differently among equally good tracks.
+  const [variety, setVariety] = useState(0);
+  const [nameDraft, setNameDraft] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ text: string; failed: boolean } | null>(null);
   const [loaded, setLoaded] = useState(false);
   const request = useRef(0);
@@ -102,7 +134,9 @@ export function NextWindow() {
 
   useEffect(() => { void loadLists(); }, [loadLists]);
   useEffect(() => { void refresh(); }, [refresh]);
-  useEffect(() => { remember(playlist, mode); }, [playlist, mode]);
+  useEffect(() => { remember({ playlist, mode, view, pattern, length }); }, [playlist, mode, view, pattern, length]);
+  // A chain belongs to the start it was built from.
+  useEffect(() => { setBuilt(null); setNameDraft(null); }, [playlist, seed]);
 
   // The library changed (an edit here, or another program's): the playlist may have grown or been renamed.
   useEffect(() => {
@@ -144,6 +178,48 @@ export function NextWindow() {
     }).catch(fail);
   };
 
+  const patternValid = PATTERN_OK.test(pattern);
+  const build = (nextVariety: number) => {
+    setVariety(nextVariety);
+    void getBackend().then(async (backend) => {
+      const chain = await backend.buildNext(playlist, seed, pattern, length, nextVariety);
+      setBuilt(chain);
+      setNameDraft(null);
+      setNotice(chain.steps.length === 0 ? { text: t("Nothing in the library fits the start track."), failed: true } : null);
+    }).catch((error: unknown) => { setBuilt(null); fail(error); });
+  };
+
+  const chainIds = built ? built.steps.map((step) => step.item.track.id) : [];
+  const defaultName = built ? `${built.seed.title} · ${pattern.replace(/[^TtDd]/g, "").toUpperCase()}` : "";
+  const chainName = (nameDraft ?? defaultName).trim();
+
+  const createChain = () => {
+    if (!built) return;
+    if (protectLibrary) {
+      setNotice({ text: t(refusal(true)), failed: true });
+      return;
+    }
+    void getBackend().then(async (backend) => {
+      await backend.edits.createPlaylistWithTracks(chainName, [built.seed.id, ...chainIds]);
+      setNotice({ text: t("Created “{name}” with {count} tracks.", { name: chainName, count: chainIds.length + 1 }), failed: false });
+    }).catch(fail);
+  };
+
+  const addChain = () => {
+    if (!built) return;
+    if (protectLibrary) {
+      setNotice({ text: t(refusal(true)), failed: true });
+      return;
+    }
+    void getBackend().then(async (backend) => {
+      await backend.edits.addTracksToPlaylist(playlist, chainIds);
+      // The playlist grew: the chain was built from where it used to end.
+      setSeed(null);
+      setBuilt(null);
+      setNotice({ text: t("Added {count} tracks to “{name}”.", { count: chainIds.length, name: result?.playlistName ?? "" }), failed: false });
+    }).catch(fail);
+  };
+
   useEffect(() => {
     if (!notice || notice.failed) return;
     const timer = setTimeout(() => setNotice(null), 3000);
@@ -153,6 +229,13 @@ export function NextWindow() {
   const seedId = result?.seed?.id ?? null;
   const lastId = result?.tracks.at(-1)?.id ?? null;
   const close = () => { void getBackend().then((backend) => backend.closeWindow()); };
+
+  /** The play button every track row has. */
+  const playButton = (track: NextTrack) => (
+    <button type="button" className={styles.play} data-on={playing === track.id || undefined}
+      aria-label={playing === track.id ? t("Stop the preview") : t("Preview")}
+      onClick={() => preview(track)}>{playing === track.id ? "■" : "▶"}</button>
+  );
 
   return (
     <section className={styles.window} role="dialog" aria-label={t("Next")}>
@@ -167,18 +250,47 @@ export function NextWindow() {
             ))}
           </select>
         </label>
-        <div className={styles.modes} role="radiogroup" aria-label={t("Mode")}>
-          {(["transition", "double"] as const).map((choice) => (
-            <button key={choice} type="button" role="radio" aria-checked={mode === choice} data-on={mode === choice || undefined}
-              onClick={() => setMode(choice)}>{choice === "transition" ? t("Transition") : t("Double drop")}</button>
+        <div className={styles.modes} role="radiogroup" aria-label={t("View")}>
+          {(["suggest", "build"] as const).map((choice) => (
+            <button key={choice} type="button" role="radio" aria-checked={view === choice} data-on={view === choice || undefined}
+              onClick={() => setView(choice)}>{choice === "suggest" ? t("Suggestions") : t("Build")}</button>
           ))}
         </div>
+        {view === "suggest" ? (
+          <div className={styles.modes} role="radiogroup" aria-label={t("Mode")}>
+            {(["transition", "double"] as const).map((choice) => (
+              <button key={choice} type="button" role="radio" aria-checked={mode === choice} data-on={mode === choice || undefined}
+                onClick={() => setMode(choice)}>{choice === "transition" ? t("Transition") : t("Double drop")}</button>
+            ))}
+          </div>
+        ) : null}
         <button type="button" disabled={seed === null} onClick={() => setSeed(null)}>{t("Follow the last track")}</button>
         <span className={styles.count}>
-          {result ? t("{count} suggestions", { count: result.items.length }) : ""}
+          {view === "suggest" && result ? t("{count} suggestions", { count: result.items.length }) : ""}
         </span>
         <button type="button" onClick={close}>{t("Close")}</button>
       </div>
+      {view === "build" ? (
+        <div className={styles.buildBar}>
+          <label className={styles.patternBox}>
+            <span>{t("Pattern")}</span>
+            <input type="text" value={pattern} spellCheck={false} aria-invalid={!patternValid || undefined}
+              title={t("T is a transition, D is a double drop, one letter a track; it repeats to the length, for example DT or TTD")}
+              onChange={(event) => setPattern(event.target.value)} />
+          </label>
+          <label className={styles.countBox}>
+            <span>{t("Tracks")}</span>
+            <input type="number" min={1} max={MAX_LENGTH} value={length}
+              onChange={(event) => setLength(Math.min(MAX_LENGTH, Math.max(1, Math.floor(Number(event.target.value)) || 1)))} />
+          </label>
+          <button type="button" disabled={!playlist || !patternValid} onClick={() => build(0)}>{t("Build chain")}</button>
+          <button type="button" disabled={!built} title={t("Another chain: equally good tracks are picked differently")}
+            onClick={() => build(variety + 1)}>{t("Shuffle")}</button>
+          <span className={styles.count}>
+            {built ? t("{count} of {requested} tracks", { count: built.steps.length, requested: built.requested }) : ""}
+          </span>
+        </div>
+      ) : null}
 
       <div className={styles.panes}>
         <div className={styles.pane} aria-label={t("The playlist")}>
@@ -199,40 +311,76 @@ export function NextWindow() {
           </div>
         </div>
 
-        <div className={styles.pane} aria-label={t("Suggestions")}>
-          <h2>{result?.seed ? t("After “{title}”", { title: result.seed.title }) : t("Suggestions")}</h2>
-          <div className={styles.rows} role="list">
-            {!playlist ? <p className={styles.note}>{t("Pick a playlist to see what fits after its last track.")}</p> : null}
-            {playlist && result && !result.seed ? <p className={styles.note}>{t("Nothing to follow yet.")}</p> : null}
-            {result?.seed && result.items.length === 0
-              ? <p className={styles.note}>{result.seed.key && result.seed.bpm > 0
-                ? t("Nothing in the library fits.") : t("The track has no key or tempo to match on.")}</p> : null}
-            {(result?.items ?? []).map((item) => (
-              <div key={item.track.id} role="listitem" className={styles.suggestion}>
-                <button type="button" className={styles.play} data-on={playing === item.track.id || undefined}
-                  aria-label={playing === item.track.id ? t("Stop the preview") : t("Preview")}
-                  onClick={() => preview(item.track)}>{playing === item.track.id ? "■" : "▶"}</button>
-                <span className={styles.score} title={t("How well it fits, out of 100")}>
-                  <i style={{ width: `${Math.round(item.score)}%` }} />
-                  <b>{Math.round(item.score)}</b>
-                </span>
-                <span className={styles.name}><b>{item.track.title}</b><i>{item.track.artist}</i></span>
-                <span className={styles.key}>{item.track.key}</span>
-                <span className={styles.bpm}>{tempo(item.track)}</span>
-                <span className={styles.delta} title={t("Tempo difference from the seed")}>
-                  {item.bpmDiffPct === 0 ? "±0%" : `${item.bpmDiffPct.toFixed(1)}%`}
-                </span>
-                <span className={styles.energy}>{item.track.energy > 0 ? `E${item.track.energy}` : ""}</span>
-                <span className={styles.length}>{clock(item.track.lengthSec)}</span>
-                <span className={styles.played} title={t("Played after the seed in your playlists or histories")}>
-                  {item.followed > 0 ? `★ ${item.followed}×` : ""}
-                </span>
-                <span className={styles.kind}>{item.transition.replace("_", " ")}</span>
-                <button type="button" className={styles.add} onClick={() => add(item.track)}>{t("Add")}</button>
-              </div>
-            ))}
+        {view === "suggest" ? (
+          <div className={styles.pane} aria-label={t("Suggestions")}>
+            <h2>{result?.seed ? t("After “{title}”", { title: result.seed.title }) : t("Suggestions")}</h2>
+            <div className={styles.rows} role="list">
+              {!playlist ? <p className={styles.note}>{t("Pick a playlist to see what fits after its last track.")}</p> : null}
+              {playlist && result && !result.seed ? <p className={styles.note}>{t("Nothing to follow yet.")}</p> : null}
+              {result?.seed && result.items.length === 0
+                ? <p className={styles.note}>{result.seed.key && result.seed.bpm > 0
+                  ? t("Nothing in the library fits.") : t("The track has no key or tempo to match on.")}</p> : null}
+              {(result?.items ?? []).map((item) => (
+                <div key={item.track.id} role="listitem" className={styles.suggestion}>
+                  {playButton(item.track)}
+                  <span className={styles.score} title={t("How well it fits, out of 100")}>
+                    <i style={{ width: `${Math.round(item.score)}%` }} />
+                    <b>{Math.round(item.score)}</b>
+                  </span>
+                  <span className={styles.name}><b>{item.track.title}</b><i>{item.track.artist}</i></span>
+                  <span className={styles.key}>{item.track.key}</span>
+                  <span className={styles.bpm}>{tempo(item.track)}</span>
+                  <span className={styles.delta} title={t("Tempo difference from the seed")}>
+                    {item.bpmDiffPct === 0 ? "±0%" : `${item.bpmDiffPct.toFixed(1)}%`}
+                  </span>
+                  <span className={styles.energy}>{item.track.energy > 0 ? `E${item.track.energy}` : ""}</span>
+                  <span className={styles.length}>{clock(item.track.lengthSec)}</span>
+                  <span className={styles.played} title={t("Played after the seed in your playlists or histories")}>
+                    {item.followed > 0 ? `★ ${item.followed}×` : ""}
+                  </span>
+                  <span className={styles.kind}>{item.transition.replace("_", " ")}</span>
+                  <button type="button" className={styles.add} onClick={() => add(item.track)}>{t("Add")}</button>
+                </div>
+              ))}
+            </div>
           </div>
-        </div>
+        ) : (
+          <div className={styles.pane} aria-label={t("Chain")}>
+            <h2>{built ? t("Chain after “{title}”", { title: built.seed.title }) : t("Chain")}</h2>
+            <div className={styles.rows} role="list">
+              {!playlist ? <p className={styles.note}>{t("Pick a playlist to start from its last track.")}</p> : null}
+              {playlist && !built
+                ? <p className={styles.note}>{t("Choose a pattern and the number of tracks, then Build. Click a track of the playlist to start from it.")}</p> : null}
+              {built && built.steps.length < built.requested && built.steps.length > 0
+                ? <p className={styles.note}>{t("Nothing fitted after track {count}, so the chain stops there.", { count: built.steps.length })}</p> : null}
+              {(built?.steps ?? []).map((step, index) => (
+                <div key={step.item.track.id} role="listitem" className={styles.suggestion}>
+                  {playButton(step.item.track)}
+                  <span className={styles.num}>{index + 1}</span>
+                  <span className={styles.stepMode} data-mode={step.mode}
+                    title={step.mode === "D" ? t("Double drop with the track before") : t("Transition from the track before")}>{step.mode}</span>
+                  <span className={styles.name}><b>{step.item.track.title}</b><i>{step.item.track.artist}</i></span>
+                  <span className={styles.key}>{step.item.track.key}</span>
+                  <span className={styles.bpm}>{tempo(step.item.track)}</span>
+                  <span className={styles.energy}>{step.item.track.energy > 0 ? `E${step.item.track.energy}` : ""}</span>
+                  <span className={styles.length}>{clock(step.item.track.lengthSec)}</span>
+                  <span className={styles.played} title={t("Played after the track before in your playlists or histories")}>
+                    {step.item.followed > 0 ? `★ ${step.item.followed}×` : ""}
+                  </span>
+                  <span className={styles.kind}>{step.item.transition.replace("_", " ")}</span>
+                </div>
+              ))}
+            </div>
+            {built && built.steps.length > 0 ? (
+              <div className={styles.chainFooter}>
+                <input type="text" className={styles.nameBox} aria-label={t("Name of the new playlist")} value={nameDraft ?? defaultName}
+                  onChange={(event) => setNameDraft(event.target.value)} />
+                <button type="button" className={styles.add} disabled={chainName === ""} onClick={createChain}>{t("Create playlist")}</button>
+                <button type="button" className={styles.add} onClick={addChain}>{t("Add all to the playlist")}</button>
+              </div>
+            ) : null}
+          </div>
+        )}
       </div>
       {notice ? <p className={notice.failed ? styles.error : styles.status} role="status">{notice.text}</p> : null}
     </section>

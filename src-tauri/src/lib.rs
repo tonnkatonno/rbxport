@@ -622,6 +622,8 @@ pub fn run() {
             sync_window::open_sync_window,
             next_window::open_next_window,
             next_window::suggest_next,
+            next_window::build_next,
+            next_window::create_playlist_with_tracks,
             report::open_report_window,
             report::report_attachment,
             report::open_report_attachment,

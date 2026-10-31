@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import { __setBackend } from "@/ipc/client";
-import type { Backend, NextItem, NextResult, NextTrack } from "@/ipc/types";
+import type { Backend, NextBuild, NextItem, NextResult, NextTrack } from "@/ipc/types";
 import { PREFERENCES_KEY } from "@/lib/preferences";
 import { __resetPreview } from "@/store/usePreview";
 import { NextWindow } from "./NextWindow";
@@ -32,6 +32,14 @@ const result = (mode: string): NextResult => ({
 
 const suggestNext = vi.fn((_playlist: string, _seed: string | null, mode: string) => Promise.resolve(result(mode)));
 const addTracksToPlaylist = vi.fn((_playlist: string, _tracks: string[]) => Promise.resolve(1));
+const createPlaylistWithTracks = vi.fn((_name: string, _tracks: string[]) => Promise.resolve(1));
+// A chain of two tracks after the playlist's last one: a double drop, then a transition.
+const buildNext = vi.fn((_playlist: string, _seed: string | null, _pattern: string, length: number, _variety: number) =>
+  Promise.resolve<NextBuild>({
+    seed: playlist[1]!,
+    steps: [{ mode: "D", item: item(track("30", "Pair"), 2) }, { mode: "T", item: item(track("31", "Then")) }],
+    requested: length,
+  }));
 let libraryChanged: (() => void) | undefined;
 
 beforeEach(() => {
@@ -45,8 +53,9 @@ beforeEach(() => {
       { id: "7", name: "My set", kind: "playlist", depth: 2 },
     ]),
     suggestNext,
+    buildNext,
     onLibraryChanged: (listener: () => void) => { libraryChanged = listener; return () => { libraryChanged = undefined; }; },
-    edits: { addTracksToPlaylist },
+    edits: { addTracksToPlaylist, createPlaylistWithTracks },
     previewPlay: () => Promise.resolve(),
     previewStop: () => Promise.resolve(),
     previewState: () => Promise.resolve({ track: null, playing: false, positionMs: 0, durationMs: 0 }),
@@ -133,4 +142,80 @@ it("adds a suggestion and keeps saying so when the library change makes it ask a
   await flush();
   expect(suggestNext.mock.calls.length).toBeGreaterThan(asked);
   expect(host.querySelector("[role=status]")?.textContent).toBe("Added “Next Song”.");
+});
+
+function typeInto(input: HTMLInputElement, value: string) {
+  act(() => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
+const field = (label: string) => host.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`) ??
+  [...host.querySelectorAll("label")].find(l => l.textContent?.startsWith(label))!.querySelector("input")!;
+const chain = () => [...host.querySelectorAll("[role=list]")[1]!.querySelectorAll("[role=listitem]")].map(row => row.textContent);
+
+async function openBuild(protectLibrary: boolean) {
+  await open(protectLibrary);
+  act(() => button("Build").click());
+  await flush();
+  // The default pattern and length, built once.
+  act(() => button("Build chain").click());
+  await flush();
+}
+
+it("builds a chain from a pattern and a length, and shuffles for another", async () => {
+  await openBuild(true);
+  typeInto(field("Pattern"), "dt");
+  typeInto(field("Tracks"), "4");
+  act(() => button("Build chain").click());
+  await flush();
+  expect(buildNext).toHaveBeenLastCalledWith("7", null, "dt", 4, 0);
+  const rows = chain();
+  expect(rows).toHaveLength(2);
+  expect(rows[0]).toMatch(/^▶1DPair/);
+  expect(rows[0]).toContain("★ 2×");
+  expect(rows[1]).toMatch(/^▶2TThen/);
+  expect(host.textContent).toContain("2 of 4 tracks");
+  expect(host.textContent).toContain("Nothing fitted after track 2");
+
+  act(() => button("Shuffle").click());
+  await flush();
+  expect(buildNext).toHaveBeenLastCalledWith("7", null, "dt", 4, 1);
+});
+
+it("will not build from a pattern that is not made of T and D", async () => {
+  await openBuild(true);
+  typeInto(field("Pattern"), "DXT");
+  expect(button("Build chain").disabled).toBe(true);
+  typeInto(field("Pattern"), "T, D");
+  expect(button("Build chain").disabled).toBe(false);
+});
+
+it("creates a playlist from the chain, the start track first, under a name that can be changed", async () => {
+  await openBuild(false);
+  expect(field("Name of the new playlist").value).toBe("Last · DT");
+  typeInto(field("Name of the new playlist"), "  Friday warm-up ");
+  act(() => button("Create playlist").click());
+  await flush();
+  expect(createPlaylistWithTracks).toHaveBeenCalledWith("Friday warm-up", ["11", "30", "31"]);
+  expect(host.querySelector("[role=status]")?.textContent).toBe("Created “Friday warm-up” with 3 tracks.");
+});
+
+it("adds the whole chain to the playlist, and builds nothing while Library Protection is on", async () => {
+  await openBuild(true);
+  act(() => button("Create playlist").click());
+  act(() => button("Add all to the playlist").click());
+  await flush();
+  expect(createPlaylistWithTracks).not.toHaveBeenCalled();
+  expect(addTracksToPlaylist).not.toHaveBeenCalled();
+  expect(host.querySelector("[role=status]")?.textContent).toContain("Library Protection");
+
+  localStorage.setItem(PREFERENCES_KEY, JSON.stringify({ advanced: { protectLibrary: false } }));
+  act(() => { window.dispatchEvent(new StorageEvent("storage", { key: PREFERENCES_KEY })); });
+  await flush();
+  act(() => button("Add all to the playlist").click());
+  await flush();
+  expect(addTracksToPlaylist).toHaveBeenCalledWith("7", ["30", "31"]);
+  expect(host.querySelector("[role=status]")?.textContent).toBe("Added 2 tracks to “My set”.");
 });

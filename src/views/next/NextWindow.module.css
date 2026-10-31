@@ -27,6 +27,25 @@
 .controls button:hover:not(:disabled) { border-color: var(--c-accent); }
 .controls button:disabled { opacity: 0.45; cursor: default; }
 .controls :focus-visible, .rows:focus-visible { outline: 2px solid var(--c-accent); outline-offset: 1px; }
+.buildBar { flex: none; display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--c-raised); }
+.buildBar button, .buildBar input, .chainFooter input {
+  height: 26px;
+  border: 1px solid var(--c-raised);
+  border-radius: 4px;
+  background: var(--c-black);
+  color: var(--c-text);
+  font: inherit;
+  padding: 0 8px;
+}
+.buildBar button { background: var(--c-button); cursor: pointer; white-space: nowrap; }
+.buildBar button:hover:not(:disabled) { border-color: var(--c-accent); }
+.buildBar button:disabled { opacity: 0.45; cursor: default; }
+.buildBar :focus-visible, .chainFooter :focus-visible { outline: 2px solid var(--c-accent); outline-offset: 1px; }
+.buildBar input[aria-invalid] { border-color: var(--c-error); }
+.patternBox, .countBox { display: flex; align-items: center; gap: 6px; }
+.patternBox input { width: 120px; text-transform: uppercase; letter-spacing: 1px; }
+.countBox input { width: 56px; }
+.buildBar .count { margin-left: auto; }
 .modes { display: flex; }
 .modes button { border-radius: 0; }
 .modes button:first-child { border-radius: 4px 0 0 4px; }
@@ -70,7 +89,7 @@
 .delta { width: 44px; }
 .energy { width: 26px; }
 .length { width: 38px; }
-.played { flex: none; width: 36px; color: var(--c-accent); text-align: right; font-variant-numeric: tabular-nums; }
+.played { flex: none; width: 52px; white-space: nowrap; color: var(--c-accent); text-align: right; font-variant-numeric: tabular-nums; }
 .kind { flex: none; width: 92px; color: var(--c-text-dim); font-size: var(--f-size-sm); }
 .score { flex: none; position: relative; width: 52px; height: 16px; border: 1px solid var(--c-raised); border-radius: 2px; overflow: hidden; }
 .score i { position: absolute; inset: 0 auto 0 0; background: var(--c-accent); opacity: 0.35; }
@@ -87,6 +106,13 @@
 }
 .play { width: 28px; }
 .add { padding: 0 10px; }
+.add:disabled { opacity: 0.45; cursor: default; }
+/* A chain step: D is a double drop with the track before it, T a transition. */
+.stepMode { flex: none; width: 22px; height: 20px; line-height: 18px; text-align: center; border: 1px solid var(--c-raised); border-radius: 3px; font-weight: 700; }
+.stepMode[data-mode="D"] { border-color: var(--c-accent); color: var(--c-accent); }
+.stepMode[data-mode="T"] { color: var(--c-text-dim); }
+.chainFooter { flex: none; display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-top: 1px solid var(--c-raised); }
+.nameBox { flex: 1; min-width: 0; }
 .play:hover, .add:hover { border-color: var(--c-accent); }
 .play[data-on] { border-color: var(--c-accent); color: var(--c-accent); }
 .play:focus-visible, .add:focus-visible, .track:focus-visible { outline: 2px solid var(--c-accent); outline-offset: -2px; }

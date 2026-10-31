@@ -159,6 +159,19 @@ export interface NextItem {
   followed: number;
 }
 
+export interface NextStep {
+  /** How it is played with the track before it: a transition or a double drop. */
+  mode: "T" | "D";
+  item: NextItem;
+}
+
+export interface NextBuild {
+  seed: NextTrack;
+  steps: NextStep[];
+  /** How many tracks were asked for; fewer steps mean nothing fitted after the last. */
+  requested: number;
+}
+
 export interface NextResult {
   playlistId: string;
   playlistName: string;
@@ -972,6 +985,14 @@ export interface Backend {
    * a tighter tempo, energy and key).
    */
   suggestNext(playlist: string, seed: string | null, mode: NextMode, limit?: number): Promise<NextResult>;
+  /**
+   * Builds a chain of tracks after `seed` (the playlist's last track when
+   * null): the i-th fits the one before it as the i-th letter of `pattern`
+   * asks, `T` for a transition and `D` for a double drop, the pattern
+   * repeating to `length`. `variety` re-rolls the choice among equally good
+   * tracks. Nothing is written.
+   */
+  buildNext(playlist: string, seed: string | null, pattern: string, length: number, variety: number): Promise<NextBuild>;
   openReportWindow(): Promise<boolean>;
   reportAttachment(): Promise<string>;
   openReportAttachment(attachment: string): Promise<void>;
@@ -1949,6 +1970,12 @@ export interface Edits {
   deletePlaylist(id: string): Promise<EditHistoryState>;
   undoEdit(): Promise<EditHistoryState>;
   redoEdit(): Promise<EditHistoryState>;
+  /**
+   * Creates a playlist at the top level holding `tracks` in order, as one
+   * edit. Like `createPlaylist` it is not on the Undo stack; `deletePlaylist`
+   * removes it. Fork only (the Next window).
+   */
+  createPlaylistWithTracks(name: string, tracks: string[]): Promise<number>;
   /**
    * Adds tracks to the end of a playlist. A track the playlist already holds
    * is left out unless `allowDuplicates` is true, which adds it again.
