@@ -119,3 +119,19 @@
 .status, .error { flex: none; margin: 0; padding: 6px 12px; border-top: 1px solid var(--c-raised); }
 .status { color: var(--c-text-dim); }
 .error { color: var(--c-error); }
+.panes[data-single] { grid-template-columns: 1fr; }
+.checkBox { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.checkBox input { height: auto; }
+.phase { flex: none; width: 76px; text-align: right; white-space: nowrap; color: var(--c-text-dim); font-variant-numeric: tabular-nums; }
+.tempoPair { flex: none; width: 128px; text-align: right; font-variant-numeric: tabular-nums; }
+.verdict { flex: none; width: 70px; text-align: center; color: var(--c-text-dim); font-size: var(--f-size-sm); }
+.verdict[data-verdict="ear"] { color: var(--c-accent); }
+.verdict[data-verdict="rbxport"], .verdict[data-verdict="rekordbox"] { color: var(--c-text); }
+.switch { flex: none; display: flex; }
+.switch button { height: 24px; padding: 0 10px; border: 1px solid var(--c-raised); background: var(--c-button); color: var(--c-text); font: inherit; cursor: pointer; }
+.switch button:first-child { border-radius: 4px 0 0 4px; }
+.switch button:last-child { border-radius: 0 4px 4px 0; border-left: 0; }
+.switch button[data-on] { border-color: var(--c-accent); color: var(--c-accent); }
+.switch button:disabled { opacity: 0.45; cursor: default; }
+.switch button:focus-visible { outline: 2px solid var(--c-accent); outline-offset: -2px; }
+.suggestion[data-playing] { background: var(--c-button); box-shadow: inset 3px 0 0 var(--c-accent); }

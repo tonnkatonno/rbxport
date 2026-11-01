@@ -14,7 +14,7 @@ import type {
   ExportProgress, ExportReport, ExplorerChildren, ExplorerRoot, FilterValues, FolderPlaylistReport, Phrase, ImportReport,
   DatabaseDrive, EditHistoryState, ItunesLibrary, LibraryProblem, LibrarySummary, LinkPeerSeen, Meters,
   LinkStatus, MissingExportFile, MissingTrack, MissingTracks, PreviewState, UnanalysedTracks, ReferenceStickSettings, RelocateReport, RowDto, ScriptRequest, Tick,
-  TreeNode, ViewHandle, NextBuild, NextResult,
+  TreeNode, ViewHandle, NextBuild, NextResult, GridAbApplied, GridAbRow, GridAbStatus,
   SelectionDetails, TrackDetails, TrackLookups,
 } from "./types";
 import { tauriInvoke } from "./invoke";
@@ -576,6 +576,10 @@ async function realBackend(): Promise<Backend> {
     },
     suggestNext: (playlist, seed, mode, limit) => invoke<NextResult>("suggest_next", { playlist, seed, mode, limit: limit ?? null }),
     buildNext: (playlist, seed, pattern, length, variety) => invoke<NextBuild>("build_next", { playlist, seed, pattern, length, variety }),
+    gridAbStatus: () => invoke<GridAbStatus>("grid_ab_status"),
+    gridAbList: (playlist, all) => invoke<GridAbRow[]>("grid_ab_list", { playlist, all }),
+    gridAbUse: (track, source) => invoke<GridAbRow>("grid_ab_use", { track, source }),
+    gridAbApply: (playlist) => invoke<GridAbApplied>("grid_ab_apply", { playlist }),
     syncDevices: (playlists, destinations, defaults, automatic, ejectAfterSync, deleteUnlistedMusic, compatibilityFormat, verifyAll) =>
       invoke<SyncDeviceReport[]>("sync_devices", {
         playlists,

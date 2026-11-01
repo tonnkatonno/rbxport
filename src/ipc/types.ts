@@ -159,6 +159,38 @@ export interface NextItem {
   followed: number;
 }
 
+/** The two analyses of a track Grid A/B keeps. */
+export type GridSource = "rekordbox" | "rbxport";
+
+export interface GridAbStatus {
+  enabled: boolean;
+  tracks: number;
+}
+
+export interface GridAbRow {
+  track: NextTrack;
+  /** Which analysis the library has now. */
+  active: GridSource;
+  rekordboxBpm: number;
+  rbxportBpm: number;
+  /** rbxport found no beats: the library row has no tempo until rekordbox's analysis is put back. */
+  rbxportEmpty: boolean;
+  /** Where rbxport's grid lines sit against rekordbox's, in ms (later is positive). */
+  phaseMs: number;
+  /** An outside check's verdict on the pair: rbxport, rekordbox, either, same or ear. */
+  suggestion: string | null;
+  errRb: number | null;
+  errRbx: number | null;
+  /** The two can be told apart with a metronome. */
+  differs: boolean;
+}
+
+export interface GridAbApplied {
+  applied: number;
+  skipped: number;
+  failed: string[];
+}
+
 export interface NextStep {
   /** How it is played with the track before it: a transition or a double drop. */
   mode: "T" | "D";
@@ -993,6 +1025,20 @@ export interface Backend {
    * tracks. Nothing is written.
    */
   buildNext(playlist: string, seed: string | null, pattern: string, length: number, variety: number): Promise<NextBuild>;
+  /** Whether Grid A/B is on (a store of rekordbox's and rbxport's analyses of each track) and how many tracks it holds. */
+  gridAbStatus(): Promise<GridAbStatus>;
+  /**
+   * The tracks that have two analyses: those of one playlist (null for all), and by default only the ones where a metronome
+   * would tell the grids apart. Those that need an ear come first.
+   */
+  gridAbList(playlist: string | null, all: boolean): Promise<GridAbRow[]>;
+  /**
+   * Makes one analysis the track's own. A deck that holds the track gets the new grid at once, so its metronome moves while
+   * it plays. Returns the track's row as it is now.
+   */
+  gridAbUse(track: string, source: GridSource): Promise<GridAbRow>;
+  /** Applies the outside check's clear suggestions for a playlist (null for all). */
+  gridAbApply(playlist: string | null): Promise<GridAbApplied>;
   openReportWindow(): Promise<boolean>;
   reportAttachment(): Promise<string>;
   openReportAttachment(attachment: string): Promise<void>;

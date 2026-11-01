@@ -46,6 +46,7 @@ mod protocol;
 mod relocate;
 mod sync_window;
 mod next_window;
+mod grid_ab;
 mod report;
 mod scripting;
 mod device_settings;
@@ -624,6 +625,10 @@ pub fn run() {
             next_window::suggest_next,
             next_window::build_next,
             next_window::create_playlist_with_tracks,
+            grid_ab::grid_ab_status,
+            grid_ab::grid_ab_list,
+            grid_ab::grid_ab_use,
+            grid_ab::grid_ab_apply,
             report::open_report_window,
             report::report_attachment,
             report::open_report_attachment,

@@ -10,6 +10,9 @@
  * "Build" makes a whole run of tracks from the same start: a pattern of `T` (transition) and `D` (double drop), one letter
  * a track, repeating to the length asked for. The chain is only shown until "Create playlist" makes a playlist of it (the
  * start track first), or "Add all" puts it at the end of the playlist picked.
+ *
+ * "Grids" (only when rbxport was started with Grid A/B, see `GridsView.tsx`) chooses which of two analyses of a track the
+ * library uses, by ear, with the deck's metronome.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -21,6 +24,7 @@ import { startWindowDrag } from "@/lib/windowDrag";
 import { useShowWindowWhenReady } from "@/lib/windowReady";
 import { usePreferencesStore } from "@/store/usePreferences";
 import { onPreviewError, startPreview, stopPreview, usePreview } from "@/store/usePreview";
+import { GridsView } from "./GridsView";
 import styles from "./NextWindow.module.css";
 
 const STORAGE_KEY = "rbxport.next";
@@ -31,7 +35,7 @@ const MAX_LENGTH = 60;
 const DEFAULT_PATTERN = "DT";
 const DEFAULT_LENGTH = 8;
 
-type View = "suggest" | "build";
+type View = "suggest" | "build" | "grids";
 
 function message(error: unknown): string {
   if (error && typeof error === "object" && "message" in error && typeof error.message === "string") return error.message;
@@ -54,7 +58,7 @@ function remembered(): Remembered {
     return {
       playlist: typeof stored.playlist === "string" ? stored.playlist : plain.playlist,
       mode: stored.mode === "double" ? "double" : "transition",
-      view: stored.view === "build" ? "build" : "suggest",
+      view: stored.view === "build" || stored.view === "grids" ? stored.view : "suggest",
       pattern: typeof stored.pattern === "string" && stored.pattern.length > 0 ? stored.pattern : plain.pattern,
       length: typeof stored.length === "number" && stored.length >= 1 ? Math.min(MAX_LENGTH, Math.floor(stored.length)) : plain.length,
     };
@@ -99,6 +103,8 @@ export function NextWindow() {
   const [nameDraft, setNameDraft] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ text: string; failed: boolean } | null>(null);
   const [loaded, setLoaded] = useState(false);
+  // Grid A/B (a store of two analyses per track) is off unless rbxport was started with it.
+  const [gridAb, setGridAb] = useState(false);
   const request = useRef(0);
   useShowWindowWhenReady(loaded);
   // Library Protection is the same switch the main window obeys: a preference both windows read, the backend cannot see it.
@@ -133,6 +139,13 @@ export function NextWindow() {
   }, [playlist, seed, mode, fail]);
 
   useEffect(() => { void loadLists(); }, [loadLists]);
+  useEffect(() => {
+    void getBackend().then((backend) => backend.gridAbStatus()).then((status) => {
+      setGridAb(status.enabled);
+      if (!status.enabled) setView((now) => (now === "grids" ? "suggest" : now));
+    }).catch(() => setGridAb(false));
+  }, []);
+  const onGridNotice = useCallback((text: string, failed: boolean) => setNotice({ text, failed }), []);
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => { remember({ playlist, mode, view, pattern, length }); }, [playlist, mode, view, pattern, length]);
   // A chain belongs to the start it was built from.
@@ -244,16 +257,16 @@ export function NextWindow() {
         <label className={styles.picker}>
           <span>{t("Playlist")}</span>
           <select value={playlist} onChange={(event) => { setPlaylist(event.target.value); setSeed(null); }}>
-            <option value="">{t("Pick a playlist")}</option>
+            <option value="">{view === "grids" ? t("All tracks") : t("Pick a playlist")}</option>
             {(lists ?? []).map((node) => (
               <option key={node.id} value={node.id}>{"  ".repeat(Math.max(0, node.depth - 2))}{node.name}</option>
             ))}
           </select>
         </label>
         <div className={styles.modes} role="radiogroup" aria-label={t("View")}>
-          {(["suggest", "build"] as const).map((choice) => (
+          {(gridAb ? ["suggest", "build", "grids"] as const : ["suggest", "build"] as const).map((choice) => (
             <button key={choice} type="button" role="radio" aria-checked={view === choice} data-on={view === choice || undefined}
-              onClick={() => setView(choice)}>{choice === "suggest" ? t("Suggestions") : t("Build")}</button>
+              onClick={() => setView(choice)}>{choice === "suggest" ? t("Suggestions") : choice === "build" ? t("Build") : t("Grids")}</button>
           ))}
         </div>
         {view === "suggest" ? (
@@ -264,7 +277,7 @@ export function NextWindow() {
             ))}
           </div>
         ) : null}
-        <button type="button" disabled={seed === null} onClick={() => setSeed(null)}>{t("Follow the last track")}</button>
+        {view === "grids" ? null : <button type="button" disabled={seed === null} onClick={() => setSeed(null)}>{t("Follow the last track")}</button>}
         <span className={styles.count}>
           {view === "suggest" && result ? t("{count} suggestions", { count: result.items.length }) : ""}
         </span>
@@ -292,6 +305,7 @@ export function NextWindow() {
         </div>
       ) : null}
 
+      {view === "grids" ? <GridsView playlist={playlist} protectLibrary={protectLibrary} onNotice={onGridNotice} /> : (
       <div className={styles.panes}>
         <div className={styles.pane} aria-label={t("The playlist")}>
           <h2>{result ? result.playlistName : t("The playlist")}</h2>
@@ -382,6 +396,7 @@ export function NextWindow() {
           </div>
         )}
       </div>
+      )}
       {notice ? <p className={notice.failed ? styles.error : styles.status} role="status">{notice.text}</p> : null}
     </section>
   );

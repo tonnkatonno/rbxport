@@ -106,7 +106,7 @@ pub struct NextDto {
     pub items: Vec<NextItemDto>,
 }
 
-fn track_dto(library: &Library, row: Row) -> NextTrackDto {
+pub(crate) fn track_dto(library: &Library, row: Row) -> NextTrackDto {
     let i = row as usize;
     NextTrackDto {
         id: library.ids[i].to_string(),

@@ -2347,7 +2347,7 @@ pub async fn track_beats(
 /// A track's beat grid from its `.DAT`: milliseconds, the beat's number in
 /// the bar (1 is the downbeat) and the tempo there x100, at most `MAX_BEATS`
 /// of them. Empty for a track without one.
-fn read_beat_grid(path: &std::path::Path) -> Vec<(u32, u8, u16)> {
+pub(crate) fn read_beat_grid(path: &std::path::Path) -> Vec<(u32, u8, u16)> {
     let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
     let Ok(file) = rbl_anlz::parse(&bytes) else { return Vec::new() };
     file.sections

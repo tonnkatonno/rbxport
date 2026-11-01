@@ -2113,6 +2113,10 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     openNextWindow: () => wait(false),
     suggestNext: (playlist) => wait({ playlistId: playlist, playlistName: "Preview", tracks: [], seed: null, items: [] }),
     buildNext: () => Promise.reject(new Error("Building a playlist requires the desktop app.")),
+    gridAbStatus: () => wait({ enabled: false, tracks: 0 }),
+    gridAbList: () => wait([]),
+    gridAbUse: () => Promise.reject(new Error("Choosing a grid requires the desktop app.")),
+    gridAbApply: () => wait({ applied: 0, skipped: 0, failed: [] }),
     // Stick after stick, each announced before and after, as the real run
     // is. A destination that is not a mock device is a stick that was
     // pulled: its entry carries the error and the others their reports.
