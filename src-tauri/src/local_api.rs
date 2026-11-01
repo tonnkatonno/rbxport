@@ -19,6 +19,11 @@
 //! - `GET  /v1/playlists`: every playlist, folder and intelligent playlist, with its parent and track count.
 //! - `GET  /v1/playlists/{id}`: one playlist with its tracks in order (`id`, `title`).
 //! - `POST /v1/playlists/{id}/tracks` with `{"tracks": ["<content id>", ...], "allow_duplicates": false}`.
+//! - `POST /v1/playlists` with `{"name": "...", "tracks": ["<content id>", ...]}`: a new top-level playlist holding the tracks in
+//!   order, as one edit. Answers with its `id`. A name already taken is refused (409).
+//! - `GET  /v1/tracks/{id}/cues`: the track cues (memory and hot, hot ones with their letter).
+//! - `POST /v1/tracks/{id}/hotcues` with `{"cues": [{"slot": "B", "ms": 88275}, ...]}`, slots A to H: adds hot cues. A slot that is
+//!   already taken is skipped and reported, never replaced.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -223,6 +228,9 @@ fn route(request: &Request, app: &AppHandle, allow_write: bool) -> Reply {
         ("GET", ["v1", "playlists"]) => playlists(&state),
         ("GET", ["v1", "playlists", id]) => playlist(&state, id),
         ("POST", ["v1", "playlists", id, "tracks"]) => add_tracks(app, &state, id, &request.body, allow_write),
+        ("POST", ["v1", "playlists"]) => create_playlist(app, &state, &request.body, allow_write),
+        ("GET", ["v1", "tracks", id, "cues"]) => track_cues(&state, id),
+        ("POST", ["v1", "tracks", id, "hotcues"]) => add_hot_cues(app, &state, id, &request.body, allow_write),
         (_, ["v1", ..]) => fail(404, "no such route, or the method is not allowed on it"),
         _ => fail(404, "no such route"),
     }
@@ -300,6 +308,120 @@ fn content_id(value: &Value) -> Option<String> {
     }
 }
 
+/// `{"name": "...", "tracks": ["id", ...]}`: the new playlist name (trimmed, 1 to 200 characters) and its tracks, 1 to 500.
+fn parse_new_playlist(body: &[u8]) -> Result<(String, Vec<String>), String> {
+    let parsed: Value = serde_json::from_slice(body).map_err(|_| "the body is not JSON".to_owned())?;
+    let name = parsed.get("name").and_then(Value::as_str).map(str::trim).unwrap_or_default();
+    if name.is_empty() || name.chars().count() > 200 || name.chars().any(char::is_control) {
+        return Err("\"name\" must be 1 to 200 characters, with no control characters".to_owned());
+    }
+    let wanted = parsed.get("tracks").and_then(Value::as_array).ok_or_else(|| "\"tracks\" must be a list".to_owned())?;
+    let ids: Option<Vec<String>> = wanted.iter().map(content_id).collect();
+    let ids = ids.ok_or_else(|| "every track must be a content id (digits)".to_owned())?;
+    if ids.is_empty() || ids.len() > 500 {
+        return Err("1 to 500 tracks".to_owned());
+    }
+    Ok((name.to_owned(), ids))
+}
+
+fn create_playlist(app: &AppHandle, state: &AppState, body: &[u8], allow_write: bool) -> Reply {
+    if !allow_write {
+        return fail(403, format!("writes are off; start rbxport with {WRITE_ENV}=1"));
+    }
+    let (name, ids) = match parse_new_playlist(body) {
+        Ok(parsed) => parsed,
+        Err(message) => return fail(400, message),
+    };
+    let Ok(library) = state.library() else { return fail(503, "the library has not finished loading yet") };
+    let unknown: Vec<&String> = ids
+        .iter()
+        .filter(|t| t.parse::<u64>().ok().and_then(|n| library.row_of_id(n)).is_none())
+        .collect();
+    if !unknown.is_empty() {
+        return (404, json!({ "error": "unknown track ids", "unknown": unknown }));
+    }
+    // The library does not refuse a second playlist with the same name, and a retried request would silently make a copy: refuse it here.
+    {
+        let p = library.playlists();
+        let taken = (0..p.ids.len()).any(|i| {
+            let top_level = p.parent.get(i).and_then(|&x| p.ids.get(x as usize)).is_none();
+            top_level && p.names.get(i).trim().eq_ignore_ascii_case(&name)
+        });
+        if taken {
+            return fail(409, format!("a top-level playlist called \"{name}\" already exists"));
+        }
+    }
+    match tauri::async_runtime::block_on(crate::next_window::create_playlist_made(app.clone(), app.state(), name.clone(), ids.clone())) {
+        Ok((_generation, id)) => {
+            tracing::info!(playlist = %id, tracks = ids.len(), "local API created a playlist");
+            (200, json!({ "ok": true, "id": id, "name": name, "tracks": ids.len() }))
+        }
+        Err(e) => (409, json!({ "error": e.message })),
+    }
+}
+
+/// `{"cues": [{"slot": "B", "ms": 88275}, ...]}`: hot cue letters A to H with positions in ms (up to 24 h), 1 to 16 of them.
+fn parse_hot_cues(body: &[u8]) -> Result<Vec<(char, u32)>, String> {
+    let parsed: Value = serde_json::from_slice(body).map_err(|_| "the body is not JSON".to_owned())?;
+    let list = parsed.get("cues").and_then(Value::as_array).ok_or_else(|| "\"cues\" must be a list".to_owned())?;
+    if list.is_empty() || list.len() > 16 {
+        return Err("1 to 16 cues per request".to_owned());
+    }
+    list.iter()
+        .map(|cue| {
+            let slot = cue
+                .get("slot")
+                .and_then(Value::as_str)
+                .filter(|s| s.chars().count() == 1)
+                .and_then(|s| s.chars().next())
+                .map(|c| c.to_ascii_uppercase())
+                .filter(|c| ('A'..='H').contains(c))
+                .ok_or_else(|| "each cue needs a \"slot\" from A to H".to_owned())?;
+            let ms = cue
+                .get("ms")
+                .and_then(Value::as_u64)
+                .filter(|&ms| ms <= 86_400_000)
+                .and_then(|ms| u32::try_from(ms).ok())
+                .ok_or_else(|| "each cue needs \"ms\", a whole number of milliseconds up to 24 hours".to_owned())?;
+            Ok((slot, ms))
+        })
+        .collect()
+}
+
+fn add_hot_cues(app: &AppHandle, state: &AppState, id: &str, body: &[u8], allow_write: bool) -> Reply {
+    if !allow_write {
+        return fail(403, format!("writes are off; start rbxport with {WRITE_ENV}=1"));
+    }
+    let wanted = match parse_hot_cues(body) {
+        Ok(wanted) => wanted,
+        Err(message) => return fail(400, message),
+    };
+    let Ok(library) = state.library() else { return fail(503, "the library has not finished loading yet") };
+    if id.parse::<u64>().ok().and_then(|n| library.row_of_id(n)).is_none() {
+        return fail(404, "no such track");
+    }
+    match tauri::async_runtime::block_on(crate::cues::add_hot_cues(app.clone(), id.to_owned(), wanted)) {
+        Ok(done) => {
+            tracing::info!(track = id, added = done.added.len(), skipped = done.skipped.len(), "local API added hot cues");
+            let added: Vec<Value> = done.added.iter().map(|(slot, ms, cue)| json!({ "slot": slot.to_string(), "ms": ms, "id": cue })).collect();
+            let skipped: Vec<Value> = done.skipped.iter().map(|(slot, why)| json!({ "slot": slot.to_string(), "reason": why })).collect();
+            (200, json!({ "ok": true, "added": added, "skipped": skipped }))
+        }
+        Err(e) => (409, json!({ "error": e.message })),
+    }
+}
+
+fn track_cues(state: &AppState, id: &str) -> Reply {
+    let Ok(library) = state.library() else { return fail(503, "the library has not finished loading yet") };
+    let Some(row) = id.parse::<u64>().ok().and_then(|n| library.row_of_id(n)) else { return fail(404, "no such track") };
+    let cues: Vec<Value> = library
+        .cues_of(row)
+        .iter()
+        .map(|c| json!({ "kind": c.kind, "slot": c.hot_letter().map(|l| l.to_string()), "ms": c.position_ms, "loop_out_ms": c.out_ms }))
+        .collect();
+    (200, json!({ "track": id, "cues": cues }))
+}
+
 fn add_tracks(app: &AppHandle, state: &AppState, id: &str, body: &[u8], allow_write: bool) -> Reply {
     if !allow_write {
         return fail(403, format!("writes are off; start rbxport with {WRITE_ENV}=1"));
@@ -364,6 +486,50 @@ fn add_tracks(app: &AppHandle, state: &AppState, id: &str, body: &[u8], allow_wr
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_playlist_needs_a_clean_name_and_tracks_that_are_content_ids() {
+        let ok = parse_new_playlist(br#"{"name": "  Friday warm-up ", "tracks": ["12", 34]}"#).unwrap();
+        assert_eq!(ok, ("Friday warm-up".to_owned(), vec!["12".to_owned(), "34".to_owned()]));
+        for bad in [
+            &br#"{"name": "", "tracks": ["1"]}"#[..],
+            br#"{"name": "   ", "tracks": ["1"]}"#,
+            br#"{"tracks": ["1"]}"#,
+            br#"{"name": "a\u0007b", "tracks": ["1"]}"#,
+            br#"{"name": "x", "tracks": []}"#,
+            br#"{"name": "x", "tracks": ["1", "abc"]}"#,
+            br#"{"name": "x"}"#,
+            b"not json",
+        ] {
+            assert!(parse_new_playlist(bad).is_err(), "{}", String::from_utf8_lossy(bad));
+        }
+        let long = format!(r#"{{"name": "{}", "tracks": ["1"]}}"#, "x".repeat(201));
+        assert!(parse_new_playlist(long.as_bytes()).is_err(), "over 200 characters");
+        let many = format!(r#"{{"name": "x", "tracks": [{}]}}"#, vec!["1"; 501].join(","));
+        assert!(parse_new_playlist(many.as_bytes()).is_err(), "over 500 tracks");
+    }
+
+    #[test]
+    fn hot_cues_are_letters_a_to_h_at_a_position_in_milliseconds() {
+        let ok = parse_hot_cues(br#"{"cues": [{"slot": "b", "ms": 88275}, {"slot": "F", "ms": 0}]}"#).unwrap();
+        assert_eq!(ok, vec![('B', 88275), ('F', 0)], "a letter is read in either case");
+        for bad in [
+            &br#"{"cues": []}"#[..],
+            br#"{"cues": [{"slot": "I", "ms": 1}]}"#,
+            br#"{"cues": [{"slot": "BC", "ms": 1}]}"#,
+            br#"{"cues": [{"slot": "B"}]}"#,
+            br#"{"cues": [{"slot": "B", "ms": -5}]}"#,
+            br#"{"cues": [{"slot": "B", "ms": 1.5}]}"#,
+            br#"{"cues": [{"slot": "B", "ms": 86400001}]}"#,
+            br#"{"cues": [{"slot": 2, "ms": 1}]}"#,
+            br#"{"slots": []}"#,
+            b"[]",
+        ] {
+            assert!(parse_hot_cues(bad).is_err(), "{}", String::from_utf8_lossy(bad));
+        }
+        let many = format!(r#"{{"cues": [{}]}}"#, vec![r#"{"slot": "A", "ms": 1}"#; 17].join(","));
+        assert!(parse_hot_cues(many.as_bytes()).is_err(), "over 16 cues");
+    }
 
     fn parse(text: &str) -> Result<Request, (u16, &'static str)> {
         read_request(&mut text.as_bytes())

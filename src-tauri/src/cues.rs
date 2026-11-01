@@ -190,6 +190,43 @@ async fn edit_cues<R: tauri::Runtime>(
     Ok(change)
 }
 
+/// What [`add_hot_cues`] did with each cue it was asked for.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HotCueOutcome {
+    /// The letter, the position in ms and the new cue's id.
+    pub added: Vec<(char, u32, String)>,
+    /// The letter and why it was left.
+    pub skipped: Vec<(char, &'static str)>,
+}
+
+/// Adds hot cues to a track by letter, for the local API. A slot that is already taken (or asked for twice) is left as it is:
+/// this never replaces a cue. Each goes through the same edit as the interface Add Cue, so the index refreshes and a deck
+/// showing the track redraws.
+pub(crate) async fn add_hot_cues<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    track: String,
+    wanted: Vec<(char, u32)>,
+) -> AppResult<HotCueOutcome> {
+    use tauri::Manager as _;
+    let library = app.state::<Arc<AppState>>().library()?;
+    let Some(row) = library.row_of(&track) else {
+        return Err(AppError::new(ErrorKind::NotFound, "That track is not in the library."));
+    };
+    let mut taken: std::collections::HashSet<char> = library.cues_of(row).iter().filter_map(Cue::hot_letter).collect();
+    let mut outcome = HotCueOutcome { added: Vec::new(), skipped: Vec::new() };
+    for (letter, position_ms) in wanted {
+        let letter = letter.to_ascii_uppercase();
+        if !taken.insert(letter) {
+            outcome.skipped.push((letter, "occupied"));
+            continue;
+        }
+        let edit = CueEdit::Add { track: track.clone(), kind: CueKind::Hot(letter), position_ms };
+        let id = edit_cues(app.clone(), app.state::<Arc<AppState>>(), "add_hot_cue", edit).await?.cue;
+        outcome.added.push((letter, position_ms, id));
+    }
+    Ok(outcome)
+}
+
 #[tauri::command]
 pub async fn add_cue<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,

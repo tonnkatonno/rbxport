@@ -17,3 +17,9 @@ A small HTTP API on `127.0.0.1` for a companion program on the same machine: rea
 ## Routes
 
 `GET /v1/status`, `GET /v1/playlists`, `GET /v1/playlists/{id}` and `POST /v1/playlists/{id}/tracks` with `{"tracks": ["<content id>", ...], "allow_duplicates": false}`. Replies are JSON; an error is `{"error": "..."}`. A track already in the playlist is skipped unless `allow_duplicates` is set; only plain playlists accept tracks (not folders or intelligent playlists).
+
+Also (fork only, for the searcher's chain generator):
+
+- `POST /v1/playlists` with `{"name": "...", "tracks": ["<content id>", ...]}` makes a new top-level playlist holding the tracks in order, as one edit, and answers `{"ok": true, "id": "...", "name": "...", "tracks": n}`. The name is trimmed (1 to 200 characters), 1 to 500 tracks. A name already taken is refused with 409. It is not on the Undo stack; Delete Playlist removes it.
+- `GET /v1/tracks/{id}/cues` lists a track's cues: `{"kind": raw djmdCue.Kind, "slot": "B" | null, "ms": ..., "loop_out_ms": ...}`; `slot` is the hot cue letter, null for a memory cue.
+- `POST /v1/tracks/{id}/hotcues` with `{"cues": [{"slot": "B", "ms": 88275}, ...]}` (slots A to H, 1 to 16 cues, positions up to 24 h) adds hot cues and answers `{"ok": true, "added": [{"slot", "ms", "id"}], "skipped": [{"slot", "reason": "occupied"}]}`. A slot the track already has (or that is asked for twice) is skipped, never replaced. The letters are stored as rekordbox stores them: A, B, C are kinds 1 to 3, and D onward sit one higher (D is 5, E 6, F 7), because kind 4 is the active memory loop.

@@ -267,7 +267,7 @@ pub async fn build_next(
 /// Creates a playlist at the top level holding `tracks` in order, as one edit.
 ///
 /// Like creating a playlist in the browser, or adding tracks to one, it is not on the Undo stack: Delete Playlist (which is)
-/// removes it. The name has to be free among the top-level playlists, which the library itself checks.
+/// removes it. The library does not refuse a name that is already taken, so the local API checks that before it calls this.
 #[tauri::command]
 pub async fn create_playlist_with_tracks<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -275,6 +275,16 @@ pub async fn create_playlist_with_tracks<R: tauri::Runtime>(
     name: String,
     tracks: Vec<String>,
 ) -> AppResult<u32> {
+    create_playlist_made(app, state, name, tracks).await.map(|(generation, _)| generation)
+}
+
+/// [`create_playlist_with_tracks`] that also says which playlist it made: the local API answers with the id.
+pub(crate) async fn create_playlist_made<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    tracks: Vec<String>,
+) -> AppResult<(u32, String)> {
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err(AppError::new(ErrorKind::Malformed, "Give the playlist a name."));
@@ -282,9 +292,15 @@ pub async fn create_playlist_with_tracks<R: tauri::Runtime>(
     if tracks.is_empty() {
         return Err(AppError::new(ErrorKind::Malformed, "There are no tracks to put in the playlist."));
     }
-    edit(app, state, "create_playlist_with_tracks", Touched::Playlists, move |w| {
+    let made = Arc::new(parking_lot::Mutex::new(None::<String>));
+    let kept = Arc::clone(&made);
+    let generation = edit(app, state, "create_playlist_with_tracks", Touched::Playlists, move |w| {
         let id = w.create_playlist(&name, rbl_db::write::ROOT)?;
-        w.add_tracks_allowing(&id, &tracks, false).map(|_| ())
+        w.add_tracks_allowing(&id, &tracks, false)?;
+        *kept.lock() = Some(id);
+        Ok(())
     })
-    .await
+    .await?;
+    let id = made.lock().take().ok_or_else(|| AppError::internal("the id of the new playlist was not kept"))?;
+    Ok((generation, id))
 }
