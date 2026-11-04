@@ -275,15 +275,17 @@ pub async fn create_playlist_with_tracks<R: tauri::Runtime>(
     name: String,
     tracks: Vec<String>,
 ) -> AppResult<u32> {
-    create_playlist_made(app, state, name, tracks).await.map(|(generation, _)| generation)
+    create_playlist_made(app, state, name, tracks, false).await.map(|(generation, _)| generation)
 }
 
 /// [`create_playlist_with_tracks`] that also says which playlist it made: the local API answers with the id.
+/// `allow_duplicates` keeps a track that is asked for more than once (the searcher's separator row between double pairs).
 pub(crate) async fn create_playlist_made<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, Arc<AppState>>,
     name: String,
     tracks: Vec<String>,
+    allow_duplicates: bool,
 ) -> AppResult<(u32, String)> {
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -296,7 +298,7 @@ pub(crate) async fn create_playlist_made<R: tauri::Runtime>(
     let kept = Arc::clone(&made);
     let generation = edit(app, state, "create_playlist_with_tracks", Touched::Playlists, move |w| {
         let id = w.create_playlist(&name, rbl_db::write::ROOT)?;
-        w.add_tracks_allowing(&id, &tracks, false)?;
+        w.add_tracks_allowing(&id, &tracks, allow_duplicates)?;
         *kept.lock() = Some(id);
         Ok(())
     })

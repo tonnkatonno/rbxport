@@ -21,6 +21,8 @@
 //! - `POST /v1/playlists/{id}/tracks` with `{"tracks": ["<content id>", ...], "allow_duplicates": false}`.
 //! - `POST /v1/playlists` with `{"name": "...", "tracks": ["<content id>", ...]}`: a new top-level playlist holding the tracks in
 //!   order, as one edit. Answers with its `id`. A name already taken is refused (409).
+//!   `"allow_duplicates": true` keeps a track listed more than once.
+//! - `POST /v1/tracks/import` with `{"path": "D:/.../file.flac"}`: adds one audio file to the library (or finds it there) and answers its id.
 //! - `GET  /v1/tracks/{id}/cues`: the track cues (memory and hot, hot ones with their letter).
 //! - `POST /v1/tracks/{id}/hotcues` with `{"cues": [{"slot": "B", "ms": 88275}, ...]}`, slots A to H: adds hot cues. A slot that is
 //!   already taken is skipped and reported, never replaced.
@@ -229,6 +231,7 @@ fn route(request: &Request, app: &AppHandle, allow_write: bool) -> Reply {
         ("GET", ["v1", "playlists", id]) => playlist(&state, id),
         ("POST", ["v1", "playlists", id, "tracks"]) => add_tracks(app, &state, id, &request.body, allow_write),
         ("POST", ["v1", "playlists"]) => create_playlist(app, &state, &request.body, allow_write),
+        ("POST", ["v1", "tracks", "import"]) => import_track(app, &request.body, allow_write),
         ("GET", ["v1", "tracks", id, "cues"]) => track_cues(&state, id),
         ("POST", ["v1", "tracks", id, "hotcues"]) => add_hot_cues(app, &state, id, &request.body, allow_write),
         (_, ["v1", ..]) => fail(404, "no such route, or the method is not allowed on it"),
@@ -332,6 +335,7 @@ fn create_playlist(app: &AppHandle, state: &AppState, body: &[u8], allow_write: 
         Ok(parsed) => parsed,
         Err(message) => return fail(400, message),
     };
+    let allow_duplicates = serde_json::from_slice::<Value>(body).ok().and_then(|v| v.get("allow_duplicates").and_then(Value::as_bool)).unwrap_or(false);
     let Ok(library) = state.library() else { return fail(503, "the library has not finished loading yet") };
     let unknown: Vec<&String> = ids
         .iter()
@@ -351,7 +355,7 @@ fn create_playlist(app: &AppHandle, state: &AppState, body: &[u8], allow_write: 
             return fail(409, format!("a top-level playlist called \"{name}\" already exists"));
         }
     }
-    match tauri::async_runtime::block_on(crate::next_window::create_playlist_made(app.clone(), app.state(), name.clone(), ids.clone())) {
+    match tauri::async_runtime::block_on(crate::next_window::create_playlist_made(app.clone(), app.state(), name.clone(), ids.clone(), allow_duplicates)) {
         Ok((_generation, id)) => {
             tracing::info!(playlist = %id, tracks = ids.len(), "local API created a playlist");
             (200, json!({ "ok": true, "id": id, "name": name, "tracks": ids.len() }))
@@ -406,6 +410,44 @@ fn add_hot_cues(app: &AppHandle, state: &AppState, id: &str, body: &[u8], allow_
             let added: Vec<Value> = done.added.iter().map(|(slot, ms, cue)| json!({ "slot": slot.to_string(), "ms": ms, "id": cue })).collect();
             let skipped: Vec<Value> = done.skipped.iter().map(|(slot, why)| json!({ "slot": slot.to_string(), "reason": why })).collect();
             (200, json!({ "ok": true, "added": added, "skipped": skipped }))
+        }
+        Err(e) => (409, json!({ "error": e.message })),
+    }
+}
+
+/// `{"path": "..."}`: one existing audio file, by absolute path (no folder: a folder would import everything under it).
+fn parse_import(body: &[u8]) -> Result<std::path::PathBuf, String> {
+    let parsed: Value = serde_json::from_slice(body).map_err(|_| "the body is not JSON".to_owned())?;
+    let path = parsed.get("path").and_then(Value::as_str).map(str::trim).unwrap_or_default();
+    let path = std::path::PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err("\"path\" must be an absolute file path".to_owned());
+    }
+    Ok(path)
+}
+
+fn import_track(app: &AppHandle, body: &[u8], allow_write: bool) -> Reply {
+    if !allow_write {
+        return fail(403, format!("writes are off; start rbxport with {WRITE_ENV}=1"));
+    }
+    let path = match parse_import(body) {
+        Ok(path) => path,
+        Err(message) => return fail(400, message),
+    };
+    if !path.is_file() {
+        return fail(404, "no such file (one audio file, not a folder)");
+    }
+    let wanted = path.to_string_lossy().into_owned();
+    match tauri::async_runtime::block_on(crate::commands::import_files(app.clone(), app.state(), vec![wanted])) {
+        Ok(report) => {
+            if let Some(t) = report.tracks.first() {
+                tracing::info!(track = %t.id, "local API imported a file");
+                (200, json!({ "ok": true, "id": t.id, "added": true }))
+            } else if let Some(t) = report.existing.first() {
+                (200, json!({ "ok": true, "id": t.id, "added": false }))
+            } else {
+                fail(409, report.skipped.first().cloned().unwrap_or_else(|| "the file was not imported".to_owned()))
+            }
         }
         Err(e) => (409, json!({ "error": e.message })),
     }
@@ -486,6 +528,14 @@ fn add_tracks(app: &AppHandle, state: &AppState, id: &str, body: &[u8], allow_wr
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_import_needs_an_absolute_path() {
+        assert!(parse_import(br#"{"path": "C:/Music/x.flac"}"#).is_ok());
+        for bad in [&br#"{"path": "x.flac"}"#[..], br#"{"path": ""}"#, br#"{}"#, b"nope"] {
+            assert!(parse_import(bad).is_err(), "{}", String::from_utf8_lossy(bad));
+        }
+    }
 
     #[test]
     fn a_new_playlist_needs_a_clean_name_and_tracks_that_are_content_ids() {
