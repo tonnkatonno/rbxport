@@ -26,6 +26,9 @@
 //! - `GET  /v1/tracks/{id}/cues`: the track cues (memory and hot, hot ones with their letter).
 //! - `POST /v1/tracks/{id}/hotcues` with `{"cues": [{"slot": "B", "ms": 88275}, ...]}`, slots A to H: adds hot cues. A slot that is
 //!   already taken is skipped and reported, never replaced.
+//! - `POST /v1/hotcues/arrange` with `{"tracks": [{"id": "123", "delete": ["A"], "move": [["B", "A"]]}, ...]}`, 1 to 500 tracks:
+//!   deletes, then moves hot cues to free slots, in one write. Letters name the slots as they were; a move onto a taken slot is
+//!   skipped and reported.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -234,6 +237,7 @@ fn route(request: &Request, app: &AppHandle, allow_write: bool) -> Reply {
         ("POST", ["v1", "tracks", "import"]) => import_track(app, &request.body, allow_write),
         ("GET", ["v1", "tracks", id, "cues"]) => track_cues(&state, id),
         ("POST", ["v1", "tracks", id, "hotcues"]) => add_hot_cues(app, &state, id, &request.body, allow_write),
+        ("POST", ["v1", "hotcues", "arrange"]) => arrange_hot_cues(app, &request.body, allow_write),
         (_, ["v1", ..]) => fail(404, "no such route, or the method is not allowed on it"),
         _ => fail(404, "no such route"),
     }
@@ -415,6 +419,70 @@ fn add_hot_cues(app: &AppHandle, state: &AppState, id: &str, body: &[u8], allow_
     }
 }
 
+fn hot_letter(v: &Value) -> Option<char> {
+    let mut chars = v.as_str()?.chars();
+    let c = chars.next()?.to_ascii_uppercase();
+    (chars.next().is_none() && ('A'..='H').contains(&c)).then_some(c)
+}
+
+/// `{"tracks": [{"id": "123", "delete": ["A"], "move": [["B", "A"], ["C", "B"]]}, ...]}`, 1 to 500 tracks.
+fn parse_arrangements(body: &[u8]) -> Result<Vec<crate::cues::Arrangement>, String> {
+    let parsed: Value = serde_json::from_slice(body).map_err(|_| "the body is not JSON".to_owned())?;
+    let list = parsed.get("tracks").and_then(Value::as_array).ok_or_else(|| "\"tracks\" must be a list".to_owned())?;
+    if list.is_empty() || list.len() > 500 {
+        return Err("1 to 500 tracks per request".to_owned());
+    }
+    list.iter()
+        .map(|t| {
+            let track = t.get("id").and_then(content_id).ok_or_else(|| "each track needs an \"id\" (digits)".to_owned())?;
+            let delete = match t.get("delete").and_then(Value::as_array) {
+                None => Vec::new(),
+                Some(l) => l.iter().map(|v| hot_letter(v).ok_or_else(|| "\"delete\" holds letters A to H".to_owned())).collect::<Result<_, _>>()?,
+            };
+            let moves = match t.get("move").and_then(Value::as_array) {
+                None => Vec::new(),
+                Some(l) => l
+                    .iter()
+                    .map(|m| match m.as_array().map(Vec::as_slice) {
+                        Some([from, to]) => hot_letter(from).zip(hot_letter(to)).ok_or_else(|| "a move is two letters A to H".to_owned()),
+                        _ => Err("each move is [\"from\", \"to\"]".to_owned()),
+                    })
+                    .collect::<Result<_, _>>()?,
+            };
+            Ok(crate::cues::Arrangement { track, delete, moves })
+        })
+        .collect()
+}
+
+fn arrange_hot_cues(app: &AppHandle, body: &[u8], allow_write: bool) -> Reply {
+    if !allow_write {
+        return fail(403, format!("writes are off; start rbxport with {WRITE_ENV}=1"));
+    }
+    let plans = match parse_arrangements(body) {
+        Ok(plans) => plans,
+        Err(message) => return fail(400, message),
+    };
+    match tauri::async_runtime::block_on(crate::cues::arrange_hot_cues(app.clone(), plans)) {
+        Ok(done) => {
+            let changed = done.iter().filter(|o| !o.deleted.is_empty() || !o.moved.is_empty()).count();
+            tracing::info!(tracks = done.len(), changed, "local API rearranged hot cues");
+            let tracks: Vec<Value> = done
+                .iter()
+                .map(|o| {
+                    json!({
+                        "id": o.track,
+                        "deleted": o.deleted.iter().map(char::to_string).collect::<Vec<_>>(),
+                        "moved": o.moved.iter().map(|(f, t)| [f.to_string(), t.to_string()]).collect::<Vec<_>>(),
+                        "skipped": o.skipped,
+                    })
+                })
+                .collect();
+            (200, json!({ "ok": true, "tracks": tracks }))
+        }
+        Err(e) => (409, json!({ "error": e.message })),
+    }
+}
+
 /// `{"path": "..."}`: one existing audio file, by absolute path (no folder: a folder would import everything under it).
 fn parse_import(body: &[u8]) -> Result<std::path::PathBuf, String> {
     let parsed: Value = serde_json::from_slice(body).map_err(|_| "the body is not JSON".to_owned())?;
@@ -528,6 +596,19 @@ fn add_tracks(app: &AppHandle, state: &AppState, id: &str, body: &[u8], allow_wr
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_arrangement_request_names_tracks_and_letters() {
+        let got = parse_arrangements(br#"{"tracks": [{"id": "12", "delete": ["a"], "move": [["B", "A"], ["C", "B"]]}, {"id": 7}]}"#).unwrap();
+        assert_eq!(got[0].track, "12");
+        assert_eq!(got[0].delete, vec!['A']);
+        assert_eq!(got[0].moves, vec![('B', 'A'), ('C', 'B')]);
+        assert!(got[1].delete.is_empty() && got[1].moves.is_empty());
+        for bad in [&br#"{"tracks": []}"#[..], br#"{"tracks": [{"id": "x"}]}"#, br#"{"tracks": [{"id": "1", "move": [["B"]]}]}"#,
+            br#"{"tracks": [{"id": "1", "delete": ["Z"]}]}"#] {
+            assert!(parse_arrangements(bad).is_err(), "{}", String::from_utf8_lossy(bad));
+        }
+    }
 
     #[test]
     fn an_import_needs_an_absolute_path() {

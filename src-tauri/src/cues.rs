@@ -227,6 +227,120 @@ pub(crate) async fn add_hot_cues<R: tauri::Runtime>(
     Ok(outcome)
 }
 
+/// One track's hot cues rearranged, for the local API (fork): the cues at `delete` removed, then each `(from, to)` move made, in
+/// order. Letters name the slots as they were before anything happened; a move is made only into a slot that is free by then,
+/// so nothing slides and nothing is overwritten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arrangement {
+    pub track: String,
+    pub delete: Vec<char>,
+    pub moves: Vec<(char, char)>,
+}
+
+/// What [`arrange_hot_cues`] did on one track.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ArrangeOutcome {
+    pub track: String,
+    pub deleted: Vec<char>,
+    pub moved: Vec<(char, char)>,
+    pub skipped: Vec<String>,
+}
+
+type Step = (CueEdit, Option<char>, Option<(char, char)>);
+
+/// The edits an arrangement needs, worked out from the track's cues before any edit: which cue sits on each letter, and
+/// whether each step can be made (a deleted or moved letter has a cue, a move lands on a slot that is free by then).
+fn plan_arrangement(cues: &[Cue], plan: &Arrangement) -> (Vec<Step>, Vec<String>) {
+    let mut at: std::collections::HashMap<char, u32> =
+        cues.iter().filter_map(|c| c.hot_letter().filter(|_| c.id != 0).map(|l| (l, c.id))).collect();
+    let (mut edits, mut skipped) = (Vec::new(), Vec::new());
+    for &letter in &plan.delete {
+        match at.remove(&letter) {
+            Some(id) => edits.push((CueEdit::Delete { cue: id.to_string() }, Some(letter), None)),
+            None => skipped.push(format!("delete {letter}: no hot cue there")),
+        }
+    }
+    for &(from, to) in &plan.moves {
+        if at.contains_key(&to) {
+            skipped.push(format!("move {from} to {to}: {to} is taken"));
+            continue;
+        }
+        match at.remove(&from) {
+            Some(id) => {
+                at.insert(to, id);
+                edits.push((CueEdit::Slot { cue: id.to_string(), kind: CueKind::Hot(to) }, None, Some((from, to))));
+            }
+            None => skipped.push(format!("move {from} to {to}: no hot cue at {from}")),
+        }
+    }
+    (edits, skipped)
+}
+
+/// Rearranges hot cues on many tracks in one write (the local API's batch: thousands of tracks would take hours one save at a
+/// time). Each step is the same writer edit as the interface's delete / move-to-slot; afterwards every touched track's cues are
+/// re-read and `cues:changed` names it.
+pub(crate) async fn arrange_hot_cues<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    plans: Vec<Arrangement>,
+) -> AppResult<Vec<ArrangeOutcome>> {
+    use tauri::Manager as _;
+    let state = Arc::clone(&app.state::<Arc<AppState>>());
+    let library = state.library()?;
+    let mut outcomes = Vec::with_capacity(plans.len());
+    let mut steps: Vec<(usize, Vec<Step>)> = Vec::new();
+    for plan in &plans {
+        let mut outcome = ArrangeOutcome { track: plan.track.clone(), ..ArrangeOutcome::default() };
+        match library.row_of(&plan.track) {
+            None => outcome.skipped.push("no such track".to_owned()),
+            Some(row) => {
+                let (edits, skipped) = plan_arrangement(&library.cues_of(row), plan);
+                outcome.skipped = skipped;
+                if !edits.is_empty() {
+                    steps.push((outcomes.len(), edits));
+                }
+            }
+        }
+        outcomes.push(outcome);
+    }
+    let touched: Vec<String> = steps.iter().map(|(i, _)| outcomes[*i].track.clone()).collect();
+    let outcomes = blocking("arrange_hot_cues", move || {
+        let mut outcomes = outcomes;
+        if steps.is_empty() {
+            return Ok(outcomes);
+        }
+        let results = match state.write(|writer| {
+            Ok(steps
+                .into_iter()
+                .map(|(i, edits)| (i, edits.into_iter().map(|(edit, del, mv)| (apply(writer, edit), del, mv)).collect::<Vec<_>>()))
+                .collect::<Vec<_>>())
+        }) {
+            Ok(results) => results,
+            Err(refused) => return Err(write_error(refused)),
+        };
+        for (i, done) in results {
+            for (result, del, mv) in done {
+                match result {
+                    Ok(_) => {
+                        outcomes[i].deleted.extend(del);
+                        outcomes[i].moved.extend(mv);
+                    }
+                    Err(e) => outcomes[i].skipped.push(e.message),
+                }
+            }
+        }
+        let db = state.open_read_only().map_err(write_error)?;
+        for track in &touched {
+            rbl_index::reload_cues_of(&db, &library, track).map_err(|e| AppError::new(ErrorKind::Internal, e.to_string()))?;
+        }
+        Ok(outcomes)
+    })
+    .await?;
+    for o in outcomes.iter().filter(|o| !o.deleted.is_empty() || !o.moved.is_empty()) {
+        let _ = tauri::Emitter::emit(&app, "cues:changed", &o.track);
+    }
+    Ok(outcomes)
+}
+
 #[tauri::command]
 pub async fn add_cue<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -399,6 +513,28 @@ mod tests {
         fn cues(&self, track: &str) -> Vec<Cue> {
             self.library.cues_of(self.library.row_of(track).unwrap())
         }
+    }
+
+    #[test]
+    fn an_arrangement_deletes_then_moves_onto_free_slots_only() {
+        let mut f = open();
+        let track = track_id(0);
+        for (letter, ms) in [('A', 300), ('E', 44_000), ('B', 55_000), ('F', 99_000), ('C', 110_000)] {
+            apply(&mut f.writer, CueEdit::Add { track: track.clone(), kind: CueKind::Hot(letter), position_ms: ms }).unwrap();
+        }
+        f.reload(&track);
+        // the searcher's layout E-B-F-C (start cue on A) becomes E-A-F-B; the last move lands on a taken slot and is left
+        let plan = Arrangement { track: track.clone(), delete: vec!['A'], moves: vec![('B', 'A'), ('C', 'B'), ('F', 'E')] };
+        let (steps, skipped) = plan_arrangement(&f.cues(&track), &plan);
+        assert_eq!(steps.len(), 3);
+        assert_eq!(skipped, vec!["move F to E: E is taken".to_owned()]);
+        for (edit, _, _) in steps {
+            apply(&mut f.writer, edit).unwrap();
+        }
+        f.reload(&track);
+        let mut got: Vec<(char, u32)> = f.cues(&track).iter().filter_map(|c| c.hot_letter().map(|l| (l, c.position_ms))).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![('A', 55_000), ('B', 110_000), ('E', 44_000), ('F', 99_000)]);
     }
 
     fn kind(json: &str) -> Result<CueKind, serde_json::Error> {
