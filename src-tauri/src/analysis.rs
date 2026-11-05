@@ -349,7 +349,8 @@ fn analyse_file(
     head_secs: f64,
     drawing: Option<&Drawing<'_>>,
 ) -> AppResult<(rbl_analysis::Analysis, f64)> {
-    let mut stream = rbl_audio::MonoStream::open(path).map_err(|e| decode_error(&e))?;
+    // Fork: the SSD mirror's copy when it is the same file (see `ssd_mirror`).
+    let mut stream = rbl_audio::MonoStream::open(&crate::ssd_mirror::fast_path(path)).map_err(|e| decode_error(&e))?;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a positive number of seconds at an audio rate")]
     let cap = (head_secs.max(0.0) * f64::from(stream.sample_rate())) as usize;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a positive number of seconds at an audio rate")]

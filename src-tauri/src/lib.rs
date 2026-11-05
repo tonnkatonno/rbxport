@@ -11,6 +11,7 @@ mod file_drag;
 mod startup;
 mod screen_cache;
 mod sentry;
+mod ssd_mirror;
 #[cfg(test)]
 mod test_stick;
 pub mod analysis;
