@@ -24,6 +24,9 @@
 //!   `"allow_duplicates": true` keeps a track listed more than once.
 //! - `DELETE /v1/playlists/{id}`: deletes one plain playlist (never a folder or an intelligent playlist), the same recorded edit as
 //!   the interface's Delete Playlist, so Undo brings it back. Its tracks stay in the collection.
+//! - `POST /v1/tracks/{id}/grid` with `{"edits": [{"kind": "tempo", "bpmX100": 17400, "anchorMs": 1294}, {"kind": "nudge", "ms": -180}]}`,
+//!   1 to 8 edits applied in order to the whole grid, each one the GRID panel's own edit (so its Undo takes them back). Answers the grid's
+//!   tempo and beat count after the last one. A locked track or a grid the edit does not fit is refused (409).
 //! - `POST /v1/tracks/import` with `{"path": "D:/.../file.flac"}`: adds one audio file to the library (or finds it there) and answers its id.
 //! - `GET  /v1/tracks/{id}/cues`: the track cues (memory and hot, hot ones with their letter).
 //! - `POST /v1/tracks/{id}/hotcues` with `{"cues": [{"slot": "B", "ms": 88275}, ...]}`, slots A to H: adds hot cues. A slot that is
@@ -239,6 +242,7 @@ fn route(request: &Request, app: &AppHandle, allow_write: bool) -> Reply {
         ("DELETE", ["v1", "playlists", id]) => delete_playlist(app, &state, id, allow_write),
         ("POST", ["v1", "tracks", "import"]) => import_track(app, &request.body, allow_write),
         ("GET", ["v1", "tracks", id, "cues"]) => track_cues(&state, id),
+        ("POST", ["v1", "tracks", id, "grid"]) => edit_grid(app, &state, id, &request.body, allow_write),
         ("POST", ["v1", "tracks", id, "hotcues"]) => add_hot_cues(app, &state, id, &request.body, allow_write),
         ("POST", ["v1", "hotcues", "arrange"]) => arrange_hot_cues(app, &request.body, allow_write),
         (_, ["v1", ..]) => fail(404, "no such route, or the method is not allowed on it"),
@@ -391,6 +395,44 @@ fn delete_playlist(app: &AppHandle, state: &AppState, id: &str, allow_write: boo
         }
         Err(e) => (409, json!({ "error": e.message })),
     }
+}
+
+/// `{"edits": [...]}`: 1 to 8 grid edits in the GRID panel's own shape (`crate::grid::GridEdit`, `kind` in camelCase).
+fn parse_grid_edits(body: &[u8]) -> Result<Vec<crate::grid::GridEdit>, String> {
+    let parsed: Value = serde_json::from_slice(body).map_err(|_| "the body is not JSON".to_owned())?;
+    let list = parsed.get("edits").cloned().ok_or_else(|| "\"edits\" must be a list".to_owned())?;
+    let edits: Vec<crate::grid::GridEdit> =
+        serde_json::from_value(list).map_err(|e| format!("each edit is a grid edit, such as {{\"kind\": \"nudge\", \"ms\": -180}}: {e}"))?;
+    if edits.is_empty() || edits.len() > 8 {
+        return Err("1 to 8 edits per request".to_owned());
+    }
+    Ok(edits)
+}
+
+fn edit_grid(app: &AppHandle, state: &AppState, id: &str, body: &[u8], allow_write: bool) -> Reply {
+    if !allow_write {
+        return fail(403, format!("writes are off; start rbxport with {WRITE_ENV}=1"));
+    }
+    let edits = match parse_grid_edits(body) {
+        Ok(edits) => edits,
+        Err(message) => return fail(400, message),
+    };
+    let Ok(library) = state.library() else { return fail(503, "the library has not finished loading yet") };
+    if id.parse::<u64>().ok().and_then(|n| library.row_of_id(n)).is_none() {
+        return fail(404, "no such track");
+    }
+    let mut last = None;
+    for edit in edits {
+        match tauri::async_runtime::block_on(crate::grid::grid_edit(
+            app.clone(), app.state(), app.state(), app.state(), id.to_owned(), edit, None, None, None,
+        )) {
+            Ok(done) => last = Some(done),
+            Err(e) => return (409, json!({ "error": e.message, "applied": last.is_some() })),
+        }
+    }
+    let done = last.expect("at least one edit");
+    tracing::info!(track = id, bpm_x100 = done.bpm_x100, beats = done.beats, "local API edited a grid");
+    (200, json!({ "ok": true, "bpm_x100": done.bpm_x100, "beats": done.beats }))
 }
 
 /// `{"cues": [{"slot": "B", "ms": 88275}, ...]}`: hot cue letters A to H with positions in ms (up to 24 h), 1 to 16 of them.
@@ -726,6 +768,16 @@ mod tests {
         assert_eq!(parse("GET /").map(|_| ()).unwrap_err().0, 400);
         let big = format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(MAX_HEAD + 10));
         assert_eq!(parse(&big).map(|_| ()).unwrap_err().0, 431);
+    }
+
+    #[test]
+    fn grid_edits_are_the_grid_panels_own_and_one_to_eight_of_them() {
+        let ok = parse_grid_edits(br#"{"edits": [{"kind": "tempo", "bpmX100": 17400, "anchorMs": 1294}, {"kind": "nudge", "ms": -180}]}"#).unwrap();
+        assert_eq!(ok.len(), 2);
+        assert!(parse_grid_edits(br#"{"edits": []}"#).is_err());
+        assert!(parse_grid_edits(br#"{"edits": [{"kind": "warp", "ms": 1}]}"#).is_err());
+        assert!(parse_grid_edits(br#"{"edits": [{"kind": "nudge"}]}"#).is_err());
+        assert!(parse_grid_edits(b"nope").is_err());
     }
 
     #[test]
