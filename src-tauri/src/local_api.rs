@@ -22,6 +22,8 @@
 //! - `POST /v1/playlists` with `{"name": "...", "tracks": ["<content id>", ...]}`: a new top-level playlist holding the tracks in
 //!   order, as one edit. Answers with its `id`. A name already taken is refused (409).
 //!   `"allow_duplicates": true` keeps a track listed more than once.
+//! - `DELETE /v1/playlists/{id}`: deletes one plain playlist (never a folder or an intelligent playlist), the same recorded edit as
+//!   the interface's Delete Playlist, so Undo brings it back. Its tracks stay in the collection.
 //! - `POST /v1/tracks/import` with `{"path": "D:/.../file.flac"}`: adds one audio file to the library (or finds it there) and answers its id.
 //! - `GET  /v1/tracks/{id}/cues`: the track cues (memory and hot, hot ones with their letter).
 //! - `POST /v1/tracks/{id}/hotcues` with `{"cues": [{"slot": "B", "ms": 88275}, ...]}`, slots A to H: adds hot cues. A slot that is
@@ -234,6 +236,7 @@ fn route(request: &Request, app: &AppHandle, allow_write: bool) -> Reply {
         ("GET", ["v1", "playlists", id]) => playlist(&state, id),
         ("POST", ["v1", "playlists", id, "tracks"]) => add_tracks(app, &state, id, &request.body, allow_write),
         ("POST", ["v1", "playlists"]) => create_playlist(app, &state, &request.body, allow_write),
+        ("DELETE", ["v1", "playlists", id]) => delete_playlist(app, &state, id, allow_write),
         ("POST", ["v1", "tracks", "import"]) => import_track(app, &request.body, allow_write),
         ("GET", ["v1", "tracks", id, "cues"]) => track_cues(&state, id),
         ("POST", ["v1", "tracks", id, "hotcues"]) => add_hot_cues(app, &state, id, &request.body, allow_write),
@@ -363,6 +366,28 @@ fn create_playlist(app: &AppHandle, state: &AppState, body: &[u8], allow_write: 
         Ok((_generation, id)) => {
             tracing::info!(playlist = %id, tracks = ids.len(), "local API created a playlist");
             (200, json!({ "ok": true, "id": id, "name": name, "tracks": ids.len() }))
+        }
+        Err(e) => (409, json!({ "error": e.message })),
+    }
+}
+
+fn delete_playlist(app: &AppHandle, state: &AppState, id: &str, allow_write: bool) -> Reply {
+    if !allow_write {
+        return fail(403, format!("writes are off; start rbxport with {WRITE_ENV}=1"));
+    }
+    let Ok(library) = state.library() else { return fail(503, "the library has not finished loading yet") };
+    let name = {
+        let p = library.playlists();
+        let Some(i) = find_playlist(&p, id) else { return fail(404, "no such playlist") };
+        if kind_of(p.attribute.get(i).copied().unwrap_or(0)) != "playlist" {
+            return fail(409, "only a plain playlist can be deleted here, not a folder or an intelligent playlist");
+        }
+        p.names.get(i).to_owned()
+    };
+    match tauri::async_runtime::block_on(crate::commands::delete_playlist(app.clone(), app.state(), id.to_owned())) {
+        Ok(_) => {
+            tracing::info!(playlist = id, "local API deleted a playlist");
+            (200, json!({ "ok": true, "id": id, "name": name }))
         }
         Err(e) => (409, json!({ "error": e.message })),
     }
