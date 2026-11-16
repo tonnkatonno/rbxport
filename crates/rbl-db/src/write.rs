@@ -3421,6 +3421,50 @@ impl Writer {
         Ok(Changed { rows, usn })
     }
 
+    /// Fork: puts a hot cue on a FREE pad slot and touches no other cue, unlike
+    /// [`Writer::move_hot_cue`], which slides every cue between the two slots
+    /// (a move from B to G would carry C–F down one). Refused when the slot is
+    /// taken. The local API's batch rearrangement uses this.
+    pub fn place_hot_cue(&mut self, cue: &str, kind: u8) -> Result<Changed> {
+        const SLOTS: [i64; 16] = [1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+        if !SLOTS.contains(&i64::from(kind)) {
+            return Err(DbError::WriteRefused(format!("{kind} is not a hot cue slot rekordbox has")));
+        }
+        self.prepare()?;
+        let stamp = time::now();
+        let tx = self.library.connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (content, from_kind): (Option<String>, i64) = tx
+            .query_row(
+                "SELECT ContentID, Kind FROM djmdCue WHERE ID = ?1 AND rb_local_deleted = 0",
+                params![cue],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|_| DbError::WriteRefused(format!("no cue {cue}")))?;
+        if !SLOTS.contains(&from_kind) {
+            return Err(DbError::WriteRefused(format!("cue {cue} is not in a hot cue slot")));
+        }
+        if from_kind == i64::from(kind) {
+            return Ok(Changed { rows: 1, usn: 0 });
+        }
+        let taken: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM djmdCue WHERE ContentID IS ?1 AND Kind = ?2 AND rb_local_deleted = 0",
+            params![content, i64::from(kind)],
+            |r| r.get(0),
+        )?;
+        if taken > 0 {
+            return Err(DbError::WriteRefused(format!("hot cue slot {kind} is taken")));
+        }
+        let usn = next_usn(&tx)?;
+        let rows = tx.execute(
+            "UPDATE djmdCue SET Kind = ?1, rb_local_usn = ?2, updated_at = ?3 WHERE ID = ?4",
+            params![i64::from(kind), usn, stamp, cue],
+        )?;
+        set_counter(&tx, usn)?;
+        tx.commit()?;
+        Ok(Changed { rows, usn })
+    }
+
     /// The track a live cue belongs to, or `None` for a cue that is not there.
     ///
     /// A read, so nothing is prepared or gated: a caller that is about to move

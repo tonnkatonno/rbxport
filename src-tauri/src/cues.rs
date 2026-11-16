@@ -85,6 +85,8 @@ pub enum CueEdit {
     Move { cue: String, position_ms: u32 },
     /// A hot cue to another pad slot, the cues between the two shifting over.
     Slot { cue: String, kind: CueKind },
+    /// Fork: a hot cue onto a FREE pad slot, no other cue moving (the local API's rearrangement).
+    Place { cue: String, kind: CueKind },
     Colour { cue: String, colour: Option<u8> },
     Comment { cue: String, comment: String },
     /// A memory loop set as, or cleared from being, its track's Active Loop.
@@ -127,6 +129,14 @@ pub fn apply(writer: &mut rbl_db::write::Writer, edit: CueEdit) -> AppResult<Cue
         CueEdit::Slot { cue, kind } => {
             let track = owner_of(writer, &cue)?;
             let changed = writer.move_hot_cue(&cue, kind.number()?).map_err(write_error)?;
+            if changed.rows == 0 {
+                return Err(AppError::new(ErrorKind::NotFound, format!("no cue {cue}")));
+            }
+            Ok(CueChange { track, cue })
+        }
+        CueEdit::Place { cue, kind } => {
+            let track = owner_of(writer, &cue)?;
+            let changed = writer.place_hot_cue(&cue, kind.number()?).map_err(write_error)?;
             if changed.rows == 0 {
                 return Err(AppError::new(ErrorKind::NotFound, format!("no cue {cue}")));
             }
@@ -178,7 +188,7 @@ impl CueEdit {
             Self::Add { kind: CueKind::Hot(_), .. } => "Set Hot Cue",
             Self::AddLoop { .. } => "Set Loop",
             Self::Move { .. } => "Move Cue",
-            Self::Slot { .. } => "Move Hot Cue",
+            Self::Slot { .. } | Self::Place { .. } => "Move Hot Cue",
             Self::Colour { .. } => "Cue Color",
             Self::Comment { .. } => "Cue Comment",
             Self::ActiveLoop { .. } => "Active Loop",
@@ -195,6 +205,7 @@ pub fn apply_recorded(writer: &mut rbl_db::write::Writer, edit: CueEdit) -> AppR
         CueEdit::Add { track, .. } | CueEdit::AddLoop { track, .. } => track.clone(),
         CueEdit::Move { cue, .. }
         | CueEdit::Slot { cue, .. }
+        | CueEdit::Place { cue, .. }
         | CueEdit::Colour { cue, .. }
         | CueEdit::Comment { cue, .. }
         | CueEdit::ActiveLoop { cue, .. }
@@ -350,7 +361,7 @@ fn plan_arrangement(cues: &[Cue], plan: &Arrangement) -> (Vec<Step>, Vec<String>
         match at.remove(&from) {
             Some(id) => {
                 at.insert(to, id);
-                edits.push((CueEdit::Slot { cue: id.to_string(), kind: CueKind::Hot(to) }, None, Some((from, to))));
+                edits.push((CueEdit::Place { cue: id.to_string(), kind: CueKind::Hot(to) }, None, Some((from, to))));
             }
             None => skipped.push(format!("move {from} to {to}: no hot cue at {from}")),
         }
@@ -646,6 +657,28 @@ mod tests {
         let mut got: Vec<(char, u32)> = f.cues(&track).iter().filter_map(|c| c.hot_letter().map(|l| (l, c.position_ms))).collect();
         got.sort_unstable();
         assert_eq!(got, vec![('A', 55_000), ('B', 110_000), ('E', 44_000), ('F', 99_000)]);
+    }
+
+    /// A move past other slots (B to G) must not carry the cues it passes: the
+    /// pad-drag move slid C–F down one, which put E/F on D/E [OBS 2026-11-16].
+    #[test]
+    fn an_arrangement_move_past_other_cues_leaves_them_where_they_are() {
+        let mut f = open();
+        let track = track_id(0);
+        for (letter, ms) in [('A', 174), ('B', 22_117), ('C', 44_060), ('D', 109_884), ('E', 33_084), ('F', 98_913)] {
+            apply(&mut f.writer, CueEdit::Add { track: track.clone(), kind: CueKind::Hot(letter), position_ms: ms }).unwrap();
+        }
+        f.reload(&track);
+        let plan = Arrangement { track: track.clone(), delete: vec!['A'], moves: vec![('B', 'G'), ('C', 'A'), ('D', 'B')] };
+        let (steps, skipped) = plan_arrangement(&f.cues(&track), &plan);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        for (edit, _, _) in steps {
+            apply(&mut f.writer, edit).unwrap();
+        }
+        f.reload(&track);
+        let mut got: Vec<(char, u32)> = f.cues(&track).iter().filter_map(|c| c.hot_letter().map(|l| (l, c.position_ms))).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![('A', 44_060), ('B', 109_884), ('E', 33_084), ('F', 98_913), ('G', 22_117)]);
     }
 
     fn kind(json: &str) -> Result<CueKind, serde_json::Error> {

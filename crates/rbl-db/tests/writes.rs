@@ -1625,6 +1625,24 @@ fn a_hot_cue_moves_to_a_slot_and_the_cues_between_shift_over() {
     assert_eq!(kinds(&f), before);
 }
 
+/// Fork: placing a hot cue on a free slot moves that cue alone — a move from B
+/// past C–F to G leaves them where they are — and a taken slot is refused.
+#[test]
+fn a_hot_cue_placed_on_a_free_slot_leaves_the_others_alone() {
+    let mut f = fixture();
+    let ids: Vec<String> = [(2, 22_117), (3, 44_060), (5, 109_884), (6, 33_084), (7, 98_913)]
+        .iter()
+        .map(|&(k, ms)| f.writer.add_cue(&track_id(0), k, ms).unwrap())
+        .collect();
+    let kinds = |f: &Fixture| -> Vec<i64> { ids.iter().map(|id| f.one("SELECT Kind FROM djmdCue WHERE ID = ?1", &[id])).collect() };
+    f.writer.place_hot_cue(&ids[0], 8).unwrap();                  // B to G
+    assert_eq!(kinds(&f), [8, 3, 5, 6, 7]);
+    f.writer.place_hot_cue(&ids[1], 1).unwrap();                  // C to A
+    assert_eq!(kinds(&f), [8, 1, 5, 6, 7]);
+    assert!(matches!(f.writer.place_hot_cue(&ids[2], 6), Err(DbError::WriteRefused(_))), "E is taken");
+    assert_eq!(kinds(&f), [8, 1, 5, 6, 7]);
+}
+
 /// #504: a hot cue moved across slots rewrites three rows; the revision
 /// holds those three and no other, and Undo/Redo write them back exactly
 /// under a new change counter, as any other edit.
