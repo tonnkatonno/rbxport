@@ -139,8 +139,13 @@ pub fn sections(cues: &[ExportCue], extended: bool) -> Vec<Section> {
                     entry[45 + comment.len()..48 + comment.len()]
                         .copy_from_slice(&export_colour(cue.color_code, cue.slot()));
                 } else {
-                    put32(&mut entry, 16, if cue.active_loop { 4 } else { 0 });
-                    put32(&mut entry, 20, 0x10000);
+                    // Status: 1 enabled, 4 active loop. A CDJ-2000NXS2 writes its own hot cues
+                    // as 1 with a zero word after it; a hot cue left at 0 (disabled) has its
+                    // marker drawn but its pad stays dark and cannot be called [OBS
+                    // 2026-11-15, CDJ-2000NXS2 USB].
+                    let enabled_hot = hot && !cue.active_loop;
+                    put32(&mut entry, 16, if cue.active_loop { 4 } else if hot { 1 } else { 0 });
+                    put32(&mut entry, 20, if enabled_hot { 0 } else { 0x10000 });
                     put16(
                         &mut entry,
                         24,
@@ -321,6 +326,24 @@ mod tests {
             (2, 2000, 4000)
         );
         assert_eq!(&ext[3].payload[36..40], &[0, 4, 0, 1]);
+    }
+
+    /// A CDJ-2000NXS2 leaves a hot cue's pad dark unless its PCPT status
+    /// word is 1, and writes its own hot cues as 1 then a zero word; memory
+    /// cues keep 0 and 0x10000 [OBS 2026-11-15].
+    #[test]
+    fn legacy_hot_cues_are_enabled_and_memory_cues_are_not() {
+        let cues = vec![
+            ExportCue { kind: 1, time_ms: 500, ..Default::default() },
+            ExportCue { kind: 6, time_ms: 900, ..Default::default() },
+            ExportCue { time_ms: 1500, ..Default::default() },
+        ];
+        let dat = sections(&cues, false);
+        assert_eq!(&dat[0].payload[16..24], &[0, 0, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(&dat[1].payload[16..24], &[0, 0, 0, 0, 0, 1, 0, 0]);
+        let ext = sections(&cues, true);
+        assert_eq!(&ext[0].payload[12..16], &5_u32.to_be_bytes());
+        assert_eq!(&ext[0].payload[16..24], &[0, 0, 0, 1, 0, 0, 0, 0]);
     }
 
     /// The Active Loop is desktop Kind 4 (#577). rekordbox 7.2.19's

@@ -1634,8 +1634,15 @@ fn export_cancellable_inner(
                 parsed.sections = parsed.sections.iter().map(rbl_anlz::encode::with_device_preview).collect();
                 if let Some(cues) = &track.cues {
                     if extension == "DAT" || extension == "EXT" {
+                        // The lists go where the source had them — rekordbox's own files keep
+                        // them straight after `PWV3` — not at the end of the file. A
+                        // CDJ-2000NXS2 dropped a track's whole EXT (detail waveform and
+                        // hot cues E-H) with the lists appended after `PSSI`, and took it
+                        // with them in rekordbox's place [OBS 2026-11-15].
+                        let at = parsed.sections.iter().position(|s| s.is_cue_list()).unwrap_or(parsed.sections.len());
                         parsed.sections.retain(|s| !s.is_cue_list());
-                        parsed.sections.extend(rbl_anlz::cues::sections(cues, extension == "EXT"));
+                        let at = at.min(parsed.sections.len());
+                        parsed.sections.splice(at..at, rbl_anlz::cues::sections(cues, extension == "EXT"));
                     }
                 }
                 Ok::<_, std::io::Error>((extension.clone(), parsed.to_bytes()))
