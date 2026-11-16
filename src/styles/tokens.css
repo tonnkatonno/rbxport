@@ -12,10 +12,12 @@
   --c-field-placeholder: #4B4B4B; /* measured: search placeholder text and magnifier glyph */
   --c-text: #E6E6E6;
   --c-text-dim: #9A9A9A;
+  --c-played: #69B900; /* rekordbox 7.2.19 static: a played track's text in the track list, theme colour 0x30000e1 in the dark theme and the selected-row constant alike (ListViewer::findTextColour @0x1003efb70; the theme table from __GLOBAL__sub_I_ColorTheme.cpp, issue #540) */
   --c-icon-off: #A0A0A0; /* skins/*_off.svg fill rgb(160,160,160) */
   --c-icon-on: #F0F0F0; /* skins/*_on.svg fill rgb(240,240,240) */
   --c-missing: #FF9600; /* measured: the orange [!] rekordbox 7.2.14 draws in the Attribute column for a track whose file is missing (Winrig chris-win11 2026-10-08, issue #201) */
   --c-missing-manager: #191919; /* measured: rekordbox 7.2.14's Missing File Manager window and every other row of its list, (25,25,25), the rows between them black (Winrig chris-win11 2026-10-08, issue #201) */
+  --c-missing-manager-heading: #969696; /* measured: the Missing File Manager's column headings, (150,150,150) on #191919, rekordbox 7.2.14 on chris-win11 (Winrig 2026-10-17, issue #541); `MissingFileTableLookAndFeel` */
   --c-wave-low: #0055E1; /* rekordbox's 3Band waveform, the low band standing alone; sampled from rekordbox in mixxxdj/mixxx#12326 and the same value our own capture measured */
   --c-wave-mid: #FFA600; /* rekordbox's 3Band waveform, the mid band standing alone (mixxxdj/mixxx#12326); our overview capture measured #FF8C00 where the mid stood mostly alone */
   --c-wave-high: #FFFFFF; /* rekordbox's 3Band waveform, the high band standing alone (mixxxdj/mixxx#12326) */
@@ -29,6 +31,7 @@
   --c-cue-hot-text: #000000; /* docs/screenshots at 2x: the letter inside that badge, cap height 14px */
   --c-meter-track: #323232; /* capture of rekordbox's top bar: the unlit part of both meters */
   --c-error: #E23B2E; /* UNMEASURED — failures in the status bar; the same red the meter's clip band uses, so the app has one alarm colour */
+  --c-device-copy-short: #C00000; /* rekordbox 7.2.19 static: importFromDeviceCopySettingWindow colours its free space 0xFFC00000 when the files do not fit (@0x1001d7558) */
   --c-on-error: #FFFFFF; /* UNMEASURED — text on a filled alarm band, where the red is the background rather than the ink */
   --c-sync-pending: #5BC8FF; /* UNMEASURED — a lighter blue than --c-accent, so the space a sync would add reads apart from what the stick already holds */
   --c-meter-green: #2FBF4E; /* UNMEASURED — the capture's meters are silent, so a level meter's own convention: green below -6 dB */
@@ -40,7 +43,8 @@
   --c-eject: #CDCDCD; /* sampled from a capture of the sleeve hovered: the eject glyph is a flat (205,205,205) */
   --c-eject-scrim: #000000; /* INFERRED — the sampled sleeve is uniform there, so the darkening cannot be separated from the artwork; without it the glyph is unreadable over bright art */
   --c-zoom-scrim: rgb(0 0 0 / 80%); /* INFERRED — the zoom cluster sits over the detail waveform, so it needs a ground the waveform still reads through; 55% left the rings competing with a bright transient behind them */
-  --c-playhead-armed: #EA3323; /* UNMEASURED — the armed playhead's red, described rather than sampled; the value is the cue head's */
+  --c-playhead-armed: #FF0000; /* rekordbox 7.2.19 static: the paused head's red is juce::Colour(0xff, 0x00, 0x00) on the overview (WidgetLoudView::drawTextures @0x100fd1700) and the detail (WidgetWaveView::drawCurrentCursorGL @0x10211f1a8); #393's capture of 7.2.14 sampled the detail's as flat (255,0,0). Was #EA3323, the cue head's red, unmeasured (#570) */
+  --c-playhead: #E0E0E0; /* #393, the same rig (rekordbox-07-deck-playing-1x.png): the playing detail playhead, two device columns of flat (224,224,224) */
   --c-cue-head: #EA3323; /* docs/screenshots at 2x: the 3x6px head at a cue, left of the hot cue badge sharing its position */
   --c-downbeat: #FFFFFF; /* measured from docs/screenshots; the detail band runs y 358..650: every fourth marker's line, white where the others are grey */
   --c-phrase-intro: #B83F1D; /* sampled from the phrase bar in a 2x capture of rekordbox 7.2.11: INTRO */
@@ -82,6 +86,23 @@
   --c-filter-label: #969696; /* measured from the track-filter capture docs/screenshots (rekordbox 7.2.11, 2x, 9.10.17 PM): the BPM / KEY / RATING / COLOR / tag headings, MASTER PLAYER, OR and RST */
   --c-filter-text: #FFFFFF; /* measured from the track-filter capture docs/screenshots (rekordbox 7.2.11, 2x, 9.10.17 PM): list rows (123, Abm, Pink) and the toggle glyph */
   --c-filter-accent: #3571E3; /* measured from the track-filter capture docs/screenshots (rekordbox 7.2.11, 2x, 9.10.17 PM): the picked row, the tick boxes and AND; the same value the pads' AU / Q use */
+  --c-mytag-heading: #191919; /* measured, rekordbox 7.2.14 for Windows (Winrig chris-win11 2026-10-17, issue #539, rekordbox-08): a My Tag category's row, (25,25,25) under 'Lexicon Tags' and each 'Empty Category' */
+  --c-mytag-heading-text: #969696; /* measured, same capture: the category name, (150,150,150) at its stems */
+  --c-mytag-text: #FFFFFF; /* measured, same capture: a tag's name with a track selected */
+  --c-mytag-text-off: #7F7F7F; /* measured, rekordbox-05 (no track selected): a tag's name, greyed with its tick box */
+  --c-mytag-check: #282828; /* measured, rekordbox-08: a tick box with a track selected, (40,40,40) across its 12px face */
+  --c-mytag-check-off: #1E1E1E; /* measured, rekordbox-05: a tick box with no track selected */
+  --c-mytag-check-edge: #050505; /* measured, rekordbox-08: the 1px ring round the enabled face, its corners left black */
+  --c-mytag-check-off-edge: #010101; /* measured, rekordbox-05: the same ring round a greyed face */
+  --c-mytag-check-on: #1473EB; /* skins/checkbox_mark.png, the face ColourThemeLookAndFeel::drawTickBox (@0x1000842b8, rekordbox 7.2.19) draws for a ticked box */
+  --c-mytag-check-on-edge: #040B13; /* the same png's anti-aliased edge once drawTickBox stretches it from 16px to the 14px drawToggleButton (@0x10008462c) asks for: a 1px ring at about an eighth of the face */
+  --c-mytag-tick: #FFFFFF; /* skins/checkbox_on.svg's tick, rgb(255,255,255), the tick of checkbox_mark.png */
+  --c-mytag-check-on-off: #144480; /* a ticked box greyed: drawTickBox draws both pngs at 50% opacity (checkbox_common #282828, then checkbox_mark) */
+  --c-mytag-tick-off: #8A8A8A; /* the white tick of the same greyed box, at 50% over it */
+  --c-mytag-edit-text: #969696; /* a name being renamed: BaseLookAndFeel's Label::textWhenEditingColourId, Colour(150,150,150) (ctor @0x101b5f80c, static init @0x101b672d0) */
+  --c-mytag-edit-select: #7D7D7D; /* the selection in that box: MyTagItemComponent's ctor sets TextEditor::highlightColourId to Colour(125,125,125) (@0x10066c18c) */
+  --c-mytag-edit-select-text: #191919; /* the selected text: highlightedTextColourId from the default look's colour 0x1000900, Colour(25,25,25) (@0x10066c1a4, @0x101b5f660) */
+  --c-mytag-add: #969696; /* skins/brws_tree_addIcon.svg circle rgb(150,150,150), and measured so on the rig; its plus is the svg's rgb(25,25,25) */
   --c-filter-strip: #282828; /* measured from the track-filter capture docs/screenshots (rekordbox 7.2.11, 2x, 9.10.17 PM): the MASTER PLAYER strip behind the arrows, x 920..1634 */
   --c-filter-chip: #040404; /* measured from the track-filter capture docs/screenshots (rekordbox 7.2.11, 2x, 9.10.17 PM): a My Tag chip's ground */
   --c-filter-chip-text: #4F4F4F; /* measured from the track-filter capture docs/screenshots (rekordbox 7.2.11, 2x, 9.10.17 PM): a My Tag chip's text */
@@ -205,6 +226,14 @@
   --s-right-rail-w: 24px; /* docs/screenshots (rekordbox 7.2.11, 2x) 9.10.38 PM: the icon column x 3662..3709 between the list's scrollbar column and the window edge, 48px; 9.09.26 PM measured 56 because the sub-browser's 4pt right margin (x 3654..3661) was counted into it. The boxes sit at x 3668..3703 in every capture */
   --s-tree-rail-w: 57px; /* browseSetting.xml TreeShortcut w=57 */
   --s-info-w: 557px; /* browseSetting.xml BrowseLayout ListInfo w=557 */
+  --s-mytag-w: 322px; /* measured, rekordbox 7.2.14 for Windows at 100% (Winrig chris-win11 2026-10-17, issue #539, rekordbox-08): the My Tag window x 1565..1886, from its 1px black edge to the icon column */
+  --s-mytag-row-h: 24px; /* measured, same capture: category and tag rows on a 24px pitch (y 344, 368, 392, ...) */
+  --s-mytag-check: 12px; /* measured, same capture: the tick box's solid face x 1574..1585 inside the 16px ToggleButton BrowseMyTagView sets at (6, 4) [static 7.2.19 MyTagItemComponent::resized @0x10066d4d4] */
+  --s-mytag-check-x: 8px; /* measured: the face starts 8px into the row */
+  --s-mytag-name-x: 27px; /* static, MyTagItemComponent::resized: a tag's Label at x 27; measured ink from x 1593 */
+  --s-mytag-heading-x: 7px; /* static, same: a category's Label at x 7; measured ink from x 1574 */
+  --s-mytag-add: 11px; /* skins/brws_tree_addIcon.svg 11x11, centred in the 14px button resized() sets 20px in from the row's right */
+  --s-mytag-add-right: 20px; /* static, same: the add button at width - 20 (the width less 13 for the scrollbar), its glyph 2px in; measured glyph x 1856..1866, 20px short of the window's right edge at 1887 */
   --s-sub-browse-w: 878px; /* capture 2026-09-09 9.09.26 PM at 2x: the sub-browser runs x 1898..3653 of a 1798pt window, 1756px, rail to list edge. browseSetting.xml recorded SubBrowse w=1107 for a different window; the capture is what rekordbox drew */
   --s-player-h: 279px; /* measured from a 2x capture of rekordbox 7.2.11 running; player spans y 56..335pt */
   --s-player-gutter-h: 4px; /* user adjustment: increase the black gap below the player by 1px from the measured 3px */
@@ -227,9 +256,9 @@
   --s-player-vocal-h: 5px; /* measured from a 2x capture of rekordbox 7.2.11 running; vocal strip above the overview */
   --s-player-phrase-h: 14px; /* measured from a 2x capture of rekordbox 7.2.11 running; phrase bar y 127..141pt */
   --s-player-detail-h: 146px; /* measured from a 2x capture of rekordbox 7.2.11 running; detail waveform y 141..287pt */
-  --s-wave-inset-top: 20px; /* by request 2026-09-18: the waveform a little shorter than the measured 11px inset drew it, and room for the beat markers to reach 15px above it */
+  --s-wave-inset-top: 33px; /* #393: the beat markers' top plus the 15px they reach above the waveform (by request 2026-09-18), now that the markers start under the cue lane rather than in it */
   --s-wave-inset-bottom: 16px; /* by request 2026-09-18: the waveform a little shorter than the measured 2px inset drew it, and room for the beat markers to reach 15px below it */
-  --s-beat-marker-top: 5px; /* by request 2026-09-18: the waveform's top inset less the 15px a marker reaches above the waveform (measured, rekordbox's own started 26px down the band) */
+  --s-beat-marker-top: 18px; /* #393: under the cue lane, where rekordbox 7.2.14 starts the beat heads on the row after the hot cue badge's last (chris-win11 150%: badge y 144..162, heads 163..169 of a band the playhead spans from y 132, so 31 device px down = 20.7pt there; scaled by this badge's 11px over rekordbox's 12.7 that is 17.9px). The 2026-09-18 request had moved them to 5px, above the badges, which put the badge over the waveform */
   --s-beat-marker-bottom: 1px; /* by request 2026-09-18: the waveform's bottom inset less the 15px a marker reaches below the waveform (measured, rekordbox's own ended 6.5px up the band) */
   --s-beat-head-h: 4px; /* measured from docs/screenshots; the detail band runs y 358..650: the triangle at each end of a marker, y 410..417 */
   --s-player-pad-h: 48px; /* measured from a 2x capture of rekordbox 7.2.11 running; hot-cue / memory bar y 287..335pt */
@@ -324,6 +353,7 @@
   --s-filter-dot: 8px; /* measured from the track-filter capture docs/screenshots (rekordbox 7.2.11, 2x, 9.10.17 PM): a colour dot, 16px across at 2x */
   --s-filter-toggle: 18px; /* measured from the track-filter capture docs/screenshots (rekordbox 7.2.11, 2x, 9.10.17 PM): the header's filter button x 3122..3158, y 760..796 */
   --s-filter-toggle-glyph: 11px; /* measured from the track-filter capture docs/screenshots (rekordbox 7.2.11, 2x, 9.10.17 PM): the glyph inside it, x 3129..3151 */
+  --s-artwork-mode-gap: 20px; /* rekordbox 7.2.18 manual p.81 (browser panel, item 6), rendered at 8x: the two artwork buttons' glyphs start 115px apart at 3px per skin unit, a 38-unit pitch for 18-unit buttons; the filter pair beside them has the same pitch. [ASSUME] the manual's screenshot is at rekordbox's 1x layout */
   --s-filter-scrollbar-w: 6px; /* measured from the track-filter capture docs/screenshots (rekordbox 7.2.11, 2x, 9.10.17 PM): the list scrollbar column x 1190..1202, with a 4pt thumb */
   --s-device-strip-h: 33px; /* measured from the device-panel captures docs/screenshots (rekordbox 7.2.11, 2x, 9.08.22 to 9.08.41 PM): the tab strip band y 376..408.5pt, tabs 20pt tall 5pt below its top */
   --s-device-tab-w: 128px; /* measured from the device-panel captures docs/screenshots (rekordbox 7.2.11, 2x, 9.08.22 to 9.08.41 PM): one tab x 402..529.5pt; six on a 132pt pitch, 14pt in from the panel's left edge */
@@ -436,8 +466,8 @@
   --s-context-menu-pad: 1px; /* docs/screenshots context-menu-tree@2x / context-menu-track@2x (rekordbox 7.2.11, 2x): the first row starts 2px at 2x inside the hairline and the last ends 2px above it; the inner line is drawn in that point */
   --s-cue-marker-w: 16px; /* the user's 2x crop of a hot cue on the detail waveform (cue-badge.png, 268x406, rekordbox 7.2.11): the red triangle over the badge is 32px across its top edge (x 121.3..153.7 by coverage), centred on the cue's line */
   --s-cue-marker-h: 11px; /* the same crop: the triangle narrows 1.46px a row from 31.1px at y 81; the badge covers it from y 94, and the slope reaches its point at y 102.2, 21.7px below the top edge at y 80.5 */
-  --s-cue-marker-top: 8.25px; /* the same crop: the triangle's top edge is at y 80.5 (row 80 is half covered) under a band that starts at y 64 where the phrase bar ends, 16.5px; the beat heads in the same crop start at y 116, the 26pt the beatMarkerTop token measures, so the band's top is the same one */
-  --s-cue-badge-top: 15px; /* the same crop: the badge is 22x22px at x 128..149 y 94..115, 30px under the band's top and centred on the cue's line (x 138..139), where the overview hangs its badge from the top with its left edge on the cue; the beat head under it starts at y 116, the row after the badge's last */
+  --s-cue-marker-top: 1px; /* #393: rekordbox 7.2.14 (chris-win11 150%, rekordbox-06-memory-zoom.png) starts the memory cue triangle 2 device px under the top of the band its playhead spans, in the strip above the beat heads and the waveform; 2 px / 1.5 scaled by 11/12.7 is 1.2px. The user's 2x crop below measured 8.25pt from the phrase bar's end, a band top 7pt higher; both put the triangle's top 7pt over the badge's */
+  --s-cue-badge-top: 7px; /* #393: rekordbox 7.2.14 (chris-win11 150%, rekordbox-06-hotcueA-zoom.png) draws the badge 12 device px under the band's top and the beat head on the row after its last; 12 / 1.5 scaled by 11/12.7 is 6.9px, and 7 + the 11px badge is the beat markers' 18px. The user's 2x crop: badge x 128..149 y 94..115, centred on the cue's line (x 138..139), the beat head under it starting at y 116, the row after the badge's last */
   --s-cue-line-w: 1px; /* the same crop: the line under the badge is 2px wide at 2x, x 138..139, the width of a downbeat's */
   --s-mixer-jog-w: 32px; /* the 2-player capture docs/screenshots (Screenshot 2026-09-08 at 3.00.12 PM, rekordbox 7.2.11, 2x, both decks loaded; window x 0..1920pt, the pair y 56..477): the CUE and PLAY rings in the two-deck column, y 111..143 and 149..181 for deck A — 32pt across against the 40 the one-deck column draws */
   --s-mixer-btn-w: 24.5px; /* the 2-player capture docs/screenshots (Screenshot 2026-09-08 at 3.00.12 PM, rekordbox 7.2.11, 2x, both decks loaded; window x 0..1920pt, the pair y 56..477): the beat-jump buttons x 8..32.5 and 37..61.5 in the 70pt column */

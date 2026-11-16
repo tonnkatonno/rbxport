@@ -8,6 +8,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getBackend } from "@/ipc/client";
 import type { Backend, ListTotals, RowCue, RowDto, ViewSpec } from "@/ipc/types";
 import { rowCuesOf } from "@/lib/cues";
+import { rowMemoryCueColours } from "@/lib/memoryCueColours";
 import { RowCache, PAGE_SIZE, type CacheToken } from "@/lib/rowCache";
 import { planFetches } from "@/lib/virtual";
 
@@ -39,6 +40,11 @@ export interface TrackView {
   ensureRange: (start: number, end: number) => void;
   /** Ids between two row indices inclusive, resolved by the backend. */
   idsInRange: (from: number, to: number) => Promise<string[]>;
+  /**
+   * Looks at a cached track's file again and redraws its `[!]` if that
+   * changed: rekordbox does it for the one row selected (#682).
+   */
+  recheckMissing: (trackId: string) => void;
 }
 
 /**
@@ -224,12 +230,19 @@ export function useTrackView(
         void backend.trackCues(trackId).then((cues) => {
           if (!live) return;
           const hotCues = rowCuesOf(cues);
-          const memoryCues = cues.filter(cue => cue.memory).map(cue => cue.positionMs);
+          const memory = cues.filter(cue => cue.memory);
+          const memoryCues = memory.map(cue => cue.positionMs);
+          // A memory cue recoloured is a row to repaint too (#533).
+          const memoryCueColours = rowMemoryCueColours(memory.map(cue => cue.colour));
           const changed = cache.current.patch(
             (row) => row.id === trackId && (!sameRowCues(row.hotCues, hotCues)
               || (row.memoryCues?.length ?? 0) !== memoryCues.length
-              || memoryCues.some((position, i) => row.memoryCues?.[i] !== position)),
-            (row) => ({ ...row, hotCues, memoryCues }),
+              || memoryCues.some((position, i) => row.memoryCues?.[i] !== position)
+              || (row.memoryCueColours ?? []).join() !== (memoryCueColours ?? []).join()),
+            (row) => {
+              const { memoryCueColours: _old, ...rest } = row;
+              return memoryCueColours ? { ...rest, hotCues, memoryCues, memoryCueColours } : { ...rest, hotCues, memoryCues };
+            },
           );
           if (changed) setPagesLoaded((n) => n + 1);
         }).catch(() => {
@@ -338,6 +351,31 @@ export function useTrackView(
     [state.viewId],
   );
 
+  /*
+   * A row's `[!]` is read when its page is fetched, and a page is kept until
+   * the view or the library changes, so a file that went missing (or came
+   * back) since then would not show. rekordbox's flag is the same kind of
+   * picture, and it looks at the disk again for the one row selected
+   * (`BrowseBasicView::changedSelectedRows` -> `updateMissingStatus`,
+   * #682); this is that look. A row not on a cached page needs nothing:
+   * its page will be fetched fresh.
+   */
+  const recheckMissing = useCallback((trackId: string) => {
+    if (!cache.current.holds((row) => row.id === trackId)) return;
+    void (async () => {
+      const backend = await getBackend();
+      const missing = await backend.trackMissing(trackId);
+      if (missing === null) return;
+      const changed = cache.current.patch(
+        (row) => row.id === trackId && (row.missing === true) !== missing,
+        (row) => ({ ...row, missing }),
+      );
+      if (changed) setPagesLoaded((n) => n + 1);
+    })().catch(() => {
+      // Leave the row as it was; the next fetch of its page is current.
+    });
+  }, []);
+
   // Nothing has been opened yet, so the seed is all there is to draw. Once a
   // view exists the seed is gone for good — it is a picture of the last run,
   // not a fallback for a slow page.
@@ -365,8 +403,9 @@ export function useTrackView(
       fresh: rows ? () => false : fresh,
       ensureRange,
       idsInRange,
+      recheckMissing,
     }),
-    [rows, seedCount, state.count, state.sourceKey, state.totals, state.error, token, sourceKey, rowAt, fresh, ensureRange, idsInRange],
+    [rows, seedCount, state.count, state.sourceKey, state.totals, state.error, token, sourceKey, rowAt, fresh, ensureRange, idsInRange, recheckMissing],
   );
 }
 

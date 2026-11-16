@@ -22,6 +22,7 @@ pub mod itunes;
 pub mod key;
 pub mod key_tag;
 pub mod locate;
+pub mod my_tag_comment;
 pub mod new_library;
 pub mod write;
 pub mod xml;
@@ -79,6 +80,13 @@ pub enum DbError {
     WriteRefused(String),
     #[error("unexpected database schema: {0}")]
     Schema(String),
+    /// An Undo or Redo found the rows it would write changed since its
+    /// history entry was made: by a player over LINK, an import, rekordbox,
+    /// or anything else the history does not record. Nothing was written.
+    /// The message is the bare reason ("the track has changed since"), for
+    /// the caller to put in a sentence of its own (#506).
+    #[error("{0}")]
+    Conflict(String),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]

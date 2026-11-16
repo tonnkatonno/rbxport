@@ -54,7 +54,7 @@ pub(crate) struct Drawing<'a> {
 
 /// Per-batch choices from the Analysis Setting dialog. Missing settings
 /// preserve the defaults used by imports and older callers.
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 #[allow(clippy::struct_excessive_bools, reason = "the dialog's independent checkboxes, sent together")]
 pub struct AnalysisSettings {
@@ -66,17 +66,21 @@ pub struct AnalysisSettings {
     /// Add a memory cue on the first beat of the new grid, unless one is
     /// already there. Only a BPM / Grid pass has a grid to place it on.
     pub first_beat_cue: bool,
+    /// Explicit selected order; None preserves the optimized legacy preset.
+    pub stage_order: Option<Vec<String>>,
+    pub extension_stages: Vec<String>,
+    pub stage_settings: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for AnalysisSettings {
     fn default() -> Self {
-        Self { bpm_grid: true, key: true, high_precision: true, min_bpm: 70.0, max_bpm: 180.0, first_beat_cue: false }
+        Self { bpm_grid: true, key: true, high_precision: true, min_bpm: 70.0, max_bpm: 180.0, first_beat_cue: false, stage_order: None, extension_stages: Vec::new(), stage_settings: std::collections::BTreeMap::new() }
     }
 }
 
 impl AnalysisSettings {
-    fn options(self, preset: rbl_analysis::AnalysisPreset) -> AppResult<rbl_analysis::AnalysisOptions> {
-        if !self.bpm_grid && !self.key {
+    fn options(&self, preset: rbl_analysis::AnalysisPreset) -> AppResult<rbl_analysis::AnalysisOptions> {
+        if !self.bpm_grid && !self.key && self.extension_stages.is_empty() {
             return Err(AppError::new(ErrorKind::Malformed, "Select BPM / Grid or KEY to analyze."));
         }
         if !self.min_bpm.is_finite() || !self.max_bpm.is_finite()
@@ -99,6 +103,11 @@ impl AnalysisSettings {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisResultDto {
+    /// Serializable extension results, keyed by each registered artifact ID.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub analysis_artifacts: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub completed_stages: Vec<String>,
     pub track_id: String,
     pub analysed: u8,
     /// BPM x100, as rekordbox stores it.
@@ -119,6 +128,13 @@ pub struct AnalysisResultDto {
     /// when it found none or did not look.
     #[serde(skip)]
     pub detected_key: Option<crate::key_tag::DetectedKey>,
+}
+
+/// Registered analysis options for the dialog, including downstream stages.
+#[tauri::command]
+pub fn analysis_stages() -> AppResult<Vec<rbl_analysis::stages::StageDescriptor>> {
+    let settings=AnalysisSettings::default();
+    Ok(crate::analysis_pipeline::registry(&rbl_analysis::AnalysisPreset::Rbxport.options(),&settings)?.descriptors())
 }
 
 /// Analyses one track and keeps the result: the files in the share tree,
@@ -213,6 +229,9 @@ fn analyse_and_save(
     drawing: Option<&Drawing<'_>>,
 ) -> AppResult<AnalysisResultDto> {
     let options = settings.options(preset)?;
+    let registry=crate::analysis_pipeline::registry(&options,settings)?;
+    let plan=crate::analysis_pipeline::plan(&registry,settings)?;
+    let ordered=settings.stage_order.is_some() || !settings.extension_stages.is_empty();
     // By the id map rather than a scan: a queue analyses hundreds of
     // tracks, and each scan is 38,681 comparisons.
     let Some(row) = library.row_of(track_id) else {
@@ -234,11 +253,26 @@ fn analyse_and_save(
     }
 
     let started = std::time::Instant::now();
-    if !settings.bpm_grid {
+    if !settings.bpm_grid && !ordered {
         let audio = rbl_audio::decode_mono(std::path::Path::new(path), Some(DECODE_CAP_SECS)).map_err(|e| decode_error(&e))?;
         return analyse_key_only(state, library, row, track_id, &audio, editor, started);
     }
-    let (analysis, duration_secs) = analyse_file(std::path::Path::new(path), &options, DECODE_CAP_SECS, drawing)?;
+    let captured=std::cell::RefCell::new(None);
+    let (analysis,waves,duration_secs)=if ordered {
+        analyse_file_with(std::path::Path::new(path),DECODE_CAP_SECS,drawing,&|samples,rate,complete| {
+            let result=crate::analysis_pipeline::execute(&registry,&plan,samples,rate,complete)?;
+            let analysis=result.analysis.clone();*captured.borrow_mut()=Some(result);Ok(analysis)
+        })?
+    } else {analyse_file(std::path::Path::new(path),&options,DECODE_CAP_SECS,drawing)?};
+    let (analysis_artifacts,completed_stages)=captured.into_inner().map_or_else(||(std::collections::BTreeMap::new(),Vec::new()),|r|(r.artifacts,r.order));
+    if !settings.bpm_grid {
+        let mut result=if settings.key {
+            save_key_only(state,library,row,track_id,analysis.key.as_ref(),analysis.peak,editor,started)?
+        } else {
+            AnalysisResultDto {analysis_artifacts:std::collections::BTreeMap::new(),completed_stages:Vec::new(),track_id:track_id.into(),analysed:library.analysed.get(row).copied().unwrap_or(0),bpm_x100:library.bpm_x100.get(row).copied().unwrap_or(0),key:library.keys.name(library.key.get(row).copied().unwrap_or(0)).into(),beats:0,peak:analysis.peak,duration_sec:library.length_sec.get(row).copied().unwrap_or(0),elapsed_ms:u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),analysis_path:state.analysis_path_of(library,row,track_id),added_first_beat_cue:false,detected_key:None}
+        };
+        result.analysis_artifacts=analysis_artifacts;result.completed_stages=completed_stages;return Ok(result);
+    }
 
     let _edit_guard = state.edit_gate.lock();
     ensure_analysis_unlocked(state, editor, track_id)?;
@@ -268,20 +302,14 @@ fn analyse_and_save(
         .iter()
         .map(|b| rbl_anlz::Beat { beat_number: b.beat_number, tempo_x100: b.tempo_x100, time_ms: b.time_ms })
         .collect();
-    let columns: Vec<rbl_anlz::BandColumn> = analysis
-        .waveform
-        .columns
-        .iter()
-        .map(|c| rbl_anlz::BandColumn { low: c.low, mid: c.mid, high: c.high, peak: c.peak })
-        .collect();
     // `PPTH` as rekordbox writes it in the share tree: `?/<file name>`. The
     // full path this wrote before is not what rekordbox derives for the
     // track (issue #323).
-    let files = rbl_anlz::author_with_overview(
+    // Every saved waveform uses the completed blue, RGB and 3-band pass.
+    let files = rbl_anlz::author_with_rekordbox_waves(
         &rbl_anlz::share_tree_ppth(path),
         &beats,
-        &columns,
-        analysis.waveform.overview.as_slice().try_into().ok(),
+        &waves,
         rbl_anlz::Existing { dat: existing[0].as_ref(), ext: existing[1].as_ref(), two_ex: existing[2].as_ref() },
     );
     // Clamp before narrowing so the conversion cannot truncate.
@@ -303,6 +331,8 @@ fn analyse_and_save(
     };
 
     Ok(AnalysisResultDto {
+        analysis_artifacts,
+        completed_stages,
         track_id: track_id.to_owned(),
         analysed: u8::try_from(rbl_db::write::ANALYSED_BY_THIS_APP).unwrap_or(u8::MAX),
         bpm_x100,
@@ -342,15 +372,28 @@ fn decode_error(e: &rbl_audio::AudioError) -> AppError {
 /// waveform pass, about a fifth of the analysis, so only a deck that is
 /// watching asks for it.
 ///
-/// Resolves to the analysis and the file's length in seconds.
+/// rekordbox's own colour and 3-band waveforms are drawn from every frame
+/// of the file, in stereo, as the decode goes.
+///
+/// Resolves to the analysis, those waveforms and the file's length in seconds.
 fn analyse_file(
     path: &std::path::Path,
     options: &rbl_analysis::AnalysisOptions,
     head_secs: f64,
     drawing: Option<&Drawing<'_>>,
-) -> AppResult<(rbl_analysis::Analysis, f64)> {
-    // Fork: the SSD mirror's copy when it is the same file (see `ssd_mirror`).
-    let mut stream = rbl_audio::MonoStream::open(&crate::ssd_mirror::fast_path(path)).map_err(|e| decode_error(&e))?;
+) -> AppResult<(rbl_analysis::Analysis, rbl_anlz::RekordboxWaves, f64)> {
+    analyse_file_with(path,head_secs,drawing,&|samples,rate,_complete|Ok(rbl_analysis::analyse_with(samples,rate,*options)))
+}
+
+fn analyse_file_with(
+    path:&std::path::Path,head_secs:f64,drawing:Option<&Drawing<'_>>,
+    run:&impl Fn(&[f32],u32,bool)->AppResult<rbl_analysis::Analysis>,
+)->AppResult<(rbl_analysis::Analysis,rbl_anlz::RekordboxWaves,f64)> {
+    let mut stream = rbl_audio::MonoStream::open(&crate::ssd_mirror::fast_path(path)).map_err(|e| decode_error(&e))?; // Fork: the SSD mirror's copy when it is the same file
+    let mut creator = rbl_analysis::wave_creator::WaveCreator::new(stream.sample_rate());
+    if let Some(frames) = stream.expected_frames() {
+        creator.reserve(frames);
+    }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a positive number of seconds at an audio rate")]
     let cap = (head_secs.max(0.0) * f64::from(stream.sample_rate())) as usize;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a positive number of seconds at an audio rate")]
@@ -365,7 +408,8 @@ fn analyse_file(
     let mut fed = 0;
     let mut past_head = false;
     let mut shown = std::time::Instant::now();
-    while let Some(chunk) = stream.next_chunk() {
+    while let Some((chunk, frames)) = stream.next_frames() {
+        creator.push(frames);
         if past_head {
             if let Some(builder) = builder.as_mut() {
                 builder.push(chunk);
@@ -399,16 +443,31 @@ fn analyse_file(
     }
     let rate = stream.sample_rate();
     let audio = rbl_audio::Audio { samples: head, sample_rate: rate, source_channels: stream.source_channels() };
-    let mut analysis = rbl_analysis::analyse_with(&audio.samples, rate, *options);
+    let mut analysis = run(&audio.samples,rate,!past_head)?;
+    let waves = rekordbox_waves(creator.finish());
     let Some(builder) = builder.filter(|_| past_head) else {
-        return Ok((analysis, audio.duration_secs()));
+        return Ok((analysis, waves, audio.duration_secs()));
     };
     #[allow(clippy::cast_precision_loss, reason = "a sample count well inside f64's exact range")]
     let duration_secs = builder.samples() as f64 / f64::from(rate.max(1));
     analysis.peak = analysis.peak.max(builder.peak());
     analysis.tempo.extend_to(duration_secs);
     analysis.waveform = builder.finish();
-    Ok((analysis, duration_secs))
+    Ok((analysis, waves, duration_secs))
+}
+
+/// The analyser's waveforms as the file author takes them: the same payloads.
+fn rekordbox_waves(waves: rbl_analysis::wave_creator::Waves) -> rbl_anlz::RekordboxWaves {
+    rbl_anlz::RekordboxWaves {
+        pwav: waves.pwav,
+        pwv2: waves.pwv2,
+        pwvc: waves.pwvc,
+        pwv3: waves.pwv3,
+        pwv4: waves.pwv4,
+        pwv5: waves.pwv5,
+        pwv6: waves.pwv6,
+        pwv7: waves.pwv7,
+    }
 }
 
 /// Adds a memory cue at `first_beat_ms` unless a memory cue is already
@@ -509,7 +568,13 @@ fn ensure_analysis_unlocked(state: &AppState, editor: &crate::grid::GridEditor, 
 /// A key-only pass never authors files or updates grid metadata.
 fn analyse_key_only(state: &AppState, library: &rbl_index::Library, row: usize, track_id: &str,
     audio: &rbl_audio::Audio, editor: &crate::grid::GridEditor, started: std::time::Instant) -> AppResult<AnalysisResultDto> {
-    let found_key = rbl_analysis::detect_key(&audio.samples, audio.sample_rate).as_ref().map(detected);
+    let key=rbl_analysis::detect_key(&audio.samples,audio.sample_rate);
+    save_key_only(state,library,row,track_id,key.as_ref(),audio.samples.iter().fold(0_f32,|peak,s|peak.max(s.abs())),editor,started)
+}
+
+#[allow(clippy::too_many_arguments, reason="Same key-only persistence contract as the analysis worker")]
+fn save_key_only(state:&AppState,library:&rbl_index::Library,row:usize,track_id:&str,key:Option<&rbl_analysis::MusicalKey>,peak:f32,editor:&crate::grid::GridEditor,started:std::time::Instant)->AppResult<AnalysisResultDto> {
+    let found_key=key.map(detected);
     let key = found_key.as_ref().map(|key| key.classic.clone());
     let _edit_guard = state.edit_gate.lock();
     ensure_analysis_unlocked(state, editor, track_id)?;
@@ -523,12 +588,14 @@ fn analyse_key_only(state: &AppState, library: &rbl_index::Library, row: usize, 
         }).map_err(write_error)?
     } else { None };
     Ok(AnalysisResultDto {
+        analysis_artifacts: std::collections::BTreeMap::new(),
+        completed_stages: Vec::new(),
         track_id: track_id.to_owned(),
         analysed: library.analysed.get(row).copied().unwrap_or(0),
         bpm_x100: library.bpm_x100.get(row).copied().unwrap_or(0),
         key: key.unwrap_or_else(|| library.keys.name(library.key.get(row).copied().unwrap_or(0)).to_owned()),
         beats: 0,
-        peak: audio.samples.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs())),
+        peak,
         duration_sec: library.length_sec.get(row).copied().unwrap_or(0),
         elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         analysis_path: state.analysis_path_of(library, row, track_id),
@@ -724,8 +791,8 @@ mod tests {
     }
 
     /// A deck that loads an unanalysed track watches its waveform fill in:
-    /// every snapshot spans the whole track, and the last is what the files
-    /// then hold.
+    /// every snapshot spans the whole track, and once the analysis is over
+    /// the deck is served the files' rekordbox waveform in its place.
     #[test]
     fn a_watched_analysis_draws_the_whole_track_as_it_decodes() {
         let dir = tempfile::tempdir().unwrap();
@@ -748,8 +815,15 @@ mod tests {
         let last = snapshots.last().unwrap();
         let dat = rbl_anlz::resolve(&share, &result.analysis_path);
         let two = rbl_anlz::Anlz::read(&rbl_anlz::sibling(&dat, "2EX")).unwrap();
-        assert_eq!(crate::commands::drawing_bytes(last, "bandsDetail", None, None), two.waveform(b"PWV7").unwrap().1,
-            "the last snapshot's detail is what the files hold");
+        let written = two.waveform(b"PWV7").unwrap().1;
+        let preview = crate::commands::drawing_bytes(last, "bandsDetail", None, None);
+        assert_eq!(preview.len(), written.len(), "the last snapshot spans what the files hold");
+        assert!(two.section(b"PWVC").is_some(), "the files hold rekordbox's own waveform");
+        // The preview is drawn from the columns; once the drawing is over the
+        // deck reads the files, so it switches to rekordbox's own waveform.
+        assert_eq!(crate::commands::waveform_bytes(&state, &library, &share, &track, "bandsDetail", None, None).unwrap(), written,
+            "once the analysis is over the deck is served the files' waveform");
+        assert_ne!(preview, written, "which is not the preview's");
         assert_eq!(crate::commands::drawing_bytes(last, "bands", None, None).len(), 3_600, "and a whole overview");
     }
 
@@ -805,7 +879,8 @@ mod tests {
         assert_eq!(ext.waveform(b"PWV5").unwrap().0, 2);
         assert_eq!(tags(&ext), ["PPTH", "PWV3", "PCOB", "PCOB", "PCO2", "PCO2", "PWV5", "PWV4"]);
         let two = rbl_anlz::Anlz::read(&rbl_anlz::sibling(&dat_path, "2EX")).expect("the 2EX is there");
-        assert_eq!(tags(&two), ["PPTH", "PWV7", "PWV6"]);
+        // `PWVC` after `PWV6`, as rekordbox writes its own: the gain they were drawn at.
+        assert_eq!(tags(&two), ["PPTH", "PWV7", "PWV6", "PWVC"]);
         assert_eq!(ext.path().unwrap(), "?/click.wav");
         assert_eq!(two.path().unwrap(), "?/click.wav");
         assert_eq!(two.waveform(b"PWV6").unwrap().1.len(), 3600);
@@ -845,7 +920,7 @@ mod tests {
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?)),
         ).unwrap();
         let before = metadata();
-        let key_only = AnalysisSettings { bpm_grid: false, ..settings };
+        let key_only = AnalysisSettings { bpm_grid: false, ..settings.clone() };
         let result = analyse_and_save(&state, &fresh, &share, &track_id(0), rbl_analysis::AnalysisPreset::Rbxport, &key_only, &editor, None).unwrap();
         assert_eq!(metadata(), before);
         assert_eq!(result.bpm_x100, again.bpm_x100);
@@ -853,7 +928,7 @@ mod tests {
 
         // Unchecking KEY must leave its database reference untouched.
         let key_before: Option<String> = db.connection().query_row("SELECT KeyID FROM djmdContent WHERE ID = ?1", [track_id(0)], |r| r.get(0)).unwrap();
-        let grid_only = AnalysisSettings { key: false, ..settings };
+        let grid_only = AnalysisSettings { key: false, ..settings.clone() };
         analyse_and_save(&state, &fresh, &share, &track_id(0), rbl_analysis::AnalysisPreset::Rbxport, &grid_only, &editor, None).unwrap();
         let key_after: Option<String> = db.connection().query_row("SELECT KeyID FROM djmdContent WHERE ID = ?1", [track_id(0)], |r| r.get(0)).unwrap();
         assert_eq!(key_after, key_before);
@@ -865,7 +940,7 @@ mod tests {
         // Asked for, a memory cue lands on the grid's first beat, once: a
         // second pass finds it there and adds nothing.
         let first_beat = rbl_anlz::Anlz::read(&dat_path).unwrap().beat_grid().unwrap()[0].time_ms;
-        let with_cue = AnalysisSettings { first_beat_cue: true, ..settings };
+        let with_cue = AnalysisSettings { first_beat_cue: true, ..settings.clone() };
         let result = analyse_and_save(&state, &fresh, &share, &track_id(0), rbl_analysis::AnalysisPreset::Rbxport, &with_cue, &editor, None).unwrap();
         assert!(result.added_first_beat_cue);
         let memory: Vec<u32> = cues(&fresh).iter().filter(|cue| cue.is_memory()).map(|cue| cue.position_ms).collect();
@@ -877,7 +952,7 @@ mod tests {
         ).unwrap();
         assert_eq!(stored, 1);
         // Key-only has no grid to place it on.
-        let key_with_cue = AnalysisSettings { bpm_grid: false, first_beat_cue: true, ..settings };
+        let key_with_cue = AnalysisSettings { bpm_grid: false, first_beat_cue: true, ..settings.clone() };
         assert!(!analyse_and_save(&state, &fresh, &share, &track_id(0), rbl_analysis::AnalysisPreset::Rbxport, &key_with_cue, &editor, None).unwrap().added_first_beat_cue);
 
         // A refused cue write says the analysis was saved and only the cue
@@ -912,9 +987,12 @@ mod tests {
         write_click_wav(&audio, 24, 0.5);
         let options = AnalysisSettings::default().options(rbl_analysis::AnalysisPreset::Rbxport).unwrap();
 
-        let (whole, whole_secs) = analyse_file(&audio, &options, 60.0, None).unwrap();
-        let (headed, headed_secs) = analyse_file(&audio, &options, 8.0, None).unwrap();
+        let (whole, whole_waves, whole_secs) = analyse_file(&audio, &options, 60.0, None).unwrap();
+        let (headed, headed_waves, headed_secs) = analyse_file(&audio, &options, 8.0, None).unwrap();
         assert!((whole_secs - 24.0).abs() < 0.01 && (headed_secs - 24.0).abs() < 0.01, "{whole_secs} {headed_secs}");
+        // rekordbox's own waveforms are drawn from every frame either way.
+        assert_eq!(headed_waves, whole_waves);
+        assert_eq!(headed_waves.pwv7.len(), 24 * 150 * 3);
 
         // Every 1/150 s column of all 24 seconds, identical to the whole decode's.
         assert_eq!(headed.waveform.columns.len(), 24 * 150);
@@ -942,7 +1020,7 @@ mod tests {
 
     #[test]
     fn a_memory_cue_near_the_first_beat_counts_and_hot_cues_do_not() {
-        let cue = |kind: u8, position_ms: u32, out_ms: u32| rbl_index::Cue { id: 1, position_ms, out_ms, kind, colour: 0 };
+        let cue = |kind: u8, position_ms: u32, out_ms: u32| rbl_index::Cue { id: 1, position_ms, out_ms, kind, colour: 0, memory_colour: None };
         assert!(needs_first_beat_cue(&[], 120));
         assert!(!needs_first_beat_cue(&[cue(0, 120, 0)], 120));
         assert!(!needs_first_beat_cue(&[cue(0, 125, 0)], 120), "within the tolerance");
@@ -955,14 +1033,14 @@ mod tests {
     fn analysis_choices_validate_and_reach_the_tempo_options() {
         let preset = rbl_analysis::AnalysisPreset::Rbxport;
         let defaults = AnalysisSettings::default();
-        let chosen = AnalysisSettings { high_precision: false, min_bpm: 98.0, max_bpm: 195.0, ..defaults };
+        let chosen = AnalysisSettings { high_precision: false, min_bpm: 98.0, max_bpm: 195.0, ..defaults.clone() };
         let options = chosen.options(preset).unwrap();
         assert_eq!(options.tempo.placement, rbl_analysis::tempo::Placement::Envelope);
         assert!((options.tempo.min_bpm - 98.0).abs() < f64::EPSILON);
         assert!((options.tempo.max_bpm - 195.0).abs() < f64::EPSILON);
-        assert!(AnalysisSettings { bpm_grid: false, key: false, ..defaults }.options(preset).is_err());
+        assert!(AnalysisSettings { bpm_grid: false, key: false, ..defaults.clone() }.options(preset).is_err());
         for (min_bpm, max_bpm) in [(180.0, 70.0), (70.0, 70.0), (0.0, 180.0), (70.0, 301.0), (f64::NAN, 180.0)] {
-            assert!(AnalysisSettings { min_bpm, max_bpm, ..defaults }.options(preset).is_err());
+            assert!(AnalysisSettings { min_bpm, max_bpm, ..defaults.clone() }.options(preset).is_err());
         }
     }
 }

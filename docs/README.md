@@ -9,7 +9,9 @@ Commands in these guides run from the repository root unless stated otherwise.
 | --- | --- |
 | [Getting started](development/getting-started.md) | Setting up a checkout and choosing a safe run mode. |
 | [Architecture](development/architecture.md) | Finding the owner of a feature or tracing a request. |
+| [Analysis stages](development/analysis-stages.md) | Registering analysis extensions and controlling execution order. |
 | [Conventions](development/conventions.md) | Writing code that fits the project. |
+| [Product decisions](development/product-decisions.md) | Checking whether a feature fits RBXport's focused scope. |
 | [Testing](development/testing.md) | Choosing checks and interpreting their results. |
 | [Contributing](../CONTRIBUTING.md) | Reporting an issue or preparing a change for review. |
 | [Debugging](development/debugging.md) | Diagnosing failures and managing local output. |
@@ -24,6 +26,7 @@ Commands in these guides run from the repository root unless stated otherwise.
 - [Waveform scrubbing](user/waveform-scrubbing.md): drag behavior and its audio filter.
 - [AppleScript](user/applescript.md): macOS automation, objects, commands, and examples.
 - [Nix](user/nix.md): installing, running, developing, and removing the flake.
+- [FAQ](user/faq.md): what RBXport is for, and why DJ controllers are not registered or mapped.
 
 ## Technical references
 
@@ -32,6 +35,8 @@ Commands in these guides run from the repository root unless stated otherwise.
 - [USB export pipeline](reference/usb-export-pipeline.md): how an export and selective sync run from the Sync Manager to the stick, their safety checks and recovery, what has been validated, and where to change it.
 - [Library backups](reference/backups.md): how backups are created and restored, and why.
 - [Keyboard commands](reference/shortcut-commands.md): how a key, a menu item and a button run one shared command, and the audit of every bound action against rekordbox's menu bar.
+- [Auto Relocate search folders](reference/auto-relocate-search-folders.md): rekordbox's Auto Relocate search-folder preferences compared with rbxport, and the gaps (research for #487).
+- [Library Undo coverage](reference/library-undo.md): which library actions Edit › Undo reverses, which are permanent or external, and the follow-up tickets.
 - [LINK behavior and hardware coverage](reference/link-testing.md): device dialects, behavior catalog, and physical checks.
 - [Analysis crate](../crates/rbl-analysis/README.md): algorithm reading path and evaluation tools.
 - [Waveform calibration](reference/waveform-analysis.md): measured overview behavior and its limits.

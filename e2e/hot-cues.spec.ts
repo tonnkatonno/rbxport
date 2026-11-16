@@ -66,7 +66,7 @@ test("an empty pad sets the hot cue at the playhead, and its ✕ in the list cle
   await expect(pad(page, "D")).toHaveAttribute("aria-pressed", "true");
   await expect(pad(page, "E")).toHaveAttribute("aria-pressed", "false");
   await expect(pad(page, "E")).toHaveAttribute("title", "Set Hot Cue E");
-  await expect(listRow(page, "E")).toHaveAttribute("aria-disabled", "true");
+  await expect(listRow(page, "E")).toHaveAttribute("data-empty", "");
   await expect(overviewBadge(page, "E")).toHaveCount(0);
 
   await playAWhile(page);
@@ -74,7 +74,7 @@ test("an empty pad sets the hot cue at the playhead, and its ✕ in the list cle
 
   // Lit, listed with a time and a ✕, and badged on both waveforms.
   await expect(pad(page, "E")).toHaveAttribute("aria-pressed", "true");
-  await expect(listRow(page, "E")).not.toHaveAttribute("aria-disabled", "true");
+  await expect(listRow(page, "E")).not.toHaveAttribute("data-empty");
   await expect(listRow(page, "E")).toContainText(/\d\d:\d\d/);
   await expect(clearButton(page, "E")).toBeEnabled();
   await expect(overviewBadge(page, "E")).toHaveCount(1);
@@ -92,10 +92,42 @@ test("an empty pad sets the hot cue at the playhead, and its ✕ in the list cle
   // ✕ clears it, and the pad, the list and both waveforms let go together.
   await clearButton(page, "E").click();
   await expect(pad(page, "E")).toHaveAttribute("aria-pressed", "false");
-  await expect(listRow(page, "E")).toHaveAttribute("aria-disabled", "true");
+  await expect(listRow(page, "E")).toHaveAttribute("data-empty", "");
   await expect(clearButton(page, "E")).toHaveCount(0);
   await expect(overviewBadge(page, "E")).toHaveCount(0);
   await expect(detailBadge(page, "E")).toHaveCount(0);
+});
+
+test("an empty row in the HOT CUE list sets that hot cue, as its pad does (#532)", async ({ page }) => {
+  // rekordbox 7.2.19 `djplay::HotCueComp::mouseDown` @0x100689788 posts the
+  // unshifted hot cue key press for a list row whether or not its slot is
+  // set, so an empty row is the empty pad. The two-deck view has no pads and
+  // this list is the only place to set one with the mouse.
+  await enableTooltips(page);
+  await load(page, "?writable=1");
+  await expect(listRow(page, "F")).toHaveAttribute("data-empty", "");
+  await expect(listRow(page, "F")).not.toHaveAttribute("aria-disabled", "true");
+  await expect(listRow(page, "F")).toHaveAttribute("title", "Set Hot Cue F");
+
+  await playAWhile(page);
+  const at = await elapsedSeconds(page);
+  await listRow(page, "F").click();
+
+  await expect(pad(page, "F")).toHaveAttribute("aria-pressed", "true");
+  await expect(listRow(page, "F")).not.toHaveAttribute("data-empty");
+  await expect(listRow(page, "F")).toContainText(/\d\d:\d\d/);
+  expect(Math.abs((await cueSeconds(page, "F")) - Math.floor(at))).toBeLessThanOrEqual(1);
+  await expect(overviewBadge(page, "F")).toHaveCount(1);
+  // Setting leaves the transport alone, as the pad's set does.
+  await expect(playButton(page)).toBeVisible();
+
+  // Read-only, the empty row is dead and says why.
+  await load(page);
+  await expect(listRow(page, "F")).toHaveAttribute("aria-disabled", "true");
+  await expect(listRow(page, "F")).toHaveAttribute("title", /read-only/);
+  await listRow(page, "F").click({ force: true });
+  await page.waitForTimeout(200);
+  await expect(listRow(page, "F")).toHaveAttribute("data-empty", "");
 });
 
 test("the simple player's overview wears the badge too", async ({ page }) => {
@@ -348,6 +380,27 @@ test("right-clicking a set pad opens the cue colour menu and recolours it (#272)
   await expect(menu).toBeHidden();
 });
 
+test("a hot cue set or reset here takes its slot's HOT CUE color default, not green (#593)", async ({ page }) => {
+  // rekordbox's deck stores a new hot cue, and one whose colour is Reset,
+  // with ColorTableIndex 0; COLORFUL (the default) then draws slot E in
+  // index 19, #30D26E, where index 21 drew every such cue #3CEB50.
+  await load(page, "?writable=1");
+  await playAWhile(page);
+  await pad(page, "E").click();
+  await expect(pad(page, "E")).toHaveAttribute("aria-pressed", "true");
+  await expect(pad(page, "E")).toHaveAttribute("style", /--cue-colour: ?#30D26E/i);
+  await expect(overviewBadge(page, "E")).toHaveAttribute("style", /--cue-colour: ?#30D26E/i);
+
+  // Its own colour wins, and Reset gives the slot default back.
+  await pad(page, "E").click({ button: "right" });
+  const menu = page.getByRole("menu", { name: "Hot cue color" });
+  await menu.getByRole("button", { name: "Color 6" }).click();
+  await expect(pad(page, "E")).toHaveAttribute("style", /--cue-colour: ?#508CFF/i);
+  await pad(page, "E").click({ button: "right" });
+  await menu.getByRole("menuitem", { name: "Reset" }).click();
+  await expect(pad(page, "E")).toHaveAttribute("style", /--cue-colour: ?#30D26E/i);
+});
+
 test("pointing at a set pad shows its ✕, which clears the hot cue (#341)", async ({ page }) => {
   // rekordbox 7.2.18 manual p.76: "To delete a Hot Cue, point on it with the
   // mouse cursor, and then click [X]." `HotCuePad::mouseEnter` shows it over a
@@ -371,7 +424,7 @@ test("pointing at a set pad shows its ✕, which clears the hot cue (#341)", asy
 
   await padClear("A").click();
   await expect(pad(page, "A")).toHaveAttribute("aria-pressed", "false");
-  await expect(listRow(page, "A")).toHaveAttribute("aria-disabled", "true");
+  await expect(listRow(page, "A")).toHaveAttribute("data-empty", "");
   await expect(overviewBadge(page, "A")).toHaveCount(0);
   await expect(padClear("A")).toHaveCount(0);
 });

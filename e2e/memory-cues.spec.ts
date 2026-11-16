@@ -257,6 +257,66 @@ test("memory loops and the Active Loop are listed with rekordbox's loop mark and
   await expect(overview.locator('[class*="loopBand"]')).toHaveCount(2);
 });
 
+test("the loop mark sets the track's one Active Loop and clears it (#577)", async ({ page }) => {
+  // rekordbox's MEMORY row loop button, tooltip "Set Active Loop": a click
+  // sets that loop as the Active Loop (red), and the old one goes orange;
+  // a click on the red one clears it. The row is not also called.
+  await enableTooltips(page);
+  await load(page, "?memoryLoops=1&writable=1");
+  const list = page.getByRole("complementary", { name: "Cue list" });
+  const toggles = list.getByRole("button", { name: "Set Active Loop", exact: true });
+  const marks = list.getByTestId("memory-cue-loop");
+  await expect(toggles).toHaveCount(2);
+  await expect(toggles.nth(0)).toHaveAttribute("title", "Set Active Loop");
+  await expect(toggles.nth(0)).toHaveAttribute("aria-pressed", "false");
+  await expect(toggles.nth(1)).toHaveAttribute("aria-pressed", "true");
+
+  await toggles.nth(0).click();
+  await expect(toggles.nth(0)).toHaveAttribute("aria-pressed", "true");
+  await expect(toggles.nth(1)).toHaveAttribute("aria-pressed", "false");
+  await expect(marks.nth(0)).toHaveCSS("color", "rgb(230, 55, 55)");
+  await expect(marks.nth(1)).toHaveCSS("color", "rgb(255, 130, 5)");
+
+  await toggles.nth(0).click();
+  await expect(toggles.nth(0)).toHaveAttribute("aria-pressed", "false");
+  await expect(list.locator("[data-active]")).toHaveCount(0);
+});
+
+test("the Active Loop toggle is disabled while the library is read-only (#577)", async ({ page }) => {
+  await load(page, "?memoryLoops=1");
+  const toggles = page.getByRole("complementary", { name: "Cue list" }).getByRole("button", { name: "Set Active Loop", exact: true });
+  await expect(toggles).toHaveCount(2);
+  await expect(toggles.nth(0)).toBeDisabled();
+});
+
+test("a memory cue's marker on the waveform takes its colour, and red without one (#533)", async ({ page }) => {
+  // rekordbox picks a memory cue's marker from its memoryCueImageDown sprite
+  // by djmdCue.Color, and the red row for none (WidgetLoudView::drawTextures).
+  await load(page, "?writable=1");
+  const head = page.getByTestId("player-overview").locator('[data-cue=""] i');
+  await expect(head).toHaveCount(1);
+  await expect(head).toHaveCSS("background-color", "rgb(234, 51, 35)");
+
+  const row = page.getByRole("complementary", { name: "Cue list" }).locator('[class*="cueRow"]').first();
+  await row.click({ button: "right" });
+  const menu = page.getByRole("menu", { name: "Memory cue color" });
+  await menu.getByRole("menuitem", { name: "Blue" }).click();
+  await expect(head).toHaveCSS("background-color", "rgb(32, 79, 239)");
+  // The row's preview draws it in the same colour
+  // (BrowseHelper::getCueImageForPreview).
+  const canvas = page.locator('[role="gridcell"][data-col="preview"]').nth(3).locator("canvas");
+  const previewPixel = () => canvas.evaluate((c: HTMLCanvasElement) => {
+    const pixel = c.getContext("2d")?.getImageData(Math.round(c.width * 0.02), 1, 1, 1).data;
+    return pixel ? Array.from(pixel).slice(0, 3) : [];
+  });
+  await expect.poll(previewPixel).toEqual([32, 79, 239]);
+
+  await row.click({ button: "right" });
+  await menu.getByRole("menuitem", { name: "No Color" }).click();
+  await expect(head).toHaveCSS("background-color", "rgb(234, 51, 35)");
+  await expect.poll(previewPixel).toEqual([234, 51, 35]);
+});
+
 test("MEMORY during an Auto Beat Loop saves the loop, which a reload keeps and a call plays", async ({ page }) => {
   // #411: rekordbox 7.2.18 manual p.163, "To save the loop": during loop play,
   // MEMORY saves the loop point. rekordbox 7.2.19 UiPlayer::eventMemoryCue

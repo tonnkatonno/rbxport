@@ -12,6 +12,7 @@
     reason = "sample counts and durations convert between usize and f64 throughout decoding"
 )]
 
+pub mod aifc;
 pub mod compatibility;
 
 use std::path::Path;
@@ -98,6 +99,8 @@ pub struct MonoStream {
     source_channels: u16,
     buffer: Option<SampleBuffer<f32>>,
     mono: Vec<f32>,
+    /// The same frames as 16-bit stereo: see [`MonoStream::next_frames`].
+    stereo: Vec<[i16; 2]>,
     /// What is left of the file's lead on rekordbox's timeline: frames of
     /// silence still to hand out when positive, decoded frames still to drop
     /// when negative. See [`rekordbox_lead`].
@@ -122,8 +125,8 @@ fn rekordbox_lead(path: &Path, codec: symphonia::core::codecs::CodecType) -> i64
 impl MonoStream {
     /// Opens a file and its first audio track.
     pub fn open(path: &Path) -> Result<Self> {
-        let file = std::fs::File::open(path)?;
-        let stream = MediaSourceStream::new(Box::new(file), symphonia::core::io::MediaSourceStreamOptions::default());
+        let (source, aifc) = aifc::open(path)?;
+        let stream = MediaSourceStream::new(source, symphonia::core::io::MediaSourceStreamOptions::default());
 
         let mut hint = Hint::new();
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -132,7 +135,7 @@ impl MonoStream {
 
         let probed = symphonia::default::get_probe()
             .format(&hint, stream, &FormatOptions::default(), &MetadataOptions::default())
-            .map_err(|e| AudioError::Unsupported(e.to_string()))?;
+            .map_err(|e| AudioError::Unsupported(aifc.describe(e)))?;
         let format = probed.format;
 
         let track = format
@@ -151,7 +154,7 @@ impl MonoStream {
             .map_or(2, |c| u16::try_from(c.count()).unwrap_or(2));
         let lead = rekordbox_lead(path, track.codec_params.codec);
         let expected = track.codec_params.n_frames.map(|frames| frames.saturating_add_signed(lead));
-        Ok(Self { format, decoder, track_id, sample_rate, source_channels, buffer: None, mono: Vec::new(), lead, expected })
+        Ok(Self { format, decoder, track_id, sample_rate, source_channels, buffer: None, mono: Vec::new(), stereo: Vec::new(), lead, expected })
     }
 
     /// How many samples the stream is expected to hand out in all, from the
@@ -172,6 +175,14 @@ impl MonoStream {
         self.source_channels
     }
 
+    /// The next packet's samples, downmixed, beside the same frames as
+    /// 16-bit stereo: what rekordbox's waveform analysis reads, one channel
+    /// twice for a mono file and the first two of any more.
+    pub fn next_frames(&mut self) -> Option<(&[f32], &[[i16; 2]])> {
+        self.next_chunk()?;
+        Some((&self.mono, &self.stereo))
+    }
+
     /// The next packet's samples, downmixed; `None` at the end of the file.
     ///
     /// `next_packet` reports the end of the stream as an error, so any error
@@ -179,8 +190,11 @@ impl MonoStream {
     /// discarding what came before it.
     pub fn next_chunk(&mut self) -> Option<&[f32]> {
         if self.lead > 0 {
+            let lead = usize::try_from(self.lead).unwrap_or(0);
             self.mono.clear();
-            self.mono.resize(usize::try_from(self.lead).unwrap_or(0), 0.0);
+            self.mono.resize(lead, 0.0);
+            self.stereo.clear();
+            self.stereo.resize(lead, [0, 0]);
             self.lead = 0;
             return Some(&self.mono);
         }
@@ -195,8 +209,11 @@ impl MonoStream {
                 // as it does in rekordbox: dropping it would move everything
                 // after it earlier.
                 Err(symphonia::core::errors::Error::DecodeError(_)) => {
+                    let silence = usize::try_from(packet.dur).unwrap_or(0);
                     self.mono.clear();
-                    self.mono.resize(usize::try_from(packet.dur).unwrap_or(0), 0.0);
+                    self.mono.resize(silence, 0.0);
+                    self.stereo.clear();
+                    self.stereo.resize(silence, [0, 0]);
                     if self.drop_lead() {
                         return Some(&self.mono);
                     }
@@ -216,6 +233,10 @@ impl MonoStream {
             let channels = spec.channels.count().max(1);
             self.mono.clear();
             self.mono.extend(interleaved.samples().chunks(channels).map(|frame| frame.iter().sum::<f32>() / channels as f32));
+            self.stereo.clear();
+            self.stereo.extend(
+                interleaved.samples().chunks(channels).map(|frame| [to_i16(frame[0]), to_i16(*frame.get(1).unwrap_or(&frame[0]))]),
+            );
             if self.drop_lead() {
                 return Some(&self.mono);
             }
@@ -229,10 +250,17 @@ impl MonoStream {
             let owed = usize::try_from(self.lead.unsigned_abs()).unwrap_or(usize::MAX);
             let dropped = owed.min(self.mono.len());
             self.mono.drain(..dropped);
+            self.stereo.drain(..dropped);
             self.lead += dropped as i64;
         }
         !self.mono.is_empty()
     }
+}
+
+/// A decoded sample as a 16-bit decode holds it: symphonia's own conversion,
+/// so the frames match what decoding straight to `i16` gives.
+fn to_i16(sample: f32) -> i16 {
+    (sample.clamp(-1.0, 1.0) * 32_768.0) as i16
 }
 
 /// Writes the stretch of a file between `from_secs` and `to_secs` as a
@@ -398,6 +426,32 @@ mod tests {
         assert!(write_range_wav(&source, 1.0, 0.5, &out).is_err());
     }
 
+    /// rekordbox's waveforms read both channels, so the stream hands out each
+    /// chunk's frames as the file holds them beside the downmix; a mono file's
+    /// one channel stands for both.
+    #[test]
+    fn the_frames_beside_the_downmix_are_the_files_own_stereo() {
+        let dir = tempfile::tempdir().unwrap();
+        let stereo = dir.path().join("stereo.wav");
+        let samples: Vec<f32> = (0..2_000).flat_map(|i| [i as f32 / 4_000.0, -0.25]).collect();
+        write_wav(&stereo, 8_000, 2, &samples);
+        let mut stream = MonoStream::open(&stereo).unwrap();
+        let mut frames = Vec::new();
+        while let Some((mono, chunk)) = stream.next_frames() {
+            assert_eq!(mono.len(), chunk.len());
+            frames.extend_from_slice(chunk);
+        }
+        let written = |x: f32| (x * 32767.0) as i16;
+        assert_eq!(frames.len(), 2_000);
+        assert_eq!(frames[1_000], [written(0.25), written(-0.25)]);
+
+        let mono = dir.path().join("mono.wav");
+        write_wav(&mono, 8_000, 1, &[0.5; 100]);
+        let mut stream = MonoStream::open(&mono).unwrap();
+        let (_, chunk) = stream.next_frames().unwrap();
+        assert_eq!(chunk[0], [written(0.5), written(0.5)]);
+    }
+
     #[test]
     fn decodes_a_mono_wav() {
         let dir = tempfile::tempdir().unwrap();
@@ -492,6 +546,68 @@ mod tests {
         mp3
     }
 
+    /// Where an MP3's frame `index` starts, counting its Info frame as 0.
+    fn frame_at(bytes: &[u8], index: usize) -> usize {
+        let mut at = bytes.windows(2).position(|w| w == [0xFF, 0xFB]).unwrap();
+        for _ in 0..index {
+            at += 1044 + usize::from((bytes[at + 2] >> 1) & 1);
+        }
+        assert_eq!(&bytes[at..at + 2], &[0xFF, 0xFB]);
+        at
+    }
+
+    /// The MP3 with its fourth frame claiming 511 big values in its first
+    /// granule, more than a granule holds: symphonia refuses to decode it, as
+    /// it does the broken frames some files open with.
+    fn damaged_mp3(mp3: &Path) -> std::path::PathBuf {
+        let mut bytes = std::fs::read(mp3).unwrap();
+        let at = frame_at(&bytes, 3);
+        // Side information: main_data_begin (9 bits), private bits (3),
+        // scfsi (8), part2_3_length (12), then big_values (9).
+        bytes[at + 8] = 0xFF;
+        bytes[at + 9] |= 0x80;
+        let damaged = mp3.with_file_name("damaged.mp3");
+        std::fs::write(&damaged, bytes).unwrap();
+        damaged
+    }
+
+    /// The MP3 with its first audio frame in plain stereo, where the Info
+    /// frame and the rest are joint: rekordbox starts its map a frame after
+    /// that one, so its timeline begins a frame into symphonia's.
+    fn restarted_mp3(mp3: &Path) -> std::path::PathBuf {
+        let mut bytes = std::fs::read(mp3).unwrap();
+        let at = frame_at(&bytes, 1);
+        bytes[at + 3] &= 0x3F;
+        let restarted = mp3.with_file_name("restarted.mp3");
+        std::fs::write(&restarted, bytes).unwrap();
+        restarted
+    }
+
+    /// Everything `next_frames` hands out, the downmix and the stereo frames
+    /// as two runs, each chunk's two views checked to be as long.
+    fn frames_of(path: &Path) -> (Vec<f32>, Vec<[i16; 2]>) {
+        let mut stream = MonoStream::open(path).unwrap();
+        let (mut mono, mut stereo) = (Vec::new(), Vec::new());
+        while let Some((chunk, frames)) = stream.next_frames() {
+            assert_eq!(chunk.len(), frames.len(), "a chunk's downmix and stereo are the same frames");
+            mono.extend_from_slice(chunk);
+            stereo.extend_from_slice(frames);
+        }
+        (mono, stereo)
+    }
+
+    /// Each stereo frame is the one its downmix sample was made from: a frame
+    /// out of step on a 440 Hz tone is off by thousands of times more.
+    fn assert_in_step(mono: &[f32], stereo: &[[i16; 2]]) {
+        assert_eq!(mono.len(), stereo.len());
+        let worst = mono
+            .iter()
+            .zip(stereo)
+            .map(|(m, [l, r])| (m - (f32::from(*l) + f32::from(*r)) / 65_536.0).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(worst < 2.0 / 32_768.0, "{worst}");
+    }
+
     /// The file as symphonia decodes it, mono, with nothing moved.
     fn symphonia_mono(path: &Path) -> Vec<f32> {
         let file = std::fs::File::open(path).unwrap();
@@ -531,27 +647,45 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mp3 = lame_mp3(dir.path());
         let whole = decode_mono(&mp3, None).unwrap().samples;
-        // The fourth frame claims 511 big values in its first granule, more
-        // than a granule holds: symphonia refuses to decode it, as it does
-        // the broken frames some files open with.
-        let mut bytes = std::fs::read(&mp3).unwrap();
-        let mut at = bytes.windows(2).position(|w| w == [0xFF, 0xFB]).unwrap();
-        for _ in 0..3 {
-            at += 1044 + usize::from((bytes[at + 2] >> 1) & 1);
-        }
-        assert_eq!(&bytes[at..at + 2], &[0xFF, 0xFB]);
-        // Side information: main_data_begin (9 bits), private bits (3),
-        // scfsi (8), part2_3_length (12), then big_values (9).
-        bytes[at + 8] = 0xFF;
-        bytes[at + 9] |= 0x80;
-        let damaged = dir.path().join("damaged.mp3");
-        std::fs::write(&damaged, bytes).unwrap();
+        let damaged = damaged_mp3(&mp3);
         let audio = decode_mono(&damaged, None).unwrap().samples;
         assert_eq!(audio.len(), whole.len(), "a dropped packet moves everything after it");
         // What follows the damage is where it was.
         let tail = whole.len() - 22_050;
         let drift = audio[tail..].iter().zip(&whole[tail..]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(drift < 1e-6, "{drift}");
+    }
+
+    #[test]
+    fn an_mp3_s_stereo_frames_open_with_the_silence_rekordbox_plays() {
+        let dir = tempfile::tempdir().unwrap();
+        let mp3 = lame_mp3(dir.path());
+        let (mono, stereo) = frames_of(&mp3);
+        assert_eq!(mono, decode_mono(&mp3, None).unwrap().samples);
+        assert!(stereo[..1152].iter().all(|&frame| frame == [0, 0]));
+        assert_in_step(&mono, &stereo);
+    }
+
+    #[test]
+    fn an_mp3_s_stereo_frames_drop_what_rekordbox_does_not_play() {
+        let dir = tempfile::tempdir().unwrap();
+        let restarted = restarted_mp3(&lame_mp3(dir.path()));
+        assert_eq!(rbl_core::mpeg::rekordbox_lead_frames(&mut std::fs::File::open(&restarted).unwrap()), -1152);
+        let (mono, stereo) = frames_of(&restarted);
+        assert_eq!(mono.len(), symphonia_mono(&restarted).len() - 1152);
+        assert_in_step(&mono, &stereo);
+    }
+
+    #[test]
+    fn a_damaged_mp3_packet_is_silence_in_the_stereo_frames_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let mp3 = lame_mp3(dir.path());
+        let (mono, stereo) = frames_of(&damaged_mp3(&mp3));
+        assert_eq!(mono, decode_mono(&damaged_mp3(&mp3), None).unwrap().samples);
+        assert_eq!(stereo.len(), frames_of(&mp3).1.len(), "the damaged packet keeps its place");
+        // The Info frame's silence and two good frames, then the damaged one.
+        assert!(stereo[3 * 1152..4 * 1152].iter().all(|&frame| frame == [0, 0]));
+        assert_in_step(&mono, &stereo);
     }
 
     #[test]

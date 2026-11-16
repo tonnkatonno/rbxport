@@ -10,6 +10,11 @@
 //!
 //! What the writer does with each column is settled in `rbl-db/src/write.rs`;
 //! nothing here chooses a value.
+//!
+//! Each command is one entry in the library history (#504): the cue rows it
+//! changed, read before and after it under the edit gate, so Edit › Undo
+//! puts back exactly those rows and nothing else on the track. A Convert
+//! Memory Cues to Hot Cues is one entry for the whole track.
 
 use std::sync::Arc;
 
@@ -17,9 +22,11 @@ use rbl_index::Cue;
 use serde::Deserialize;
 use tauri::State;
 
-use crate::commands::{blocking, write_error};
+use rbl_db::write::CueRevision;
+
+use crate::commands::{announce_history, blocking, write_error};
 use crate::error::{AppError, AppResult, ErrorKind};
-use crate::state::AppState;
+use crate::state::{AppState, LibraryEdit};
 
 /// Which slot a new cue goes in: `"memory"`, or `{ "hot": "A" }`.
 ///
@@ -80,6 +87,8 @@ pub enum CueEdit {
     Slot { cue: String, kind: CueKind },
     Colour { cue: String, colour: Option<u8> },
     Comment { cue: String, comment: String },
+    /// A memory loop set as, or cleared from being, its track's Active Loop.
+    ActiveLoop { cue: String, on: bool },
     Delete { cue: String },
 }
 
@@ -139,6 +148,13 @@ pub fn apply(writer: &mut rbl_db::write::Writer, edit: CueEdit) -> AppResult<Cue
             }
             Ok(CueChange { track, cue })
         }
+        CueEdit::ActiveLoop { cue, on } => {
+            let track = owner_of(writer, &cue)?;
+            // No rows is an Active Loop already set, or one not set being
+            // cleared: the cue is there, so that is not a missing cue.
+            writer.set_active_loop(&cue, on).map_err(write_error)?;
+            Ok(CueChange { track, cue })
+        }
         CueEdit::Delete { cue } => {
             // Looked up before the delete: a deleted cue no longer reports an
             // owner, and the owner is whose cues the index has to re-read.
@@ -152,6 +168,45 @@ pub fn apply(writer: &mut rbl_db::write::Writer, edit: CueEdit) -> AppResult<Cue
     }
 }
 
+impl CueEdit {
+    /// What Edit › Undo calls this edit: rekordbox's own name for the
+    /// control that makes it where there is one (`Set Memory Cue`,
+    /// `Set Hot Cue`), else what it does.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Add { kind: CueKind::Memory, .. } => "Set Memory Cue",
+            Self::Add { kind: CueKind::Hot(_), .. } => "Set Hot Cue",
+            Self::AddLoop { .. } => "Set Loop",
+            Self::Move { .. } => "Move Cue",
+            Self::Slot { .. } => "Move Hot Cue",
+            Self::Colour { .. } => "Cue Color",
+            Self::Comment { .. } => "Cue Comment",
+            Self::ActiveLoop { .. } => "Active Loop",
+            Self::Delete { .. } => "Delete Cue",
+        }
+    }
+}
+
+/// [`apply`], with the rows it changed: the track's cue rows read before
+/// and after through the same writer, which the caller holds under the edit
+/// gate, so nothing else's change is mistaken for this edit's.
+pub fn apply_recorded(writer: &mut rbl_db::write::Writer, edit: CueEdit) -> AppResult<(CueChange, CueRevision)> {
+    let track = match &edit {
+        CueEdit::Add { track, .. } | CueEdit::AddLoop { track, .. } => track.clone(),
+        CueEdit::Move { cue, .. }
+        | CueEdit::Slot { cue, .. }
+        | CueEdit::Colour { cue, .. }
+        | CueEdit::Comment { cue, .. }
+        | CueEdit::ActiveLoop { cue, .. }
+        | CueEdit::Delete { cue } => owner_of(writer, cue)?,
+    };
+    let before = writer.cue_rows(&track).map_err(write_error)?;
+    let change = apply(writer, edit)?;
+    let after = writer.cue_rows(&change.track).map_err(write_error)?;
+    let revision = CueRevision::between(&change.track, &before, &after);
+    Ok((change, revision))
+}
+
 fn owner_of(writer: &rbl_db::write::Writer, cue: &str) -> AppResult<String> {
     writer
         .cue_owner(cue)
@@ -159,23 +214,47 @@ fn owner_of(writer: &rbl_db::write::Writer, cue: &str) -> AppResult<String> {
         .ok_or_else(|| AppError::new(ErrorKind::NotFound, format!("no cue {cue}")))
 }
 
-/// Opens the writer, applies one edit, re-reads that track's cues, and tells
-/// the interface which track changed.
+/// Where an edit's history goes: its own entry, or folded into a
+/// conversion's, which records the whole track's as one at the end.
+enum Record {
+    Entry,
+    Into(Arc<parking_lot::Mutex<Option<CueRevision>>>),
+}
+
+/// Opens the writer, applies one edit, records it, re-reads that track's
+/// cues, and tells the interface which track changed.
 async fn edit_cues<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, Arc<AppState>>,
     name: &'static str,
     edit: CueEdit,
+    record: Record,
 ) -> AppResult<CueChange> {
     let library = state.library()?;
-    let state = Arc::clone(&state);
+    let writing = Arc::clone(&state);
+    let label = edit.label();
+    let recorded = matches!(record, Record::Entry);
     let change = blocking(name, move || {
+        let state = writing;
+        // Held from the write until the entry is recorded, so no Undo runs
+        // in between and finds rows the history does not know of yet.
+        let _gate = state.edit_gate.lock();
         // `apply` answers with the interface's error; the writer's own
         // refusals are carried out of the closure and mapped the same way.
-        let change = match state.write(|writer| Ok(apply(writer, edit))) {
+        // The history-owning write: this edit records itself, so it is not
+        // a write outside the history that ends the Redo branch on its own.
+        let (change, revision) = match state.write_history_then(|writer| Ok(apply_recorded(writer, edit)), |_, applied| Ok(applied)) {
             Ok(applied) => applied?,
             Err(refused) => return Err(write_error(refused)),
         };
+        match record {
+            Record::Entry if !revision.is_empty() => state.edit_history.lock().record(LibraryEdit::Cues(revision), label),
+            Record::Entry => {}
+            Record::Into(whole) => match &mut *whole.lock() {
+                Some(earlier) => earlier.extend(revision),
+                slot @ None => *slot = Some(revision),
+            },
+        }
         // The writer held the file read-write; `write` has closed it before
         // the read-only handle below opens, as an edit in `commands.rs` is.
         let db = state.open_read_only().map_err(write_error)?;
@@ -187,6 +266,9 @@ async fn edit_cues<R: tauri::Runtime>(
     // The track's id, well inside the 1 KB event cap. Every deck showing the
     // track refetches its cues; nothing else has anything to do.
     let _ = tauri::Emitter::emit(&app, "cues:changed", &change.track);
+    if recorded {
+        announce_history(&app, &state);
+    }
     Ok(change)
 }
 
@@ -221,7 +303,7 @@ pub(crate) async fn add_hot_cues<R: tauri::Runtime>(
             continue;
         }
         let edit = CueEdit::Add { track: track.clone(), kind: CueKind::Hot(letter), position_ms };
-        let id = edit_cues(app.clone(), app.state::<Arc<AppState>>(), "add_hot_cue", edit).await?.cue;
+        let id = edit_cues(app.clone(), app.state::<Arc<AppState>>(), "add_hot_cue", edit, Record::Entry).await?.cue;
         outcome.added.push((letter, position_ms, id));
     }
     Ok(outcome)
@@ -349,7 +431,7 @@ pub async fn add_cue<R: tauri::Runtime>(
     kind: CueKind,
     position_ms: u32,
 ) -> AppResult<String> {
-    edit_cues(app, state, "add_cue", CueEdit::Add { track, kind, position_ms })
+    edit_cues(app, state, "add_cue", CueEdit::Add { track, kind, position_ms }, Record::Entry)
         .await
         .map(|change| change.cue)
 }
@@ -370,7 +452,7 @@ pub async fn add_loop<R: tauri::Runtime>(
 ) -> AppResult<String> {
     let beat_loop = beats.map(beat_fraction).transpose()?;
     let edit = CueEdit::AddLoop { track, kind, in_ms, out_ms, beat_loop };
-    edit_cues(app, state, "add_loop", edit).await.map(|change| change.cue)
+    edit_cues(app, state, "add_loop", edit, Record::Entry).await.map(|change| change.cue)
 }
 
 /// A beat loop length as rekordbox's `StAutoBeatLoop` holds it: 4 beats is
@@ -399,7 +481,7 @@ pub async fn move_cue<R: tauri::Runtime>(
     cue: String,
     position_ms: u32,
 ) -> AppResult<()> {
-    edit_cues(app, state, "move_cue", CueEdit::Move { cue, position_ms }).await.map(|_| ())
+    edit_cues(app, state, "move_cue", CueEdit::Move { cue, position_ms }, Record::Entry).await.map(|_| ())
 }
 
 /// Moves a hot cue to another pad slot, shifting the cues between the two by one.
@@ -407,21 +489,31 @@ pub async fn move_cue<R: tauri::Runtime>(
 pub async fn move_hot_cue<R: tauri::Runtime>(
     app: tauri::AppHandle<R>, state: State<'_, Arc<AppState>>, cue: String, kind: CueKind,
 ) -> AppResult<()> {
-    edit_cues(app, state, "move_hot_cue", CueEdit::Slot { cue, kind }).await.map(|_| ())
+    edit_cues(app, state, "move_hot_cue", CueEdit::Slot { cue, kind }, Record::Entry).await.map(|_| ())
 }
 
 #[tauri::command]
 pub async fn set_cue_colour<R: tauri::Runtime>(
     app: tauri::AppHandle<R>, state: State<'_, Arc<AppState>>, cue: String, colour: Option<u8>,
 ) -> AppResult<()> {
-    edit_cues(app, state, "set_cue_colour", CueEdit::Colour { cue, colour }).await.map(|_| ())
+    edit_cues(app, state, "set_cue_colour", CueEdit::Colour { cue, colour }, Record::Entry).await.map(|_| ())
 }
 
 #[tauri::command]
 pub async fn set_cue_comment<R: tauri::Runtime>(
     app: tauri::AppHandle<R>, state: State<'_, Arc<AppState>>, cue: String, comment: String,
 ) -> AppResult<()> {
-    edit_cues(app, state, "set_cue_comment", CueEdit::Comment { cue, comment }).await.map(|_| ())
+    edit_cues(app, state, "set_cue_comment", CueEdit::Comment { cue, comment }, Record::Entry).await.map(|_| ())
+}
+
+/// Sets a memory loop as its track's Active Loop, or clears it: the MEMORY
+/// panel's loop button, as rekordbox's is. Setting one clears the track's
+/// previous Active Loop.
+#[tauri::command]
+pub async fn set_active_loop<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>, state: State<'_, Arc<AppState>>, cue: String, on: bool,
+) -> AppResult<()> {
+    edit_cues(app, state, "set_active_loop", CueEdit::ActiveLoop { cue, on }, Record::Entry).await.map(|_| ())
 }
 
 #[tauri::command]
@@ -430,7 +522,7 @@ pub async fn delete_cue<R: tauri::Runtime>(
     state: State<'_, Arc<AppState>>,
     cue: String,
 ) -> AppResult<()> {
-    edit_cues(app, state, "delete_cue", CueEdit::Delete { cue }).await.map(|_| ())
+    edit_cues(app, state, "delete_cue", CueEdit::Delete { cue }, Record::Entry).await.map(|_| ())
 }
 
 /// Convert Memory Cues to Hot Cues: each memory cue of the track, in order
@@ -450,17 +542,36 @@ pub async fn convert_memory_cues_to_hot<R: tauri::Runtime>(
     };
     let cues = library.cues_of(row);
     let plan = conversion_plan(&cues);
+    // Each cue is written and announced as it is made; the history gets the
+    // whole conversion as one entry once they are, or as far as it got.
+    let whole = Arc::new(parking_lot::Mutex::new(None));
     let mut made = 0;
+    let mut outcome = Ok(());
     for (kind, position_ms, out_ms) in plan {
         let edit = if out_ms > position_ms {
             CueEdit::AddLoop { track: track.clone(), kind: CueKind::Hot(kind), in_ms: position_ms, out_ms, beat_loop: None }
         } else {
             CueEdit::Add { track: track.clone(), kind: CueKind::Hot(kind), position_ms }
         };
-        edit_cues(app.clone(), state.clone(), "convert_memory_cues_to_hot", edit).await?;
+        let record = Record::Into(Arc::clone(&whole));
+        if let Err(error) = edit_cues(app.clone(), state.clone(), "convert_memory_cues_to_hot", edit, record).await {
+            outcome = Err(error);
+            break;
+        }
         made += 1;
     }
-    Ok(made)
+    let revision = whole.lock().take();
+    if let Some(revision) = revision.filter(|revision| !revision.is_empty()) {
+        let writing = Arc::clone(&state);
+        blocking("convert_memory_cues_to_hot", move || {
+            let _gate = writing.edit_gate.lock();
+            writing.edit_history.lock().record(LibraryEdit::Cues(revision), "Convert Memory Cues to Hot Cues");
+            Ok(())
+        })
+        .await?;
+        announce_history(&app, &state);
+    }
+    outcome.map(|()| made)
 }
 
 /// Which hot cue each memory cue becomes: `(letter, in, out)`, memory cues
@@ -593,6 +704,47 @@ mod tests {
             .query_row("SELECT BeatLoopSize FROM djmdCue WHERE ID = ?1", [&change.cue], |r| r.get(0))
             .unwrap();
         assert_eq!(size, (1 << 16) | 2);
+    }
+
+    #[test]
+    fn the_memory_loop_button_moves_the_active_loop_and_the_index_follows() {
+        // #577: rekordbox's MEMORY row loop button turns a memory loop into
+        // the track's Active Loop (Kind 4), the previous one back to 0.
+        let mut f = open();
+        let track = track_id(1);
+        let add = |f: &mut Fixture, in_ms| {
+            apply(
+                &mut f.writer,
+                CueEdit::AddLoop { track: track.clone(), kind: CueKind::Memory, in_ms, out_ms: in_ms + 1_875, beat_loop: Some((4, 1)) },
+            )
+            .unwrap()
+            .cue
+        };
+        let first = add(&mut f, 10_000);
+        let second = add(&mut f, 40_000);
+        let active = |f: &Fixture| -> Vec<u32> {
+            f.cues(&track).iter().filter(|c| c.is_active_loop()).map(|c| c.position_ms).collect()
+        };
+
+        let change = apply(&mut f.writer, CueEdit::ActiveLoop { cue: first.clone(), on: true }).unwrap();
+        assert_eq!(change.track, track);
+        f.reload(&track);
+        assert_eq!(active(&f), [10_000]);
+        assert!(f.cues(&track).iter().all(Cue::is_memory), "still both memory loops");
+
+        apply(&mut f.writer, CueEdit::ActiveLoop { cue: second.clone(), on: true }).unwrap();
+        f.reload(&track);
+        assert_eq!(active(&f), [40_000]);
+
+        // Clearing the one that is not set is not an error: the button and
+        // the database already agree.
+        apply(&mut f.writer, CueEdit::ActiveLoop { cue: first, on: false }).unwrap();
+        apply(&mut f.writer, CueEdit::ActiveLoop { cue: second, on: false }).unwrap();
+        f.reload(&track);
+        assert_eq!(active(&f), [] as [u32; 0]);
+
+        let missing = apply(&mut f.writer, CueEdit::ActiveLoop { cue: "424242".into(), on: true }).unwrap_err();
+        assert_eq!(missing.kind, ErrorKind::NotFound);
     }
 
     #[test]
@@ -754,7 +906,7 @@ mod tests {
 
     #[test]
     fn memory_cues_take_the_free_hot_slots_in_order_of_position() {
-        let cue = |id: u32, kind: u8, position_ms: u32, out_ms: u32| Cue { id, position_ms, out_ms, kind, colour: 0 };
+        let cue = |id: u32, kind: u8, position_ms: u32, out_ms: u32| Cue { id, position_ms, out_ms, kind, colour: 0, memory_colour: None };
         // B is taken; a loop and two plain memory cues, out of order.
         let cues = vec![cue(1, 2, 5_000, 0), cue(2, 0, 30_000, 0), cue(3, 0, 10_000, 14_000), cue(4, 0, 1_000, 0)];
         assert_eq!(conversion_plan(&cues), vec![('A', 1_000, 0), ('C', 10_000, 14_000), ('D', 30_000, 0)]);

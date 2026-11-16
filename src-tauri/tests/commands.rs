@@ -255,9 +255,9 @@ fn a_playlist_folder_lists_unique_tracks_from_nested_playlists() {
     let friday = s.node("Friday");
     let saturday = s.node("Saturday");
     let outside = s.node("Outside");
-    run(commands::add_tracks_to_playlist(s.handle(), s.state(), friday.id, vec![track_id(3), track_id(1)], None)).unwrap();
-    run(commands::add_tracks_to_playlist(s.handle(), s.state(), saturday.id, vec![track_id(1), track_id(2)], None)).unwrap();
-    run(commands::add_tracks_to_playlist(s.handle(), s.state(), outside.id, vec![track_id(4)], None)).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), friday.id, vec![track_id(3), track_id(1)], None, None)).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), saturday.id, vec![track_id(1), track_id(2)], None, None)).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), outside.id, vec![track_id(4)], None, None)).unwrap();
 
     let (view, len) = s.open(playlist_folder_spec(&shows.id));
     assert_eq!(len, 3);
@@ -491,7 +491,7 @@ fn a_playlist_is_made_filled_reordered_renamed_moved_and_deleted() {
         s.state(),
         friday.id.clone(),
         vec![t3.clone(), t1.clone(), t2.clone()],
-        None
+        None, None
     ))
     .unwrap();
     let rows = s.playlist_rows(&friday.id);
@@ -559,7 +559,7 @@ fn a_deleted_playlist_tree_can_be_undone_and_redone() {
         s.state(),
         playlist.id.clone(),
         tracks.clone(),
-        None
+        None, None
     )).unwrap();
 
     let deleted = run(commands::delete_playlist(s.handle(), s.state(), folder.id.clone())).unwrap();
@@ -569,7 +569,9 @@ fn a_deleted_playlist_tree_can_be_undone_and_redone() {
     assert!(!s.has_node("Friday"));
 
     let undone = run(commands::undo_edit(s.handle(), s.state())).unwrap();
-    assert!(!undone.can_undo);
+    // What is left to undo is the add before the delete (#499), then the
+    // creations before it (#500).
+    assert_eq!(undone.undo_label.as_deref(), Some("Add Tracks to Playlist"));
     assert!(undone.can_redo);
     assert_eq!(s.node("Sets").id, folder.id);
     assert_eq!(s.node("Friday").id, playlist.id);
@@ -595,7 +597,7 @@ fn a_folder_drop_replacement_is_one_undo_and_one_redo() {
     run(commands::create_playlist(s.handle(), s.state(), "Early".into(), old.id.clone(), None)).unwrap();
     let early = s.node("Early");
     let tracks = vec![track_id(3), track_id(1)];
-    run(commands::add_tracks_to_playlist(s.handle(), s.state(), early.id.clone(), tracks.clone(), None)).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), early.id.clone(), tracks.clone(), None, None)).unwrap();
     run(commands::rename_playlist(s.handle(), s.state(), early.id.clone(), "Opening".into())).unwrap();
     let before = tree_ids(&s);
 
@@ -641,7 +643,7 @@ fn a_folder_drop_replacement_undoes_after_newer_siblings() {
     let s = shell();
     run(commands::create_playlist(s.handle(), s.state(), "Warm Up".into(), ROOT.into(), None)).unwrap();
     let old = s.node("Warm Up");
-    run(commands::add_tracks_to_playlist(s.handle(), s.state(), old.id.clone(), vec![track_id(2)], None)).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), old.id.clone(), vec![track_id(2)], None, None)).unwrap();
     run(commands::rename_playlist(s.handle(), s.state(), playlist_id(0), "Renamed".into())).unwrap();
 
     let dropped = |name: &str| {
@@ -662,7 +664,9 @@ fn a_folder_drop_replacement_undoes_after_newer_siblings() {
     let new_folder =
         run(commands::import_folder_playlist(s.handle(), s.state(), fresh, ROOT.into(), None, replaced.at, None)).unwrap();
     let new_list = new_folder.playlist.unwrap();
-    run(commands::create_playlist(s.handle(), s.state(), "Later".into(), ROOT.into(), None)).unwrap();
+    // Made by another program: since #500 one made here is in the history.
+    other_program(&s).create_playlist("Later", ROOT).unwrap();
+    run(commands::reload_library(s.handle(), s.state())).unwrap();
     let later = s.node("Later");
 
     let undone = run(commands::undo_edit(s.handle(), s.state())).unwrap();
@@ -684,8 +688,9 @@ fn a_folder_drop_replacement_undoes_after_newer_siblings() {
     assert_eq!(s.node("Playlist 0").id, playlist_id(0), "the rename before it undone too");
 }
 
-/// #426: Undo of a replacement refuses once the new playlist has changed,
-/// and the history keeps the entry rather than losing it.
+/// #426: Undo of a replacement refuses once the new playlist has changed.
+/// Since #506 the refused entry leaves the history, so it cannot block the
+/// entries older than it.
 #[test]
 fn a_folder_drop_replacement_refuses_undo_after_its_playlist_changed() {
     let s = shell();
@@ -698,14 +703,22 @@ fn a_folder_drop_replacement_refuses_undo_after_its_playlist_changed() {
     ))
     .unwrap();
     let made = replaced.playlist.unwrap();
-    run(commands::add_tracks_to_playlist(s.handle(), s.state(), made.clone(), vec![track_id(4)], None)).unwrap();
+    // Another program adds a track: an add made here is its own Undo (#499).
+    let mut other = rbl_db::write::Writer::open(s.location.clone(), s._dir.path().join("other-backups")).unwrap();
+    other.disable_automatic_backups();
+    other.add_tracks(&made, &[track_id(4)]).unwrap();
+    drop(other);
+    run(commands::reload_library(s.handle(), s.state())).unwrap();
     let tree_ids = |s: &Shell| s.tree().into_iter().map(|n| (n.id, n.name, n.depth)).collect::<Vec<_>>();
     let tree = tree_ids(&s);
 
     let error = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
-    assert!(error.message.contains("can no longer be undone"), "{}", error.message);
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert!(error.message.starts_with("Can't undo Replace Playlist:"), "{}", error.message);
     assert_eq!(tree_ids(&s), tree, "nothing written");
     assert_eq!(s.playlist_rows(&made).len(), 2);
+    // #506: the refused entry is gone, so it does not block what is older.
+    assert_eq!(run(commands::undo_edit(s.handle(), s.state())).unwrap_err().kind, ErrorKind::NotFound);
 }
 
 #[test]
@@ -736,7 +749,7 @@ fn library_history_names_and_reverses_each_supported_edit() {
     let tracks = vec![track_id(1), track_id(2), track_id(3)];
     run(commands::add_tracks_to_playlist(
         s.handle(), s.state(), playlist.id.clone(), tracks.clone(),
-        None
+        None, None
     )).unwrap();
     let removed = run(commands::remove_tracks_from_playlist(
         s.handle(), s.state(), playlist.id.clone(), vec![tracks[1].clone()],
@@ -766,6 +779,215 @@ fn library_history_names_and_reverses_each_supported_edit() {
     assert_eq!(run(details::track_details(s.state(), track)).unwrap().title, "Seven");
 }
 
+/// `parent`'s live children as `(ID, Seq)` in tree order, read from the file.
+fn child_seqs(s: &Shell, parent: &str) -> Vec<(String, Option<i64>)> {
+    let db = Db::open(s.location.clone(), OpenMode::ReadOnly).unwrap();
+    let mut stmt = db
+        .connection()
+        .prepare("SELECT ID, Seq FROM djmdPlaylist WHERE ParentID = ?1 AND rb_local_deleted = 0 ORDER BY Seq, ID")
+        .unwrap();
+    stmt.query_map([parent], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
+}
+
+/// One column of one playlist row, read from the file.
+fn playlist_column(s: &Shell, id: &str, column: &str) -> Option<String> {
+    let db = Db::open(s.location.clone(), OpenMode::ReadOnly).unwrap();
+    db.connection()
+        .query_row(&format!("SELECT {column} FROM djmdPlaylist WHERE ID = ?1"), [id], |r| r.get(0))
+        .unwrap()
+}
+
+/// Another program (rekordbox, while RBXport stays open) writing the
+/// library: nothing in the app hears of it.
+fn other_program(s: &Shell) -> rbl_db::write::Writer {
+    let mut other = rbl_db::write::Writer::open(s.location.clone(), s._dir.path().join("other-backups")).unwrap();
+    other.disable_automatic_backups();
+    other
+}
+
+fn smart_rule(property: &str, value: &str) -> rbxport_lib::dto::SmartRuleDto {
+    rbxport_lib::dto::SmartRuleDto {
+        logic: "all".to_owned(),
+        conditions: vec![rbxport_lib::dto::SmartConditionDto {
+            property: property.to_owned(),
+            operator: "11".to_owned(),
+            left: value.to_owned(),
+            right: String::new(),
+            unit: String::new(),
+        }],
+    }
+}
+
+/// #500: Create Playlist, Create Folder and Create Intelligent Playlist are
+/// one entry each. Undo takes the same row away and gives the siblings back
+/// their exact `Seq`; Redo brings the same row back in its place. The older
+/// history stays behind them.
+#[test]
+fn each_creation_is_one_undo_and_one_redo_that_restore_the_exact_tree() {
+    let s = shell();
+    run(commands::rename_playlist(s.handle(), s.state(), playlist_id(0), "Renamed 500".into())).unwrap();
+    let root = child_seqs(&s, ROOT);
+    let history = |s: &Shell| commands::current_history(&s.state());
+
+    // A playlist made at a place among the others renumbers the whole run.
+    run(commands::create_playlist(s.handle(), s.state(), "Opening".into(), ROOT.into(), Some(0))).unwrap();
+    let made = s.node("Opening");
+    let after_playlist = child_seqs(&s, ROOT);
+    assert_eq!(after_playlist[0].0, made.id, "put first");
+    assert_eq!(history(&s).undo_label.as_deref(), Some("Create Playlist"));
+    run(commands::create_folder(s.handle(), s.state(), "Crates".into(), ROOT.into())).unwrap();
+    let folder = s.node("Crates");
+    assert_eq!(history(&s).undo_label.as_deref(), Some("Create Folder"));
+    run(commands::create_smart_playlist(s.handle(), s.state(), "Sevens".into(), folder.id.clone(), smart_rule("name", "7")))
+        .unwrap();
+    let smart = s.node("Sevens");
+    let smart_list = playlist_column(&s, &smart.id, "SmartList");
+    let after_all = child_seqs(&s, ROOT);
+    assert_eq!(history(&s).undo_label.as_deref(), Some("Create Intelligent Playlist"));
+
+    let undone = run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(undone.redo_label.as_deref(), Some("Create Intelligent Playlist"));
+    assert!(!s.has_node("Sevens"));
+    assert!(child_seqs(&s, &folder.id).is_empty());
+    let undone = run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(undone.redo_label.as_deref(), Some("Create Folder"));
+    assert!(!s.has_node("Crates"));
+    assert_eq!(child_seqs(&s, ROOT), after_playlist);
+    let undone = run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(undone.redo_label.as_deref(), Some("Create Playlist"));
+    assert_eq!(undone.undo_label.as_deref(), Some("Rename Playlist"), "the older history stays");
+    assert!(!s.has_node("Opening"));
+    assert_eq!(child_seqs(&s, ROOT), root, "the siblings have the Seq they had");
+
+    for _ in 0..3 {
+        run(commands::redo_edit(s.handle(), s.state())).unwrap();
+    }
+    assert_eq!(child_seqs(&s, ROOT), after_all, "the same rows, in the same places");
+    assert_eq!(s.node("Opening").id, made.id);
+    assert_eq!(s.node("Crates").id, folder.id);
+    let smart_again = s.node("Sevens");
+    assert_eq!((smart_again.id.as_str(), smart_again.depth), (smart.id.as_str(), 2));
+    assert_eq!(playlist_column(&s, &smart.id, "SmartList"), smart_list, "the same rule");
+    assert_eq!(s.playlist_rows(&smart.id).len(), 4, "and it lists what it did");
+    assert!(!history(&s).can_redo);
+}
+
+/// #500, following #506: Undo of a creation never takes away what was put
+/// in it since. A playlist given tracks, or a folder given a playlist, by
+/// something outside the history is kept with them; only that entry leaves
+/// the history, and the older entries still undo.
+#[test]
+fn undo_of_a_creation_keeps_the_tracks_and_playlists_added_to_it_since() {
+    let s = shell();
+    run(commands::rename_playlist(s.handle(), s.state(), playlist_id(0), "Renamed 500".into())).unwrap();
+    run(commands::create_folder(s.handle(), s.state(), "Crates".into(), ROOT.into())).unwrap();
+    let folder = s.node("Crates");
+    run(commands::create_playlist(s.handle(), s.state(), "Friday".into(), ROOT.into(), None)).unwrap();
+    let playlist = s.node("Friday");
+
+    let mut other = other_program(&s);
+    other.add_tracks(&playlist.id, &[track_id(3), track_id(4)]).unwrap();
+    let inside = other.create_playlist("Inside", &folder.id).unwrap();
+    drop(other);
+    run(commands::reload_library(s.handle(), s.state())).unwrap();
+    let tree = s.tree().into_iter().map(|n| (n.id, n.depth)).collect::<Vec<_>>();
+
+    let error = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(
+        error.message,
+        "Can't undo Create Playlist: tracks have been added to the playlist since. The newer change was kept."
+    );
+    assert_eq!(ids(&s.playlist_rows(&playlist.id)), [track_id(3).as_str(), track_id(4).as_str()]);
+
+    let error = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(
+        error.message,
+        "Can't undo Create Folder: playlists have been added to the folder since. The newer change was kept."
+    );
+    assert_eq!(s.tree().into_iter().map(|n| (n.id, n.depth)).collect::<Vec<_>>(), tree, "nothing written");
+    assert!(s.tree().iter().any(|n| n.id == inside));
+
+    let undone = run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert!(!undone.can_undo, "only the refused entries left the history");
+    assert_eq!(s.node("Playlist 0").id, playlist_id(0), "the older rename still undoes");
+}
+
+/// #500: a creation renamed or moved outside the history is kept as it is,
+/// and Redo of one whose folder has gone since is refused.
+#[test]
+fn undo_and_redo_of_a_creation_refuse_a_playlist_changed_since() {
+    let s = shell();
+    run(commands::create_playlist(s.handle(), s.state(), "Friday".into(), ROOT.into(), None)).unwrap();
+    let playlist = s.node("Friday");
+    other_program(&s).rename(&playlist.id, "Saturday").unwrap();
+    let error = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.message, "Can't undo Create Playlist: the playlist has been renamed since. The newer change was kept.");
+    assert_eq!(child_seqs(&s, ROOT).iter().filter(|(id, _)| *id == playlist.id).count(), 1, "kept");
+
+    run(commands::create_folder(s.handle(), s.state(), "Crates".into(), ROOT.into())).unwrap();
+    let folder = s.node("Crates");
+    run(commands::create_playlist(s.handle(), s.state(), "Inside".into(), folder.id.clone(), None)).unwrap();
+    let inside = s.node("Inside");
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    other_program(&s).delete_playlist(&folder.id).unwrap();
+    let error = run(commands::redo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(
+        error.message,
+        "Can't redo Create Playlist: the folder it was made in is no longer there. The newer change was kept."
+    );
+    assert!(child_seqs(&s, &folder.id).iter().all(|(id, _)| *id != inside.id), "not brought back under a deleted folder");
+}
+
+/// #500: Edit Intelligent Playlist and Add Artwork on a playlist are one
+/// entry each that give back the exact rule text and image reference; the
+/// copied image stays on disk. A rule changed since outside the history is
+/// kept.
+#[test]
+fn a_rule_edit_and_playlist_artwork_undo_to_the_exact_previous_values() {
+    let s = shell();
+    run(commands::create_smart_playlist(s.handle(), s.state(), "Sevens".into(), ROOT.into(), smart_rule("name", "7"))).unwrap();
+    let smart = s.node("Sevens");
+    let first = playlist_column(&s, &smart.id, "SmartList");
+    run(commands::set_smart_rule(s.handle(), s.state(), smart.id.clone(), smart_rule("name", "8"))).unwrap();
+    let second = playlist_column(&s, &smart.id, "SmartList");
+    assert_ne!(first, second);
+    assert_eq!(commands::current_history(&s.state()).undo_label.as_deref(), Some("Edit Intelligent Playlist"));
+
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(playlist_column(&s, &smart.id, "SmartList"), first, "the exact rule text");
+    assert_eq!(s.node("Sevens").id, smart.id, "the playlist stays: only the rule was undone");
+    run(commands::redo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(playlist_column(&s, &smart.id, "SmartList"), second);
+
+    let image = s._dir.path().join("cover-500.png");
+    std::fs::write(&image, b"\x89PNG not really").unwrap();
+    let before = playlist_column(&s, &playlist_id(1), "ImagePath");
+    run(details::add_playlist_artwork(s.handle(), s.state(), playlist_id(1), image.display().to_string())).unwrap();
+    let after = playlist_column(&s, &playlist_id(1), "ImagePath").expect("an image reference");
+    assert_eq!(commands::current_history(&s.state()).undo_label.as_deref(), Some("Add Artwork"));
+    let filed = s.location.share_root.join(after.trim_start_matches('/'));
+    assert!(filed.is_file());
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(playlist_column(&s, &playlist_id(1), "ImagePath"), before, "the exact previous reference");
+    assert!(filed.is_file(), "the copied image stays, as track artwork Undo leaves it");
+    run(commands::redo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(playlist_column(&s, &playlist_id(1), "ImagePath").as_deref(), Some(after.as_str()));
+
+    // Undo the artwork again, then the rule, after rekordbox changed the rule.
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    other_program(&s).set_smart_list(&smart.id, "<NODE Id=\"1\" LogicalOperator=\"1\"/>").unwrap();
+    let error = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(
+        error.message,
+        "Can't undo Edit Intelligent Playlist: the playlist's rule has changed since. The newer change was kept."
+    );
+    assert_eq!(playlist_column(&s, &smart.id, "SmartList").as_deref(), Some("<NODE Id=\"1\" LogicalOperator=\"1\"/>"));
+}
+
 #[test]
 fn removing_from_collection_is_permanent_and_clears_history() {
     let s = shell();
@@ -774,6 +996,396 @@ fn removing_from_collection_is_permanent_and_clears_history() {
     run(commands::remove_from_collection(s.handle(), s.state(), vec![track])).unwrap();
     let error = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
     assert_eq!(error.kind, ErrorKind::NotFound);
+}
+
+/// #427: an import writes outside the library history, so like any other
+/// unrecorded edit it ends the redo branch: Redo after it would put back a
+/// value over what it wrote. Undo of the edits before it stays.
+#[test]
+fn an_import_ends_the_redo_branch_and_keeps_undo() {
+    let s = shell();
+    let track = track_id(7);
+    run(commands::set_track_rating(s.handle(), s.state(), vec![track.clone()], 4)).unwrap();
+    run(commands::set_track_rating(s.handle(), s.state(), vec![track.clone()], 5)).unwrap();
+    let undone = run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert!(undone.can_redo);
+
+    let audio = write_wav(&s._dir.path().join("Issue 427.wav"), 1);
+    let report = run(commands::import_files(s.handle(), s.state(), vec![audio.display().to_string()])).unwrap();
+    assert_eq!(report.imported, 1);
+
+    let error = run(commands::redo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::NotFound, "the import ended the redo branch");
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(run(details::track_details(s.state(), track)).unwrap().rating, 0);
+}
+
+/// #506: a cue edit ends the redo branch; since #504 it does so as a
+/// recorded edit, its own entry on top of the Undo that stays.
+#[test]
+fn a_cue_edit_ends_the_redo_branch_and_keeps_undo() {
+    let s = shell();
+    let track = track_id(7);
+    run(commands::set_track_rating(s.handle(), s.state(), vec![track.clone()], 4)).unwrap();
+    run(commands::set_track_rating(s.handle(), s.state(), vec![track.clone()], 5)).unwrap();
+    assert!(run(commands::undo_edit(s.handle(), s.state())).unwrap().can_redo);
+
+    // Opening the library for a write that changes nothing is no edit.
+    s.state().write(|_| Ok(())).unwrap();
+    let redone = run(commands::redo_edit(s.handle(), s.state())).expect("a write that changed nothing leaves Redo");
+    assert_eq!(run(details::track_details(s.state(), track.clone())).unwrap().rating, 5);
+    assert!(!redone.can_redo);
+    assert!(run(commands::undo_edit(s.handle(), s.state())).unwrap().can_redo, "Redo offered again before the cue edit");
+    run(cues::add_cue(s.handle(), s.state(), track.clone(), CueKind::Memory, 1_000)).unwrap();
+
+    let error = run(commands::redo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::NotFound, "the cue edit ended the redo branch");
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert!(run(commands::track_cues(s.state(), track.clone())).unwrap().is_empty(), "the cue edit undoes first");
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(run(details::track_details(s.state(), track)).unwrap().rating, 0);
+}
+
+/// #506: a write by another program while RBXport stays open (rekordbox
+/// takes the file back between edits) is not seen here, so it cannot end
+/// the redo branch. Redo over it is refused instead: the newer value is
+/// kept, and the rest of the history stays usable.
+#[test]
+fn redo_refuses_a_rating_changed_by_another_program_and_keeps_the_rest() {
+    let s = shell();
+    let track = track_id(7);
+    run(commands::rename_playlist(s.handle(), s.state(), playlist_id(0), "Renamed 506".into())).unwrap();
+    run(commands::set_track_rating(s.handle(), s.state(), vec![track.clone()], 4)).unwrap();
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(run(details::track_details(s.state(), track.clone())).unwrap().rating, 0);
+
+    // Another program sets 2: written straight to the file, not through
+    // the app, so nothing here hears of it.
+    let mut other = rbl_db::write::Writer::open(s.location.clone(), s._dir.path().join("other-backups")).unwrap();
+    other.disable_automatic_backups();
+    other.set_rating(&track, 2).unwrap();
+    drop(other);
+
+    let error = run(commands::redo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(error.message, "Can't redo Track Edit: the track has changed since. The newer change was kept.");
+    assert_eq!(run(details::track_details(s.state(), track)).unwrap().rating, 2, "the newer rating is kept");
+    assert_eq!(run(commands::redo_edit(s.handle(), s.state())).unwrap_err().kind, ErrorKind::NotFound);
+    let undone = run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert!(!undone.can_undo);
+    assert_eq!(s.node("Playlist 0").id, playlist_id(0), "the unrelated rename still undoes");
+}
+
+/// #499: one Add Tracks to Playlist, sent a slice at a time under one
+/// transaction, is one Undo; Undo and Redo give back the exact order.
+#[test]
+fn an_add_sent_in_slices_is_one_undo_and_one_redo() {
+    let s = shell();
+    run(commands::create_playlist(s.handle(), s.state(), "Set 499".into(), ROOT.into(), None)).unwrap();
+    let list = s.node("Set 499").id;
+    let order = |s: &Shell| s.playlist_rows(&list).iter().map(|r| (r.id.clone(), r.track_no)).collect::<Vec<_>>();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), list.clone(), vec![track_id(5)], None, None)).unwrap();
+    let before = order(&s);
+
+    let job = Some("add-499".to_owned());
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), list.clone(), vec![track_id(1), track_id(2)], None, job.clone())).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), list.clone(), vec![track_id(3)], None, job)).unwrap();
+    let after = order(&s);
+    assert_eq!(after.len(), 4);
+    let history = commands::current_history(&s.state());
+    assert_eq!(history.undo_label.as_deref(), Some("Add Tracks to Playlist"));
+
+    let undone = run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(order(&s), before, "both slices undone at once");
+    assert_eq!(undone.undo_label.as_deref(), Some("Add Tracks to Playlist"), "the earlier add is its own entry");
+    assert_eq!(undone.redo_label.as_deref(), Some("Add Tracks to Playlist"));
+    run(commands::redo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(order(&s), after);
+
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert!(order(&s).is_empty());
+}
+
+/// #499: an add with duplicates allowed undoes only the copies it added.
+#[test]
+fn undo_of_an_add_with_duplicates_leaves_the_tracks_already_there() {
+    let s = shell();
+    run(commands::create_playlist(s.handle(), s.state(), "Dupes 499".into(), ROOT.into(), None)).unwrap();
+    let list = s.node("Dupes 499").id;
+    let order = |s: &Shell| s.playlist_rows(&list).iter().map(|r| (r.id.clone(), r.track_no)).collect::<Vec<_>>();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), list.clone(), vec![track_id(1), track_id(2)], None, None)).unwrap();
+    let before = order(&s);
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), list.clone(), vec![track_id(2), track_id(1)], Some(true), None)).unwrap();
+    assert_eq!(order(&s).len(), 4);
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(order(&s), before);
+    run(commands::redo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(ids(&s.playlist_rows(&list)), [track_id(1), track_id(2), track_id(2), track_id(1)]);
+
+    // Without duplicates the same tracks add nothing, and nothing is recorded.
+    let history = commands::current_history(&s.state());
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), list.clone(), vec![track_id(1)], None, None)).unwrap();
+    let unchanged = commands::current_history(&s.state());
+    assert_eq!((unchanged.can_undo, unchanged.undo_label), (history.can_undo, history.undo_label));
+}
+
+/// #499: a reorder, and Renumber Track Order, which comes the same way, is
+/// one Undo that puts the old order back; Redo the new one.
+#[test]
+fn a_reorder_is_one_undo_and_one_redo() {
+    let s = shell();
+    run(commands::create_playlist(s.handle(), s.state(), "Order 499".into(), ROOT.into(), None)).unwrap();
+    let list = s.node("Order 499").id;
+    let tracks = vec![track_id(1), track_id(2), track_id(3)];
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), list.clone(), tracks.clone(), None, None)).unwrap();
+    run(commands::reorder_playlist(s.handle(), s.state(), list.clone(), vec![track_id(3), track_id(1), track_id(2)])).unwrap();
+    assert_eq!(ids(&s.playlist_rows(&list)), [track_id(3), track_id(1), track_id(2)]);
+    assert_eq!(commands::current_history(&s.state()).undo_label.as_deref(), Some("Reorder Playlist"));
+
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    let rows = s.playlist_rows(&list);
+    assert_eq!(ids(&rows), tracks.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(rows.iter().map(|r| r.track_no).collect::<Vec<_>>(), [1, 2, 3]);
+    run(commands::redo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(ids(&s.playlist_rows(&list)), [track_id(3), track_id(1), track_id(2)]);
+}
+
+/// #499, #506: Undo of an add or a reorder over a playlist another program
+/// changed since is refused; the newer tracks stay and so does the rest of
+/// the history.
+#[test]
+fn undo_of_an_add_or_reorder_refuses_a_playlist_changed_since() {
+    let s = shell();
+    run(commands::create_playlist(s.handle(), s.state(), "Clash 499".into(), ROOT.into(), None)).unwrap();
+    let list = s.node("Clash 499").id;
+    run(commands::rename_playlist(s.handle(), s.state(), playlist_id(0), "Renamed 499".into())).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), list.clone(), vec![track_id(1), track_id(2)], None, None)).unwrap();
+    run(commands::reorder_playlist(s.handle(), s.state(), list.clone(), vec![track_id(2), track_id(1)])).unwrap();
+
+    let outside = |track: String| {
+        let mut other = rbl_db::write::Writer::open(s.location.clone(), s._dir.path().join("other-backups")).unwrap();
+        other.disable_automatic_backups();
+        other.add_tracks(&list, &[track]).unwrap();
+    };
+    outside(track_id(3));
+    let error = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(error.message, "Can't undo Reorder Playlist: the playlist's tracks have changed since. The newer change was kept.");
+    let error = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.message, "Can't undo Add Tracks to Playlist: the playlist's tracks have changed since. The newer change was kept.");
+    run(commands::reload_library(s.handle(), s.state())).unwrap();
+    assert_eq!(ids(&s.playlist_rows(&list)), [track_id(2), track_id(1), track_id(3)], "the newer track is kept");
+
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(s.node("Playlist 0").id, playlist_id(0), "the unrelated rename still undoes");
+}
+
+/// A rekordbox XML document over `files` (`TrackID` 1..N, named by
+/// `names`) with one top-level playlist per `(name, keys)`.
+fn xml_doc_501(files: &[PathBuf], names: &[&str], lists: &[(&str, &[usize])]) -> String {
+    let location = |p: &Path| format!("file://localhost{}", p.to_string_lossy().replace(' ', "%20"));
+    let tracks: String = files
+        .iter()
+        .zip(names)
+        .enumerate()
+        .map(|(i, (file, name))| format!(r#"<TRACK TrackID="{}" Name="{name}" Location="{}"/>"#, i + 1, location(file)))
+        .collect();
+    let nodes: String = lists
+        .iter()
+        .map(|(name, keys)| {
+            let members: String = keys.iter().map(|k| format!(r#"<TRACK Key="{k}"/>"#)).collect();
+            format!(r#"<NODE Name="{name}" Type="1" KeyType="0" Entries="{}">{members}</NODE>"#, keys.len())
+        })
+        .collect();
+    format!(
+        r#"<?xml version="1.0"?><DJ_PLAYLISTS Version="1.0.0"><COLLECTION Entries="{}">{tracks}</COLLECTION>
+        <PLAYLISTS><NODE Type="0" Name="ROOT" Count="{}">{nodes}</NODE></PLAYLISTS></DJ_PLAYLISTS>"#,
+        files.len(),
+        lists.len(),
+    )
+}
+
+/// A playlist's live membership row ids, in order, read from the database:
+/// Undo must bring back these rows themselves, not lookalikes.
+fn membership_rows(s: &Shell, playlist: &str) -> Vec<String> {
+    let db = Db::open(s.location.clone(), OpenMode::ReadOnly).unwrap();
+    let mut stmt = db
+        .connection()
+        .prepare("SELECT ID FROM djmdSongPlaylist WHERE PlaylistID = ?1 AND rb_local_deleted = 0 ORDER BY TrackNo")
+        .unwrap();
+    stmt.query_map([playlist], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+}
+
+const REPLACE_501: &str = "Replace Playlist Contents";
+
+/// #501: an XML import that replaces several playlists is one Undo step.
+/// Undo puts back every replaced playlist's own membership rows in their
+/// old order; Redo the file's. The track and the list the import added
+/// stay, an unchanged list is not part of it, and the history before it
+/// (a Remove Tracks from Playlist on a replaced list, a rename) still
+/// undoes behind it.
+#[test]
+fn an_xml_import_that_replaces_lists_is_one_undo_and_one_redo() {
+    let s = shell();
+    let names = ["One", "Two", "Three", "Four"];
+    let audio: Vec<PathBuf> =
+        names.iter().map(|n| write_wav(&s._dir.path().join(format!("{n} 501.wav")), 1)).collect();
+    let file = s._dir.path().join("collection-501.xml");
+    std::fs::write(&file, xml_doc_501(&audio[..3], &names[..3], &[
+        ("A 501", &[1, 2]),
+        ("B 501", &[3, 1]),
+        ("Same 501", &[2]),
+    ])).unwrap();
+    let path = file.display().to_string();
+    let first = run(commands::import_xml(s.handle(), s.state(), path.clone(), None)).unwrap();
+    assert_eq!((first.imported, first.playlists), (3, 3));
+    let id_of = |title: &str| first.tracks.iter().find(|t| t.title == title).unwrap().id.clone();
+    let (one, two, three) = (id_of("One"), id_of("Two"), id_of("Three"));
+    let (a, b, same) = (s.node("A 501").id, s.node("B 501").id, s.node("Same 501").id);
+
+    run(commands::rename_playlist(s.handle(), s.state(), playlist_id(0), "Renamed 501".into())).unwrap();
+    run(commands::remove_tracks_from_playlist(s.handle(), s.state(), b.clone(), vec![one.clone()])).unwrap();
+    let before = (membership_rows(&s, &a), membership_rows(&s, &b), membership_rows(&s, &same));
+    assert_eq!(ids(&s.playlist_rows(&b)), [three.as_str()]);
+
+    // The next export: A reordered with a new track, B emptied of nothing
+    // but given "One" back, Same as it was, and a new list.
+    std::fs::write(&file, xml_doc_501(&audio, &names, &[
+        ("A 501", &[2, 4, 1]),
+        ("B 501", &[1, 3]),
+        ("Same 501", &[2]),
+        ("New 501", &[4]),
+    ])).unwrap();
+    let asked = run(commands::import_xml(s.handle(), s.state(), path.clone(), None)).unwrap();
+    assert_eq!(asked.same_named, vec!["A 501", "B 501", "Same 501"]);
+    let replaced = run(commands::import_xml(s.handle(), s.state(), path, Some(true))).unwrap();
+    assert_eq!((replaced.imported, replaced.playlists), (1, 1));
+    let four = replaced.tracks[0].id.clone();
+    let new = s.node("New 501").id;
+    let history = commands::current_history(&s.state());
+    assert_eq!(history.undo_label.as_deref(), Some(REPLACE_501));
+    assert!(!history.can_redo);
+    assert_eq!(ids(&s.playlist_rows(&a)), [two.as_str(), four.as_str(), one.as_str()]);
+    assert_eq!(ids(&s.playlist_rows(&b)), [one.as_str(), three.as_str()]);
+    let after = (membership_rows(&s, &a), membership_rows(&s, &b), membership_rows(&s, &same));
+    assert_eq!(after.2, before.2, "an unchanged list is not rewritten");
+
+    let undone = run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(undone.redo_label.as_deref(), Some(REPLACE_501));
+    assert_eq!(undone.undo_label.as_deref(), Some("Remove Tracks from Playlist"), "older history is kept");
+    assert_eq!((membership_rows(&s, &a), membership_rows(&s, &b), membership_rows(&s, &same)), before);
+    assert_eq!(ids(&s.playlist_rows(&a)), [one.as_str(), two.as_str()]);
+    assert_eq!(ids(&s.playlist_rows(&b)), [three.as_str()]);
+    assert_eq!(ids(&s.playlist_rows(&new)), [four.as_str()], "the new list stays");
+    assert!(run(details::track_details(s.state(), four.clone())).is_ok(), "the imported track stays");
+
+    let redone = run(commands::redo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(redone.undo_label.as_deref(), Some(REPLACE_501));
+    assert!(!redone.can_redo);
+    assert_eq!((membership_rows(&s, &a), membership_rows(&s, &b), membership_rows(&s, &same)), after);
+    assert_eq!(ids(&s.playlist_rows(&a)), [two.as_str(), four.as_str(), one.as_str()]);
+
+    // Undo three times: the replacement, the removal, the rename.
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(ids(&s.playlist_rows(&b)), [three.as_str(), one.as_str()]);
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(s.node("Playlist 0").id, playlist_id(0));
+}
+
+/// #501: File › Import iTunes Library… with Replace existing is undone and
+/// redone the same way.
+#[test]
+fn an_itunes_import_that_replaces_a_list_is_one_undo_and_one_redo() {
+    let s = shell();
+    let audio: Vec<PathBuf> =
+        ["Alpha", "Beta"].iter().map(|n| write_wav(&s._dir.path().join(format!("{n} 501.wav")), 1)).collect();
+    let location = |p: &Path| format!("file://{}", p.to_string_lossy().replace(' ', "%20"));
+    let plist = |items: &[u32]| {
+        let items: String =
+            items.iter().map(|id| format!("<dict><key>Track ID</key><integer>{id}</integer></dict>")).collect();
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>Tracks</key><dict>
+<key>101</key><dict><key>Track ID</key><integer>101</integer><key>Name</key><string>Alpha</string><key>Location</key><string>{}</string></dict>
+<key>102</key><dict><key>Track ID</key><integer>102</integer><key>Name</key><string>Beta</string><key>Location</key><string>{}</string></dict>
+</dict>
+<key>Playlists</key><array>
+<dict><key>Name</key><string>Warm Up 501</string><key>Playlist Persistent ID</key><string>P1</string><key>Playlist Items</key><array>{items}</array></dict>
+</array></dict></plist>"#,
+            location(&audio[0]),
+            location(&audio[1]),
+        )
+    };
+    let file = s._dir.path().join("Library-501.xml");
+    std::fs::write(&file, plist(&[101, 102])).unwrap();
+    let path = file.display().to_string();
+    let first = run(commands::import_itunes(s.handle(), s.state(), path.clone(), None)).unwrap();
+    assert_eq!((first.imported, first.playlists), (2, 1));
+    let id_of = |title: &str| first.tracks.iter().find(|t| t.title == title).unwrap().id.clone();
+    let (alpha, beta) = (id_of("Alpha"), id_of("Beta"));
+    let list = s.node("Warm Up 501").id;
+    let before = membership_rows(&s, &list);
+
+    std::fs::write(&file, plist(&[102])).unwrap();
+    assert_eq!(run(commands::import_itunes(s.handle(), s.state(), path.clone(), None)).unwrap().same_named, vec!["Warm Up 501"]);
+    run(commands::import_itunes(s.handle(), s.state(), path, Some(true))).unwrap();
+    assert_eq!(ids(&s.playlist_rows(&list)), [beta.as_str()]);
+    assert_eq!(commands::current_history(&s.state()).undo_label.as_deref(), Some(REPLACE_501));
+
+    let undone = run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert!(!undone.can_undo, "the first import is not in the history");
+    assert_eq!(membership_rows(&s, &list), before);
+    assert_eq!(ids(&s.playlist_rows(&list)), [alpha.as_str(), beta.as_str()]);
+
+    run(commands::redo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(ids(&s.playlist_rows(&list)), [beta.as_str()]);
+}
+
+/// #501 under #506's policy: a replaced list changed since by something
+/// outside the history (another program here) is not overwritten. Undo is
+/// refused with a message, only that entry leaves the history, and the
+/// older entry behind it stays.
+#[test]
+fn undo_of_an_xml_replacement_changed_since_is_refused_and_keeps_the_newer_change() {
+    let s = shell();
+    let names = ["One", "Two"];
+    let audio: Vec<PathBuf> =
+        names.iter().map(|n| write_wav(&s._dir.path().join(format!("{n} 501c.wav")), 1)).collect();
+    let file = s._dir.path().join("collection-501c.xml");
+    std::fs::write(&file, xml_doc_501(&audio, &names, &[("C 501", &[1, 2])])).unwrap();
+    let path = file.display().to_string();
+    run(commands::import_xml(s.handle(), s.state(), path.clone(), None)).unwrap();
+    let list = s.node("C 501").id;
+    run(commands::rename_playlist(s.handle(), s.state(), playlist_id(0), "Renamed 501".into())).unwrap();
+
+    std::fs::write(&file, xml_doc_501(&audio, &names, &[("C 501", &[2])])).unwrap();
+    run(commands::import_xml(s.handle(), s.state(), path, Some(true))).unwrap();
+    assert_eq!(membership_rows(&s, &list).len(), 1);
+
+    let mut other = rbl_db::write::Writer::open(s.location.clone(), s._dir.path().join("other-backups")).unwrap();
+    other.disable_automatic_backups();
+    other.add_tracks(&list, &[track_id(3)]).unwrap();
+    drop(other);
+    // Written straight to the file, so the index here has not heard of it:
+    // what is kept is read back from the database.
+    let newer = membership_rows(&s, &list);
+    assert_eq!(newer.len(), 2);
+
+    let error = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(
+        error.message,
+        "Can't undo Replace Playlist Contents: the playlist's tracks have changed since. The newer change was kept.",
+    );
+    assert_eq!(membership_rows(&s, &list), newer, "the newer track is kept, nothing written");
+    let history = commands::current_history(&s.state());
+    assert_eq!(history.undo_label.as_deref(), Some("Rename Playlist"), "the older entry stays");
+    assert!(!history.can_redo);
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(s.node("Playlist 0").id, playlist_id(0));
 }
 
 /// A multi-selection removed from the collection (#136) takes every selected
@@ -787,7 +1399,7 @@ fn removing_several_tracks_from_the_collection_removes_every_one() {
     run(commands::create_playlist(s.handle(), s.state(), "Set".into(), ROOT.into(), None)).unwrap();
     let playlist = s.node("Set").id;
     let members = vec![track_id(1), track_id(2), track_id(3), track_id(4)];
-    run(commands::add_tracks_to_playlist(s.handle(), s.state(), playlist.clone(), members.clone(), None)).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), playlist.clone(), members.clone(), None, None)).unwrap();
 
     let (view, before) = s.open(collection_spec());
     let all = s.rows(view);
@@ -859,7 +1471,7 @@ fn an_edit_closes_the_views_that_were_open_over_the_old_library() {
     let (view, _) = s.open(playlist_spec(&playlist_id(0)));
     assert_eq!(s.rows(view).len(), 5);
 
-    run(commands::add_tracks_to_playlist(s.handle(), s.state(), playlist_id(0), vec![track_id(30)], None)).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), playlist_id(0), vec![track_id(30)], None, None)).unwrap();
 
     // The page the frontend held is gone; it reopens against the new tree.
     let err = run(commands::fetch_rows(s.state(), view, 0, 10, None)).unwrap_err();
@@ -1039,6 +1651,156 @@ fn a_tag_list_add_naming_a_track_that_is_not_there_is_read_only_and_adds_none_of
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(*s.tag_list_changes.lock().unwrap(), 1, "only the add that went through announced");
+}
+
+/// Waits for `n` `tag-list:changed`, which the mock app delivers on its own thread.
+fn wait_for_tag_list_changes(s: &Shell, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while *s.tag_list_changes.lock().unwrap() < n && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(*s.tag_list_changes.lock().unwrap(), n);
+}
+
+/// The live Tag List rows' ids in `TrackNo` order, read from the database:
+/// Undo must bring back these rows themselves, not lookalikes.
+fn tag_list_row_ids(s: &Shell) -> Vec<(String, i64)> {
+    let db = Db::open(s.location.clone(), OpenMode::ReadOnly).unwrap();
+    let mut stmt = db
+        .connection()
+        .prepare("SELECT ID, TrackNo FROM djmdSongTagList WHERE rb_local_deleted = 0 ORDER BY TrackNo, ID")
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
+}
+
+#[test]
+fn remove_from_tag_list_and_clear_tag_list_are_one_undo_each() {
+    let s = shell();
+    let (t1, t2, t3, t4) = (track_id(1), track_id(2), track_id(3), track_id(4));
+    run(commands::add_to_tag_list(s.handle(), s.state(), vec![t3.clone(), t1.clone(), t4.clone(), t2.clone()])).unwrap();
+    let full = tag_list_row_ids(&s);
+    let tagged = || {
+        let (view, _) = s.open(tag_list_spec());
+        s.rows(view).into_iter().map(|r| r.id).collect::<Vec<_>>()
+    };
+
+    // The whole selection, one entry.
+    run(commands::remove_from_tag_list(s.handle(), s.state(), vec![t1.clone(), t2.clone()])).unwrap();
+    assert_eq!(tagged(), [t3.clone(), t4.clone()]);
+    assert_eq!(commands::current_history(&s.state()).undo_label.as_deref(), Some("Remove from Tag List"));
+    run(commands::clear_tag_list(s.handle(), s.state())).unwrap();
+    assert!(tagged().is_empty());
+    assert_eq!(commands::current_history(&s.state()).undo_label.as_deref(), Some("Clear Tag List"));
+
+    let undone = run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(undone.undo_label.as_deref(), Some("Remove from Tag List"));
+    assert_eq!(undone.redo_label.as_deref(), Some("Clear Tag List"));
+    assert_eq!(tagged(), [t3.clone(), t4.clone()]);
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(tagged(), [t3.clone(), t1.clone(), t4.clone(), t2.clone()], "back in their places");
+    assert_eq!(tag_list_row_ids(&s), full, "the same rows at the same numbers");
+
+    let redone = run(commands::redo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(redone.undo_label.as_deref(), Some("Remove from Tag List"));
+    assert_eq!(tagged(), [t3.clone(), t4.clone()]);
+    run(commands::redo_edit(s.handle(), s.state())).unwrap();
+    assert!(tagged().is_empty());
+
+    // Each removal, clear, Undo and Redo told the Tag List alone, as the
+    // add did; no list was made to refetch.
+    wait_for_tag_list_changes(&s, 7);
+    assert!(s.changes.lock().unwrap().is_empty(), "nothing told every list to refetch");
+
+    // Taking off a track not on the list records nothing.
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    run(commands::remove_from_tag_list(s.handle(), s.state(), vec![track_id(9)])).unwrap();
+    let history = commands::current_history(&s.state());
+    assert_eq!(history.undo_label.as_deref(), Some("Remove from Tag List"));
+    assert_eq!(history.redo_label.as_deref(), Some("Clear Tag List"), "a removal of nothing keeps Redo");
+}
+
+#[test]
+fn undo_of_a_tag_list_removal_refuses_a_tag_added_since_and_keeps_the_rest() {
+    let s = shell();
+    run(commands::rename_playlist(s.handle(), s.state(), playlist_id(0), "Renamed 508".into())).unwrap();
+    run(commands::add_to_tag_list(s.handle(), s.state(), vec![track_id(1), track_id(2)])).unwrap();
+    run(commands::remove_from_tag_list(s.handle(), s.state(), vec![track_id(1)])).unwrap();
+
+    // A player tags a track over LINK: outside the history.
+    let mut other = rbl_db::write::Writer::open(s.location.clone(), s._dir.path().join("other-backups")).unwrap();
+    other.disable_automatic_backups();
+    other.tag_list_add(&[track_id(7)]).unwrap();
+    drop(other);
+    let newer = tag_list_row_ids(&s);
+
+    let error = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(error.message, "Can't undo Remove from Tag List: the Tag List has changed since. The newer change was kept.");
+    assert_eq!(tag_list_row_ids(&s), newer, "nothing written");
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(s.node("Playlist 0").id, playlist_id(0), "the unrelated rename still undoes");
+}
+
+type Plays = Vec<(String, String, i64)>;
+
+/// A history session's live plays as `(ID, ContentID, TrackNo)` in order,
+/// and every track's `DJPlayCount`.
+fn history_plays(s: &Shell, history: &str) -> (Plays, Vec<Option<i64>>) {
+    let db = Db::open(s.location.clone(), OpenMode::ReadOnly).unwrap();
+    let mut stmt = db
+        .connection()
+        .prepare("SELECT ID, ContentID, TrackNo FROM djmdSongHistory WHERE HistoryID = ?1 AND rb_local_deleted = 0 ORDER BY TrackNo, ID")
+        .unwrap();
+    let plays = stmt.query_map([history], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect();
+    let mut stmt = db.connection().prepare("SELECT DJPlayCount FROM djmdContent ORDER BY ID").unwrap();
+    let counts = stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    (plays, counts)
+}
+
+#[test]
+fn remove_from_history_is_one_undo_that_restores_the_plays_and_not_the_counts() {
+    let s = shell();
+    let session = fixture::history_id(0);
+    let spec = ViewSpecDto { source: TrackSourceDto::History { id: session.clone() }, sort: "trackNo".into(), ..collection_spec() };
+    let listed = || {
+        let (view, _) = s.open(spec.clone());
+        s.rows(view).into_iter().map(|r| r.id).collect::<Vec<_>>()
+    };
+    let (before, counts) = history_plays(&s, &session);
+    let order = listed();
+    assert_eq!(order, (0..5).map(track_id).collect::<Vec<_>>());
+
+    run(commands::remove_from_history(s.handle(), s.state(), session.clone(), vec![track_id(1), track_id(3)])).unwrap();
+    assert_eq!(listed(), [track_id(0), track_id(2), track_id(4)]);
+    let (after, counted) = history_plays(&s, &session);
+    assert_eq!(counted, counts, "Remove from History leaves DJ Play Count");
+
+    let undone = run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(undone.redo_label.as_deref(), Some("Remove from History"));
+    assert_eq!(listed(), order, "back in their places");
+    assert_eq!(history_plays(&s, &session), (before, counts.clone()), "the same plays at the same numbers; counts as they were");
+
+    run(commands::redo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(history_plays(&s, &session), (after, counts));
+    assert_eq!(listed(), [track_id(0), track_id(2), track_id(4)]);
+}
+
+#[test]
+fn undo_of_a_history_removal_refuses_a_play_added_since() {
+    let s = shell();
+    let session = fixture::history_id(0);
+    run(commands::remove_from_history(s.handle(), s.state(), session.clone(), vec![track_id(2)])).unwrap();
+    let mut other = rbl_db::write::Writer::open(s.location.clone(), s._dir.path().join("other-backups")).unwrap();
+    other.disable_automatic_backups();
+    other.add_to_history(&session, &track_id(8)).unwrap();
+    drop(other);
+    let newer = history_plays(&s, &session);
+
+    let error = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(error.message, "Can't undo Remove from History: the history has changed since. The newer change was kept.");
+    assert_eq!(history_plays(&s, &session), newer, "the newer play and every count are kept");
+    assert!(!commands::current_history(&s.state()).can_undo, "only that entry left the history");
 }
 
 // ----------------------------------------------------------- track editing
@@ -1395,7 +2157,7 @@ fn an_imported_file_goes_into_a_playlist_and_plays_on_a_deck() {
     assert_eq!(rows[0].duration_sec, 2);
 
     // Into a playlist, and loaded from there.
-    run(commands::add_tracks_to_playlist(s.handle(), s.state(), playlist_id(1), vec![id.clone()], None)).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), playlist_id(1), vec![id.clone()], None, None)).unwrap();
     assert_eq!(s.playlist_rows(&playlist_id(1)).len(), 6);
 
     // Nothing has opened the audio output yet: a window nobody played in
@@ -1566,6 +2328,221 @@ fn a_key_edited_over_several_tracks_is_tagged_only_into_the_files_it_changed() {
     }
 }
 
+/// An MP3 with an `ID3v2` tag holding `key` (none: no tag), imported: the file,
+/// its bytes and the track's id (#507).
+fn tagged_mp3(s: &Shell, name: &str, key: Option<&str>) -> (std::path::PathBuf, Vec<u8>, String) {
+    let (audio, _) = write_key_mp3(s, name);
+    if let Some(key) = key {
+        rbl_db::key_tag::write_key(&audio, key).unwrap();
+    }
+    let id = run(commands::import_files(s.handle(), s.state(), vec![audio.display().to_string()])).unwrap().tracks[0].id.clone();
+    let bytes = std::fs::read(&audio).unwrap();
+    (audio, bytes, id)
+}
+
+fn key_of(s: &Shell, id: &str) -> String {
+    run(details::track_details(s.state(), id.to_owned())).unwrap().key
+}
+
+fn file_key(path: &Path) -> Option<String> {
+    rbl_db::key_tag::read_key(path).unwrap()
+}
+
+/// Sets the track's key straight in the database, as another program
+/// would, outside the app's history.
+fn set_key_elsewhere(s: &Shell, id: &str, key: &str) {
+    let mut other = rbl_db::write::Writer::open(s.location.clone(), s._dir.path().join("other-backups")).unwrap();
+    other.disable_automatic_backups();
+    other.set_field(id, rbl_db::write::TrackField::Key, key).unwrap();
+    drop(other);
+    run(commands::reload_library(s.handle(), s.state())).unwrap();
+}
+
+/// #507 (Chris, 2026-10-22, option A): Undo of a key edit that wrote the
+/// file's key tag puts back both the library's key and the file's, and Redo
+/// writes both again.
+#[test]
+fn undo_and_redo_of_a_key_edit_restore_the_files_tag_with_the_library() {
+    let s = shell();
+    let (audio, original, id) = tagged_mp3(&s, "issue-507 Tagged.mp3", Some("Am"));
+    s.state().write(|w| { w.ensure_detected_key("Am")?; w.ensure_detected_key("Fm")?; w.ensure_detected_key("Gm") }).unwrap();
+    let imported = key_of(&s, &id);
+    run(details::set_track_field(s.handle(), s.state(), vec![id.clone()], "key".into(), "Gm".into(), None)).unwrap();
+    assert_eq!(std::fs::read(&audio).unwrap(), original, "a library-only edit");
+
+    run(details::set_track_field(s.handle(), s.state(), vec![id.clone()], "key".into(), "Fm".into(), Some(true))).unwrap();
+    assert_eq!((key_of(&s, &id), file_key(&audio)), ("Fm".into(), Some("Fm".into())));
+    assert_eq!(commands::current_history(&s.state()).undo_label.as_deref(), Some("Track Edit"));
+
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!((key_of(&s, &id), file_key(&audio)), ("Gm".into(), Some("Am".into())));
+    assert_eq!(std::fs::read(&audio).unwrap(), original, "the tag is as it was");
+
+    run(commands::redo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!((key_of(&s, &id), file_key(&audio)), ("Fm".into(), Some("Fm".into())));
+
+    // Back past the key edit to the library-only one: the file stays.
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    let restored = file_identity(&audio);
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(key_of(&s, &id), imported);
+    assert_eq!(file_identity(&audio), restored, "Undo of an edit that wrote no tag writes none");
+    run(commands::redo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(file_identity(&audio), restored, "nor does its Redo");
+}
+
+/// #507: a file whose tag had no key gets none back on Undo; an MP3 that
+/// had no tag at all comes back byte for byte.
+#[test]
+fn undo_of_a_key_written_into_a_file_without_one_takes_the_key_out_again() {
+    let s = shell();
+    let (audio, original, id) = tagged_mp3(&s, "issue-507 Bare.mp3", None);
+    s.state().write(|w| w.ensure_detected_key("Dbm")).unwrap();
+    assert_eq!(key_of(&s, &id), "");
+
+    run(details::set_track_field(s.handle(), s.state(), vec![id.clone()], "key".into(), "Dbm".into(), Some(true))).unwrap();
+    assert_eq!(file_key(&audio), Some("Dbm".into()));
+
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(key_of(&s, &id), "");
+    assert_eq!(file_key(&audio), None);
+    assert_eq!(std::fs::read(&audio).unwrap(), original);
+
+    run(commands::redo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!((key_of(&s, &id), file_key(&audio)), ("Dbm".into(), Some("Dbm".into())));
+}
+
+/// #507: a WAV, which rekordbox writes no key into, gets no file write from
+/// the edit, so its Undo and Redo are the library's only.
+#[test]
+fn a_key_edit_that_wrote_no_file_undoes_in_the_library_only() {
+    let s = shell();
+    let audio = s._dir.path().join("issue-507 Click.wav");
+    write_click_wav(&audio, 2);
+    let id = run(commands::import_files(s.handle(), s.state(), vec![audio.display().to_string()])).unwrap().tracks[0].id.clone();
+    s.state().write(|w| w.ensure_detected_key("Am")).unwrap();
+    let before = file_identity(&audio);
+
+    run(details::set_track_field(s.handle(), s.state(), vec![id.clone()], "key".into(), "Am".into(), Some(true))).unwrap();
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(key_of(&s, &id), "");
+    run(commands::redo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(key_of(&s, &id), "Am");
+    assert_eq!(file_identity(&audio), before);
+}
+
+/// #507 with #506's policy: a key tag changed in the file since (another
+/// app, a tagger) refuses the Undo. Neither the library nor the file is
+/// written, the newer tag stays, and only that entry leaves the history.
+#[test]
+fn undo_of_a_key_edit_is_refused_when_the_files_tag_changed_since() {
+    let s = shell();
+    let (audio, _, id) = tagged_mp3(&s, "issue-507 Retagged.mp3", Some("Am"));
+    s.state().write(|w| w.ensure_detected_key("Fm")).unwrap();
+    run(commands::set_track_rating(s.handle(), s.state(), vec![id.clone()], 3)).unwrap();
+    run(details::set_track_field(s.handle(), s.state(), vec![id.clone()], "key".into(), "Fm".into(), Some(true))).unwrap();
+
+    rbl_db::key_tag::write_key(&audio, "Gm").unwrap();
+    let retagged = file_identity(&audio);
+
+    let error = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(
+        error.message,
+        "Can't undo Track Edit: the key tag of “issue-507 Retagged.mp3” has changed since. The newer change was kept."
+    );
+    assert_eq!(key_of(&s, &id), "Fm", "the library keeps the edited key");
+    assert_eq!(file_identity(&audio), retagged, "the newer tag stays");
+    let history = commands::current_history(&s.state());
+    assert_eq!(history.undo_label.as_deref(), Some("Track Edit"), "the rating edit is still there");
+    assert!(!history.can_redo);
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(run(details::track_details(s.state(), id)).unwrap().rating, 0);
+}
+
+/// #507: a key changed in the library since refuses the Redo, and the file,
+/// whose tag the Undo put back, is not written either.
+#[test]
+fn redo_of_a_key_edit_is_refused_when_the_library_key_changed_since() {
+    let s = shell();
+    let (audio, _, id) = tagged_mp3(&s, "issue-507 Library.mp3", Some("Am"));
+    s.state().write(|w| { w.ensure_detected_key("Fm")?; w.ensure_detected_key("Gm") }).unwrap();
+    run(details::set_track_field(s.handle(), s.state(), vec![id.clone()], "key".into(), "Fm".into(), Some(true))).unwrap();
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    let undone = file_identity(&audio);
+
+    set_key_elsewhere(&s, &id, "Gm");
+
+    let error = run(commands::redo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(error.message, "Can't redo Track Edit: the track has changed since. The newer change was kept.");
+    assert_eq!(key_of(&s, &id), "Gm");
+    assert_eq!(file_identity(&audio), undone, "the file is not written");
+    assert_eq!(run(commands::redo_edit(s.handle(), s.state())).unwrap_err().kind, ErrorKind::NotFound);
+}
+
+/// #507: a file that cannot be written back (made read-only since) fails
+/// the Undo with nothing changed: the other file the edit wrote is put back
+/// as it was, the library keeps the edited key, and the entry stays to be
+/// tried again once the file can be written.
+#[cfg(unix)]
+#[test]
+fn a_failed_tag_write_undoes_nothing_and_keeps_the_entry() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = shell();
+    let (first, _, first_id) = tagged_mp3(&s, "issue-507 First.mp3", Some("Am"));
+    let (locked, _, locked_id) = tagged_mp3(&s, "issue-507 Locked.mp3", Some("Am"));
+    s.state().write(|w| w.ensure_detected_key("Fm")).unwrap();
+    let imported = (key_of(&s, &first_id), key_of(&s, &locked_id));
+    run(details::set_track_field(
+        s.handle(),
+        s.state(),
+        vec![first_id.clone(), locked_id.clone()],
+        "key".into(),
+        "Fm".into(),
+        Some(true),
+    ))
+    .unwrap();
+    assert_eq!((file_key(&first), file_key(&locked)), (Some("Fm".into()), Some("Fm".into())));
+
+    // Undo runs last first, so the second track's file is written back
+    // first; the first one's, locked, then fails, and the second has to be
+    // put back.
+    std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let error = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
+    assert_ne!(error.kind, ErrorKind::Conflict);
+    assert_eq!(
+        error.message,
+        "Can't undo Track Edit: the key could not be written to “issue-507 First.mp3” (the file is read-only). Nothing was changed."
+    );
+    assert_eq!((file_key(&first), file_key(&locked)), (Some("Fm".into()), Some("Fm".into())), "the written file was put back");
+    assert_eq!((key_of(&s, &first_id), key_of(&s, &locked_id)), ("Fm".into(), "Fm".into()));
+    assert_eq!(commands::current_history(&s.state()).undo_label.as_deref(), Some("Track Edit"), "the entry stays");
+
+    std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o644)).unwrap();
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!((file_key(&first), file_key(&locked)), (Some("Am".into()), Some("Am".into())));
+    assert_eq!((key_of(&s, &first_id), key_of(&s, &locked_id)), imported);
+}
+
+/// #507: a file the edit wrote that is gone since is a change made since:
+/// the Undo is refused and leaves the library's key, and only the entry
+/// goes.
+#[test]
+fn undo_of_a_key_edit_whose_file_is_gone_is_refused() {
+    let s = shell();
+    let (audio, _, id) = tagged_mp3(&s, "issue-507 Gone.mp3", Some("Am"));
+    s.state().write(|w| w.ensure_detected_key("Fm")).unwrap();
+    run(details::set_track_field(s.handle(), s.state(), vec![id.clone()], "key".into(), "Fm".into(), Some(true))).unwrap();
+    std::fs::remove_file(&audio).unwrap();
+
+    let error = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(error.message, "Can't undo Track Edit: “issue-507 Gone.mp3” is no longer there. The newer change was kept.");
+    assert_eq!(key_of(&s, &id), "Fm");
+    assert!(!commands::current_history(&s.state()).can_undo);
+}
+
 /// Twenty seconds of an A minor triad as 16-bit mono AIFF: something with a
 /// key for analysis to find, in a format rekordbox writes a key into.
 fn write_chord_aiff(path: &Path) {
@@ -1615,7 +2592,7 @@ fn analysis_writes_the_detected_key_into_the_file_in_the_display_notation() {
             s.app.state::<Arc<rbxport_lib::grid::GridEditor>>(),
             id.clone(),
             None,
-            Some(key_only),
+            Some(key_only.clone()),
             notation.map(|n| serde_json::from_str(&format!("\"{n}\"")).unwrap()),
             None,
         ))
@@ -1728,6 +2705,80 @@ fn relocate_refuses_a_file_the_collection_already_holds() {
     let free = write_wav(&s._dir.path().join("free.wav"), 1).display().to_string();
     assert!(run(commands::relocate_track(s.handle(), s.state(), track_id(1), free.clone())).unwrap());
     assert_eq!(s.state().library().unwrap().audio_path_of(&track_id(1)), Some(free.as_str()));
+}
+
+/// `FolderPath`, `FileNameL` and `rb_file_id` of a track, as stored.
+fn file_link(s: &Shell, track: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let db = Db::open(s.location.clone(), OpenMode::ReadOnly).unwrap();
+    db.connection()
+        .query_row(
+            "SELECT FolderPath, FileNameL, rb_file_id FROM djmdContent WHERE ID = ?1",
+            [track],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+}
+
+/// #502: one Relocate is one "Relocate" entry. Undo points the track back
+/// at its old file, which is still missing, with its old file number;
+/// Redo at the chosen file again. No file is moved or deleted.
+#[test]
+fn a_relocate_is_one_undo_that_restores_the_old_link() {
+    let s = shell();
+    let track = track_id(2);
+    let before = file_link(&s, &track);
+    let chosen = write_wav(&s._dir.path().join("chosen 502.wav"), 1);
+    let path = chosen.display().to_string();
+
+    assert!(run(commands::relocate_track(s.handle(), s.state(), track.clone(), path.clone())).unwrap());
+    let after = file_link(&s, &track);
+    assert_eq!(after.0.as_deref(), Some(path.as_str()));
+    assert_eq!(after.2, Some(rbl_db::file_id::column(&chosen)));
+    let history = commands::current_history(&s.state());
+    assert_eq!(history.undo_label.as_deref(), Some("Relocate"));
+
+    let undone = undo(&s);
+    assert_eq!(file_link(&s, &track), before);
+    assert_eq!(s.state().library().unwrap().audio_path_of(&track), before.0.as_deref(), "the list shows the old path");
+    assert!(!undone.can_undo);
+    assert_eq!(undone.redo_label.as_deref(), Some("Relocate"));
+    assert!(chosen.is_file(), "the chosen file stays where it is");
+
+    redo(&s);
+    assert_eq!(file_link(&s, &track), after);
+    assert_eq!(s.state().library().unwrap().audio_path_of(&track), Some(path.as_str()));
+}
+
+/// #502 under #506's policy: a track pointed elsewhere since by something
+/// outside the history keeps its newer file; only the Relocate entry goes,
+/// and the earlier entries still undo.
+#[test]
+fn undo_of_a_relocate_refuses_a_track_pointed_elsewhere_since_and_keeps_the_rest() {
+    let s = shell();
+    let track = track_id(3);
+    run(commands::rename_playlist(s.handle(), s.state(), playlist_id(0), "Renamed 502".into())).unwrap();
+    let chosen = write_wav(&s._dir.path().join("chosen.wav"), 1).display().to_string();
+    assert!(run(commands::relocate_track(s.handle(), s.state(), track.clone(), chosen)).unwrap());
+
+    let elsewhere = write_wav(&s._dir.path().join("elsewhere.wav"), 1);
+    let mut other = external(&s);
+    other.disable_automatic_backups();
+    other.relocate(&track, &elsewhere).unwrap();
+    drop(other);
+    let newer = file_link(&s, &track);
+
+    let error = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(
+        error.message,
+        "Can't undo Relocate: the track has been pointed at another file since. The newer change was kept."
+    );
+    assert_eq!(file_link(&s, &track), newer, "the newer file is kept");
+    let history = commands::current_history(&s.state());
+    assert_eq!(history.undo_label.as_deref(), Some("Rename Playlist"));
+    assert!(!history.can_redo);
+    undo(&s);
+    assert_eq!(s.node("Playlist 0").id, playlist_id(0), "the unrelated rename still undoes");
 }
 
 #[test]
@@ -1932,7 +2983,7 @@ fn usb_export_preflight_reports_missing_source_audio() {
         s.state(),
         playlist_id(1),
         vec![imported.tracks[0].id.clone()],
-        None
+        None, None
     ))
     .unwrap();
     std::fs::remove_file(&audio).unwrap();
@@ -1961,7 +3012,7 @@ fn export_track_puts_a_track_on_a_stick_by_itself_and_a_sync_keeps_it_there() {
     ))
     .unwrap();
     let (first, second) = (report.tracks[0].id.clone(), report.tracks[1].id.clone());
-    run(commands::add_tracks_to_playlist(s.handle(), s.state(), playlist_id(1), vec![first.clone()], None)).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), playlist_id(1), vec![first.clone()], None, None)).unwrap();
 
     // The second track goes on a blank stick on its own: one track, no
     // playlist, and the record says it is loose.
@@ -2059,7 +3110,7 @@ fn a_stick_pulled_during_a_sync_is_reported_as_disconnected() {
     let audio = s._dir.path().join("Pulled.wav");
     write_wav(&audio, 2);
     let report = run(commands::import_files(s.handle(), s.state(), vec![audio.display().to_string()])).unwrap();
-    run(commands::add_tracks_to_playlist(s.handle(), s.state(), playlist_id(1), vec![report.tracks[0].id.clone()], None)).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), playlist_id(1), vec![report.tracks[0].id.clone()], None, None)).unwrap();
     let stick = tempfile::tempdir().unwrap();
     let mount = stick.path().join("USB");
     std::fs::create_dir_all(&mount).unwrap();
@@ -2088,7 +3139,7 @@ fn a_sync_writes_the_same_playlists_to_every_stick_and_each_stick_remembers_them
     write_wav(&audio, 2);
     let report = run(commands::import_files(s.handle(), s.state(), vec![audio.display().to_string()])).unwrap();
     let id = report.tracks[0].id.clone();
-    run(commands::add_tracks_to_playlist(s.handle(), s.state(), playlist_id(1), vec![id], None)).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), playlist_id(1), vec![id], None, None)).unwrap();
 
     let progress: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&progress);
@@ -2192,7 +3243,7 @@ fn exporting_a_folder_writes_the_folder_with_its_playlists_inside() {
     run(commands::create_folder(s.handle(), s.state(), "Set".into(), ROOT.into())).unwrap();
     let set = s.node("Set");
     run(commands::create_playlist(s.handle(), s.state(), "Inside".into(), set.id.clone(), None)).unwrap();
-    run(commands::add_tracks_to_playlist(s.handle(), s.state(), s.node("Inside").id, vec![song], None)).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), s.node("Inside").id, vec![song], None, None)).unwrap();
     run(commands::create_folder(s.handle(), s.state(), "Later".into(), set.id.clone())).unwrap();
     let rule = SmartRuleDto {
         logic: "all".to_owned(),
@@ -2316,14 +3367,143 @@ fn an_intelligent_playlist_is_written_in_rekordboxs_smartlist_format() {
 }
 
 #[test]
+fn a_my_tag_panel_tick_tags_the_whole_selection_as_one_step() {
+    use rbl_db::fixture::{MY_TAG_CATEGORY, MY_TAG_PEAK, MY_TAG_WARM_UP};
+    let s = shell();
+    let tracks = vec![track_id(1), track_id(2)];
+    run(details::set_my_tags(s.handle(), s.state(), track_id(1), vec![MY_TAG_WARM_UP.to_owned()], None)).unwrap();
+    assert!(run(details::selection_my_tags(s.state(), tracks.clone())).unwrap().is_empty());
+
+    let ticked = run(details::put_my_tag(s.handle(), s.state(), tracks.clone(), MY_TAG_PEAK.to_owned(), true, None)).unwrap();
+    assert!(ticked.can_undo);
+    assert_eq!(run(details::selection_my_tags(s.state(), tracks.clone())).unwrap(), vec![MY_TAG_PEAK.to_owned()]);
+
+    // One undo takes it off both, and leaves track 1's Warm-up alone.
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert!(run(details::selection_my_tags(s.state(), tracks.clone())).unwrap().is_empty());
+    assert_eq!(
+        run(details::selection_my_tags(s.state(), vec![track_id(1)])).unwrap(),
+        vec![MY_TAG_WARM_UP.to_owned()]
+    );
+    run(commands::redo_edit(s.handle(), s.state())).unwrap();
+
+    // A new tag shows in the lookups under its category, by id.
+    let made = run(details::create_my_tag(s.handle(), s.state(), MY_TAG_CATEGORY.to_owned())).unwrap();
+    assert_eq!(made.name, "My Comment");
+    let lookups = run(details::track_lookups(s.state())).unwrap();
+    let category = lookups.my_tag_categories.iter().find(|c| c.id == MY_TAG_CATEGORY).unwrap();
+    assert_eq!(category.tags.last().map(|t| t.id.as_str()), Some(made.id.as_str()));
+    // The Track Filter's tag columns hear of it at once, before any rename.
+    let filter_tags = || -> Vec<String> {
+        run(commands::filter_values(s.state(), collection_spec()))
+            .unwrap()
+            .tags
+            .into_iter()
+            .flat_map(|c| c.tags)
+            .collect()
+    };
+    assert!(filter_tags().iter().any(|t| t == "My Comment"), "{:?}", filter_tags());
+    run(details::rename_my_tag(s.handle(), s.state(), made.id.clone(), "Opener".to_owned(), None)).unwrap();
+    let lookups = run(details::track_lookups(s.state())).unwrap();
+    let category = lookups.my_tag_categories.iter().find(|c| c.id == MY_TAG_CATEGORY).unwrap();
+    assert_eq!(category.tags.last().map(|t| t.name.as_str()), Some("Opener"));
+
+    // Deleting a tag takes it off the tracks and leaves nothing to undo
+    // that could name it.
+    run(details::delete_my_tag(s.handle(), s.state(), MY_TAG_PEAK.to_owned(), None)).unwrap();
+    assert!(run(details::selection_my_tags(s.state(), tracks)).unwrap().is_empty());
+    assert!(run(commands::undo_edit(s.handle(), s.state())).is_err());
+}
+
+/// Add "My Tag" to the "Comments" on (#605): a tick rewrites each selected
+/// track's comment in the same Undo step, a rename or a delete rewrites the
+/// selected tracks' only, and turning the setting on or off is one step.
+#[test]
+fn my_tag_comments_follow_ticks_renames_deletes_and_the_setting_with_undo() {
+    use rbl_db::fixture::{MY_TAG_PEAK, MY_TAG_WARM_UP};
+    let s = shell();
+    let comment = |id: &str| -> Option<String> {
+        let db = Db::open(s.location.clone(), OpenMode::ReadOnly).unwrap();
+        db.connection().query_row("SELECT Commnt FROM djmdContent WHERE ID = ?1", [id], |r| r.get(0)).unwrap()
+    };
+    let set_comment = |id: &str, text: &str| {
+        run(commands::set_track_comment(s.handle(), s.state(), vec![id.to_owned()], text.to_owned())).unwrap();
+    };
+    set_comment(&track_id(1), "Bandcamp");
+    set_comment(&track_id(2), "");
+    let tracks = vec![track_id(1), track_id(2)];
+
+    // A tick with the setting on: both selected tracks, one step.
+    run(details::put_my_tag(s.handle(), s.state(), tracks.clone(), MY_TAG_WARM_UP.to_owned(), true, Some(true))).unwrap();
+    assert_eq!(comment(&track_id(1)).as_deref(), Some("Bandcamp /* Warm-up */"));
+    assert_eq!(comment(&track_id(2)).as_deref(), Some(" /* Warm-up */"));
+    run(details::put_my_tag(s.handle(), s.state(), vec![track_id(1)], MY_TAG_PEAK.to_owned(), true, Some(true))).unwrap();
+    assert_eq!(comment(&track_id(1)).as_deref(), Some("Bandcamp /* Warm-up / Peak */"));
+
+    // Undo puts the tag and the comment back together; Redo writes both.
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(comment(&track_id(1)).as_deref(), Some("Bandcamp /* Warm-up */"));
+    assert_eq!(run(details::selection_my_tags(s.state(), vec![track_id(1)])).unwrap(), vec![MY_TAG_WARM_UP.to_owned()]);
+    run(commands::redo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(comment(&track_id(1)).as_deref(), Some("Bandcamp /* Warm-up / Peak */"));
+
+    // A comment written outside the history since refuses the Undo of the
+    // tick that wrote it, tags and all.
+    let mut other = rbl_db::write::Writer::open(s.location.clone(), s._dir.path().join("other-backups")).unwrap();
+    other.disable_automatic_backups();
+    other.set_comment(&track_id(2), "typed since").unwrap();
+    drop(other);
+    run(commands::reload_library(s.handle(), s.state())).unwrap();
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(comment(&track_id(1)).as_deref(), Some("Bandcamp /* Warm-up */"));
+    let refused = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::Conflict);
+    assert_eq!(comment(&track_id(1)).as_deref(), Some("Bandcamp /* Warm-up */"));
+    assert_eq!(comment(&track_id(2)).as_deref(), Some("typed since"));
+    assert_eq!(run(details::selection_my_tags(s.state(), tracks.clone())).unwrap(), vec![MY_TAG_WARM_UP.to_owned()]);
+    run(details::put_my_tag(s.handle(), s.state(), vec![track_id(1)], MY_TAG_PEAK.to_owned(), true, Some(true))).unwrap();
+
+    // With the setting off, a tick leaves comments alone.
+    run(details::put_my_tag(s.handle(), s.state(), vec![track_id(3)], MY_TAG_PEAK.to_owned(), true, None)).unwrap();
+    let untouched = comment(&track_id(3));
+
+    // A rename rewrites only the tracks selected with it.
+    run(details::rename_my_tag(s.handle(), s.state(), MY_TAG_WARM_UP.to_owned(), "Opener".to_owned(), Some(vec![track_id(1)]))).unwrap();
+    assert_eq!(comment(&track_id(1)).as_deref(), Some("Bandcamp /* Opener / Peak */"));
+    assert_eq!(comment(&track_id(2)).as_deref(), Some("typed since"));
+
+    // Turning the setting on rewrites every tagged track in the panel's
+    // order (Peak before Opener), as one step.
+    let on = run(details::write_my_tag_comments(s.handle(), s.state(), true)).unwrap();
+    assert!(on.can_undo);
+    assert_eq!(comment(&track_id(1)).as_deref(), Some("Bandcamp /* Peak / Opener */"));
+    assert_eq!(comment(&track_id(2)).as_deref(), Some("typed since /* Opener */"));
+    assert_ne!(comment(&track_id(3)), untouched);
+    run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(comment(&track_id(1)).as_deref(), Some("Bandcamp /* Opener / Peak */"));
+    assert_eq!(comment(&track_id(2)).as_deref(), Some("typed since"));
+    assert_eq!(comment(&track_id(3)), untouched);
+    run(commands::redo_edit(s.handle(), s.state())).unwrap();
+
+    // A delete takes the tag out of the selected tracks' comments.
+    run(details::delete_my_tag(s.handle(), s.state(), MY_TAG_PEAK.to_owned(), Some(vec![track_id(1)]))).unwrap();
+    assert_eq!(comment(&track_id(1)).as_deref(), Some("Bandcamp /* Opener */"));
+
+    // Off takes every block off a tagged track.
+    run(details::write_my_tag_comments(s.handle(), s.state(), false)).unwrap();
+    assert_eq!(comment(&track_id(1)).as_deref(), Some("Bandcamp"));
+    assert_eq!(comment(&track_id(2)).as_deref(), Some("typed since"));
+}
+
+#[test]
 fn an_intelligent_playlist_on_a_my_tag_holds_the_tracks_carrying_it() {
     // Issue #84: a rule on a My Tag opened empty and read back with no
     // property, which the editor drew as "Album artist".
     use rbl_db::fixture::MY_TAG_PEAK;
     use rbxport_lib::dto::{SmartConditionDto, SmartRuleDto};
     let s = shell();
-    run(details::set_my_tags(s.handle(), s.state(), track_id(3), vec![MY_TAG_PEAK.to_owned()])).unwrap();
-    run(details::set_my_tags(s.handle(), s.state(), track_id(5), vec![MY_TAG_PEAK.to_owned()])).unwrap();
+    run(details::set_my_tags(s.handle(), s.state(), track_id(3), vec![MY_TAG_PEAK.to_owned()], None)).unwrap();
+    run(details::set_my_tags(s.handle(), s.state(), track_id(5), vec![MY_TAG_PEAK.to_owned()], None)).unwrap();
     let rule = SmartRuleDto {
         logic: "all".to_owned(),
         conditions: vec![SmartConditionDto {
@@ -2470,4 +3650,292 @@ fn a_folder_dropped_on_the_playlists_root_becomes_a_playlist() {
     .unwrap();
     assert!(!loose.folder);
     assert_eq!(loose.playlist, None);
+}
+
+/// Track › the information panel's "Playlists" row: every playlist (and
+/// intelligent playlist) a track is in, with the folders above each spelled
+/// out as a path, ordered by path then name. A track in no playlist lists
+/// none, and an unknown track is refused.
+#[test]
+fn the_information_panel_names_the_playlists_a_track_is_in() {
+    let s = shell();
+    run(commands::create_folder(s.handle(), s.state(), "Shows".into(), ROOT.into())).unwrap();
+    let shows = s.node("Shows");
+    run(commands::create_playlist(s.handle(), s.state(), "Friday".into(), shows.id.clone(), None)).unwrap();
+    run(commands::create_playlist(s.handle(), s.state(), "Bright".into(), ROOT.into(), None)).unwrap();
+    // The fixture's "Playlist 0" takes tracks 0 to 4, so track 3 is in it
+    // before anything is written here: three lists, two without a path.
+    let friday = s.node("Friday");
+    let bright = s.node("Bright");
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), friday.id.clone(), vec![track_id(3)], None, None)).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), bright.id.clone(), vec![track_id(3)], None, None)).unwrap();
+
+    let got = run(details::track_playlists(s.state(), track_id(3))).unwrap();
+    assert_eq!(
+        got.iter()
+            .map(|list| (list.path.as_str(), list.name.as_str()))
+            .collect::<Vec<_>>(),
+        [("", "Bright"), ("", "Playlist 0"), ("Shows", "Friday")],
+    );
+    assert_eq!(got[2].id, friday.id, "the id is the playlist node's, so a name can open it");
+
+    assert!(run(details::track_playlists(s.state(), track_id(20))).unwrap().is_empty());
+    let refused = run(details::track_playlists(s.state(), "no such track".into()))
+        .expect_err("an unknown track is refused");
+    assert_eq!(refused.kind, ErrorKind::NotFound);
+}
+
+/// Sort Items (#443): one command puts a folder's children in rekordbox's
+/// name order and is one Undo step; a second sort of a sorted folder writes
+/// nothing and leaves the history alone.
+#[test]
+fn sort_items_orders_a_folder_as_one_undo_step() {
+    let s = shell();
+    run(commands::create_folder(s.handle(), s.state(), "Crate".into(), ROOT.into())).unwrap();
+    let folder = s.node("Crate");
+    for name in ["delta", "Bravo", "alpha", "Écho", "echo"] {
+        run(commands::create_playlist(s.handle(), s.state(), name.into(), folder.id.clone(), None)).unwrap();
+    }
+    let children = |s: &Shell| -> Vec<String> {
+        let tree = s.tree();
+        let at = tree.iter().position(|n| n.id == folder.id).unwrap();
+        tree[at + 1..].iter().take_while(|n| n.depth > folder.depth)
+            .filter(|n| n.depth == folder.depth + 1).map(|n| n.name.clone()).collect()
+    };
+    assert_eq!(children(&s), ["delta", "Bravo", "alpha", "Écho", "echo"]);
+
+    let sorted = run(commands::sort_playlist_items(s.handle(), s.state(), folder.id.clone(), Some("en".into()))).unwrap();
+    assert_eq!(sorted.undo_label.as_deref(), Some("Sort Items"));
+    assert_eq!(children(&s), ["alpha", "Bravo", "delta", "echo", "Écho"]);
+
+    // Already in order: nothing new to undo.
+    let again = run(commands::sort_playlist_items(s.handle(), s.state(), folder.id.clone(), Some("en".into()))).unwrap();
+    assert_eq!(again.undo_label.as_deref(), Some("Sort Items"));
+    let undone = run(commands::undo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(children(&s), ["delta", "Bravo", "alpha", "Écho", "echo"], "one undo puts the whole order back");
+    assert_eq!(undone.undo_label.as_deref(), Some("Create Playlist"), "the second sort recorded nothing: next are the creations (#500)");
+    run(commands::redo_edit(s.handle(), s.state())).unwrap();
+    assert_eq!(children(&s), ["alpha", "Bravo", "delta", "echo", "Écho"]);
+
+    // A playlist is not a folder.
+    let alpha = s.node("alpha");
+    assert!(run(commands::sort_playlist_items(s.handle(), s.state(), alpha.id, None)).is_err());
+}
+
+// ---------------------------------------------------------------- cue undo (#504)
+
+/// Every live cue row of a track, every column but the change counters and
+/// timestamps, in id order: what "the exact rows" means for an Undo.
+fn live_cue_rows(s: &Shell, track: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    const COLUMNS: &str = "ID, ContentID, InMsec, InFrame, InMpegFrame, InMpegAbs, OutMsec, OutFrame, \
+        OutMpegFrame, OutMpegAbs, Kind, Color, ColorTableIndex, ActiveLoop, Comment, BeatLoopSize, \
+        CueMicrosec, InPointSeekInfo, OutPointSeekInfo, ContentUUID, UUID, rb_local_deleted";
+    let db = Db::open(s.location.clone(), OpenMode::ReadOnly).unwrap();
+    let mut stmt = db
+        .connection()
+        .prepare(&format!("SELECT {COLUMNS} FROM djmdCue WHERE ContentID = ?1 AND rb_local_deleted = 0 ORDER BY ID"))
+        .unwrap();
+    let rows = stmt
+        .query_map([track], |r| (0..22).map(|i| r.get::<_, rusqlite::types::Value>(i)).collect())
+        .unwrap();
+    rows.collect::<rusqlite::Result<_>>().unwrap()
+}
+
+fn undo(s: &Shell) -> rbxport_lib::dto::EditHistoryDto {
+    run(commands::undo_edit(s.handle(), s.state())).unwrap()
+}
+
+fn redo(s: &Shell) -> rbxport_lib::dto::EditHistoryDto {
+    run(commands::redo_edit(s.handle(), s.state())).unwrap()
+}
+
+/// What a write from outside the history is: rekordbox with RBXport open,
+/// or a player over LINK, through its own writer.
+fn external(s: &Shell) -> rbl_db::write::Writer {
+    rbl_db::write::Writer::open(s.state().location().unwrap(), s._dir.path().join("external-backups")).unwrap()
+}
+
+/// #504: each cue command is one entry. Undo puts the track's cue rows back
+/// exactly as they were before it, Redo exactly as it left them, and the
+/// index the decks read follows both.
+#[test]
+fn each_cue_and_loop_edit_is_one_undo_that_restores_the_exact_rows() {
+    let s = shell();
+    let track = track_id(4);
+    let announced = cue_announcements(&s);
+    let label = |s: &Shell| commands::current_history(&s.state()).undo_label;
+
+    let empty = live_cue_rows(&s, &track);
+    let hot = run(cues::add_cue(s.handle(), s.state(), track.clone(), CueKind::Hot('A'), 12_000)).unwrap();
+    assert_eq!(label(&s).as_deref(), Some("Set Hot Cue"));
+    let one = live_cue_rows(&s, &track);
+    assert_eq!(undo(&s).redo_label.as_deref(), Some("Set Hot Cue"));
+    assert_eq!(live_cue_rows(&s, &track), empty, "the added hot cue is gone");
+    assert!(run(commands::track_cues(s.state(), track.clone())).unwrap().is_empty(), "and the decks' index follows");
+    redo(&s);
+    assert_eq!(live_cue_rows(&s, &track), one, "the same row, the same id, back");
+
+    let looped = run(cues::add_loop(s.handle(), s.state(), track.clone(), CueKind::Memory, 40_000, 44_000, Some(8.0))).unwrap();
+    assert_eq!(label(&s).as_deref(), Some("Set Loop"));
+    let two = live_cue_rows(&s, &track);
+    undo(&s);
+    assert_eq!(live_cue_rows(&s, &track), one);
+    redo(&s);
+    assert_eq!(live_cue_rows(&s, &track), two);
+
+    // Each attribute edit, undone and redone in turn.
+    type Step = Box<dyn Fn(&Shell)>;
+    let steps: Vec<(&str, Step)> = vec![
+        ("Move Cue", Box::new({ let hot = hot.clone(); move |s: &Shell| run(cues::move_cue(s.handle(), s.state(), hot.clone(), 15_000)).unwrap() })),
+        ("Move Hot Cue", Box::new({ let hot = hot.clone(); move |s: &Shell| run(cues::move_hot_cue(s.handle(), s.state(), hot.clone(), CueKind::Hot('C'))).unwrap() })),
+        ("Cue Color", Box::new({ let hot = hot.clone(); move |s: &Shell| run(cues::set_cue_colour(s.handle(), s.state(), hot.clone(), Some(9))).unwrap() })),
+        ("Cue Comment", Box::new({ let hot = hot.clone(); move |s: &Shell| run(cues::set_cue_comment(s.handle(), s.state(), hot.clone(), "Drop".into())).unwrap() })),
+        ("Active Loop", Box::new({ let looped = looped.clone(); move |s: &Shell| run(cues::set_active_loop(s.handle(), s.state(), looped.clone(), true)).unwrap() })),
+        ("Delete Cue", Box::new({ let hot = hot.clone(); move |s: &Shell| run(cues::delete_cue(s.handle(), s.state(), hot.clone())).unwrap() })),
+    ];
+    for (name, step) in steps {
+        let before = live_cue_rows(&s, &track);
+        step(&s);
+        let after = live_cue_rows(&s, &track);
+        assert_ne!(before, after, "{name} changed something");
+        assert_eq!(label(&s).as_deref(), Some(name));
+        undo(&s);
+        assert_eq!(live_cue_rows(&s, &track), before, "{name} undone exactly");
+        redo(&s);
+        assert_eq!(live_cue_rows(&s, &track), after, "{name} redone exactly");
+    }
+
+    // A deleted hot cue comes back as itself, every column as it was.
+    let without = live_cue_rows(&s, &track);
+    undo(&s);
+    let back = run(commands::track_cues(s.state(), track.clone())).unwrap();
+    let restored = back.iter().find(|c| c.id == hot).expect("the deleted hot cue is back");
+    assert_eq!((restored.letter.as_str(), restored.position_ms, restored.comment.as_str()), ("C", 15_000, "Drop"));
+    redo(&s);
+    assert_eq!(live_cue_rows(&s, &track), without);
+
+    // Every write and every Undo/Redo named the track to the decks.
+    assert!(announced(30).iter().all(|t| *t == track));
+}
+
+/// #504: a whole-track Convert Memory Cues to Hot Cues is one entry; the
+/// memory cues it read stay where they were through Undo and Redo.
+#[test]
+fn a_conversion_is_one_undo_for_the_whole_track() {
+    let s = shell();
+    let track = track_id(5);
+    run(cues::add_cue(s.handle(), s.state(), track.clone(), CueKind::Memory, 30_000)).unwrap();
+    run(cues::add_loop(s.handle(), s.state(), track.clone(), CueKind::Memory, 10_000, 14_000, None)).unwrap();
+    run(cues::add_cue(s.handle(), s.state(), track.clone(), CueKind::Memory, 50_000)).unwrap();
+    let memory_only = live_cue_rows(&s, &track);
+
+    assert_eq!(run(cues::convert_memory_cues_to_hot(s.handle(), s.state(), track.clone())).unwrap(), 3);
+    let converted = live_cue_rows(&s, &track);
+    assert_eq!(converted.len(), 6);
+    let history = commands::current_history(&s.state());
+    assert_eq!(history.undo_label.as_deref(), Some("Convert Memory Cues to Hot Cues"));
+
+    let undone = undo(&s);
+    assert_eq!(live_cue_rows(&s, &track), memory_only, "one Undo takes all three hot cues away");
+    assert_eq!(undone.undo_label.as_deref(), Some("Set Memory Cue"), "and only the conversion");
+    redo(&s);
+    assert_eq!(live_cue_rows(&s, &track), converted);
+}
+
+/// #504 under #506's policy: a cue changed since the entry by something
+/// outside the history keeps that change. The entry is refused with the
+/// reason and dropped; the rest of the history is kept.
+#[test]
+fn undo_of_a_cue_changed_since_is_refused_and_keeps_the_newer_change() {
+    let s = shell();
+    let rated = track_id(7);
+    run(commands::set_track_rating(s.handle(), s.state(), vec![rated.clone()], 4)).unwrap();
+    let track = track_id(4);
+    let hot = run(cues::add_cue(s.handle(), s.state(), track.clone(), CueKind::Hot('A'), 12_000)).unwrap();
+    run(cues::move_cue(s.handle(), s.state(), hot.clone(), 20_000)).unwrap();
+
+    external(&s).move_cue(&hot, 33_000).unwrap();
+    let newer = live_cue_rows(&s, &track);
+
+    let error = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(error.message, "Can't undo Move Cue: the track's cues have changed since. The newer change was kept.");
+    assert_eq!(live_cue_rows(&s, &track), newer, "nothing written");
+
+    // The refused entry is gone and nothing went to Redo. The add before it
+    // names the same row, which has changed since too, so it is refused in
+    // turn; the rating edit before both is untouched and still undoes.
+    let history = commands::current_history(&s.state());
+    assert_eq!(history.undo_label.as_deref(), Some("Set Hot Cue"));
+    assert!(!history.can_redo);
+    assert!(run(commands::undo_edit(s.handle(), s.state())).is_err());
+    assert_eq!(live_cue_rows(&s, &track), newer);
+    assert_eq!(undo(&s).undo_label, None);
+    assert_eq!(run(details::track_details(s.state(), rated)).unwrap().rating, 0);
+}
+
+/// Unrelated cues are not part of an entry: a change to another cue of the
+/// same track since does not stop the Undo, and survives it.
+#[test]
+fn undo_leaves_the_track_s_other_cues_as_they_are_now() {
+    let s = shell();
+    let track = track_id(4);
+    let first = run(cues::add_cue(s.handle(), s.state(), track.clone(), CueKind::Hot('A'), 1_000)).unwrap();
+    let second = run(cues::add_cue(s.handle(), s.state(), track.clone(), CueKind::Memory, 2_000)).unwrap();
+    run(cues::set_cue_comment(s.handle(), s.state(), first.clone(), "Intro".into())).unwrap();
+    external(&s).move_cue(&second, 9_000).unwrap();
+
+    undo(&s);
+    let cues = run(commands::track_cues(s.state(), track)).unwrap();
+    assert_eq!(cues.iter().find(|c| c.id == first).unwrap().comment, "", "the comment undone");
+    assert_eq!(cues.iter().find(|c| c.id == second).unwrap().position_ms, 9_000, "the other cue's move kept");
+}
+
+/// A deleted hot cue is not put back over a hot cue set on its pad since:
+/// that would leave two cues on one pad.
+#[test]
+fn undo_of_a_delete_is_refused_when_the_pad_was_set_again() {
+    let s = shell();
+    let track = track_id(4);
+    let hot = run(cues::add_cue(s.handle(), s.state(), track.clone(), CueKind::Hot('B'), 1_000)).unwrap();
+    run(cues::delete_cue(s.handle(), s.state(), hot)).unwrap();
+    external(&s).add_cue(&track, 2, 7_000).unwrap(); // Hot Cue B, over LINK or in rekordbox
+    let newer = live_cue_rows(&s, &track);
+
+    let error = run(commands::undo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(error.message, "Can't undo Delete Cue: Hot Cue B has been set since. The newer change was kept.");
+    assert_eq!(live_cue_rows(&s, &track), newer);
+    let cues = run(commands::track_cues(s.state(), track)).unwrap();
+    assert_eq!(cues.iter().filter(|c| c.letter == "B").count(), 1);
+}
+
+/// Redo is held to the same rule: an undone add is not redone onto a pad
+/// set since.
+#[test]
+fn redo_of_a_cue_is_refused_when_the_pad_was_set_since() {
+    let s = shell();
+    let track = track_id(4);
+    run(cues::add_cue(s.handle(), s.state(), track.clone(), CueKind::Hot('A'), 1_000)).unwrap();
+    undo(&s);
+    external(&s).add_cue(&track, 1, 5_000).unwrap();
+
+    let error = run(commands::redo_edit(s.handle(), s.state())).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(error.message, "Can't redo Set Hot Cue: Hot Cue A has been set since. The newer change was kept.");
+    let cues = run(commands::track_cues(s.state(), track)).unwrap();
+    assert_eq!(cues.iter().map(|c| c.position_ms).collect::<Vec<_>>(), [5_000]);
+    assert!(!commands::current_history(&s.state()).can_redo);
+}
+
+/// A recorded cue edit after an Undo starts a new branch, as every recorded
+/// edit does.
+#[test]
+fn a_cue_edit_after_an_undo_ends_the_redo_branch() {
+    let s = shell();
+    let track = track_id(7);
+    run(commands::set_track_rating(s.handle(), s.state(), vec![track.clone()], 4)).unwrap();
+    assert!(undo(&s).can_redo);
+    run(cues::add_cue(s.handle(), s.state(), track, CueKind::Memory, 1_000)).unwrap();
+    assert!(!commands::current_history(&s.state()).can_redo);
 }

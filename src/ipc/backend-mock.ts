@@ -11,6 +11,7 @@
  */
 import { TRACK_SEARCH_OPTIONS, type TrackSearchField } from "@/lib/search";
 import theme from "@/styles/theme";
+import { rowMemoryCueColours } from "@/lib/memoryCueColours";
 
 import type {
   AppErrorDto, Backend, Backup, BackupProgress, BackupSizes, Cue, DeckEvent, Device, DeviceSettings, Edits, ExplorerRoot, ExportReport,
@@ -23,6 +24,7 @@ import { TREE_ROOT } from "./types";
 import { applyEditFrom, validateEdit, isDynamicFrom, tempoX100, type EditableBeat } from "@/lib/gridEdit";
 import { toCamelot } from "@/lib/camelot";
 import { COLOR_NAMES, wholeBpm } from "@/lib/trackFilter";
+import { MY_TAG_LIMIT, newMyTagName } from "@/lib/myTags";
 import { referenceDeviceSettings } from "./mock-device-settings";
 import { createMockDeviceLibraries, type MockImportEntry } from "./mock-device-library";
 
@@ -54,8 +56,12 @@ const CUE_SETS: readonly (readonly (readonly [string, number, string | null])[])
   [["A", 0.12, theme.color.cuePink.value], ["B", 0.26, theme.color.cueAqua.value], ["C", 0.61, theme.color.cueLime.value], ["D", 0.79, theme.color.cuePurple.value]],
 ];
 
-/** What a hot cue added here draws: index 21, the default the writer stores. */
-const DEFAULT_CUE_COLOUR = theme.color.cueHot.value;
+/**
+ * A cue added here has no colour of its own, as the writer stores it: a hot
+ * cue's `ColorTableIndex` is 0, as on rekordbox's deck, so it is drawn in the
+ * HOT CUE color default for its slot rather than green (issue #593).
+ */
+const NO_COLOUR = null;
 
 /**
  * How long the mock pretends analysis takes.
@@ -407,6 +413,18 @@ export function createMockBackend(options: MockOptions = {}): Backend {
   mockLogLine("debug", "rbxport_lib::logging", "logging to the browser preview");
   const playlistFixture = options.playlistFixture ?? readPlaylistFixtureFromUrl();
   const all = makeRows(trackCount);
+  /** The Missing File Manager's order once a heading sorted it, by id. */
+  let missingOrder: string[] | null = null;
+  /** The missing rows in the manager's order; any not in it go last. */
+  const missingListed = () => {
+    const gone = all.filter((row) => row.missing === true);
+    if (missingOrder === null) return gone;
+    const at = new Map(missingOrder.map((id, index) => [id, index]));
+    return gone
+      .map((row, index) => ({ row, index }))
+      .sort((a, b) => (at.get(a.row.id) ?? Infinity) - (at.get(b.row.id) ?? Infinity) || a.index - b.index)
+      .map(({ row }) => row);
+  };
   const missingEvery = options.missingEvery ?? readMissingFromUrl();
   if (missingEvery !== null) {
     for (let i = 1; i < all.length; i += missingEvery) {
@@ -548,7 +566,11 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     return candidates;
   };
   const tree = makeTree(playlistFixture);
-  type MockEdit = { label: string; undo: () => void; redo: () => void };
+  type MockEdit = {
+    label: string; undo: () => void; redo: () => void;
+    /** An Add Tracks to Playlist still open to its next slice (#499). */
+    transaction?: string | undefined; playlist?: string; after?: string[];
+  };
   const editUndo: MockEdit[] = [];
   const editRedo: MockEdit[] = [];
 
@@ -562,6 +584,14 @@ export function createMockBackend(options: MockOptions = {}): Backend {
   const listeners = new Set<(generation: number) => void>();
   const historyListeners = new Set<(history: EditHistoryState) => void>();
   const tagListListeners = new Set<() => void>();
+  // Played marks (#540): the deck's recorded plays, and `?played=` as the
+  // tracks a player added to history over LINK, shown while LINK is on.
+  const deckPlayed = new Set<string>();
+  const linkPlayed = new Set<string>(readPlayedFromUrl());
+  const playedListeners = new Set<() => void>();
+  const playedChanged = () => {
+    for (const listener of playedListeners) listener();
+  };
 
   const historyState = (): EditHistoryState => ({
     generation,
@@ -603,6 +633,48 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     return wait(generation);
   };
 
+  /**
+   * Remove from Tag List or Clear Tag List (#508): keeps the tracks `keep`
+   * passes, and records one entry whose Undo puts the list back as it was,
+   * refused, as the real backend refuses it, once the list changed since.
+   */
+  const recordTagListRemoval = (label: string, keep: (track: string) => boolean): Promise<number> => {
+    const before = [...tagList];
+    const after = before.filter(keep);
+    if (after.length === before.length) return wait(generation);
+    const setFrom = (expected: readonly string[], next: readonly string[]) => {
+      if (tagList.length !== expected.length || tagList.some((track, i) => track !== expected[i])) {
+        throw new Error("the Tag List has changed since");
+      }
+      tagList.splice(0, tagList.length, ...next);
+      for (const listener of tagListListeners) listener();
+    };
+    tagList.splice(0, tagList.length, ...after);
+    editUndo.push({ label, undo: () => setFrom(after, before), redo: () => setFrom(before, after) });
+    if (editUndo.length > 50) editUndo.shift();
+    return tagListChanged();
+  };
+
+  // The library's My Tags. Edited in place by Adding My Tag, a rename and a
+  // delete, as the real backend's table is.
+  const myTagCategories: { id: string; name: string; tags: { id: string; name: string }[] }[] = [
+    { id: "3", name: "Situation", tags: [{ id: "t-peak", name: "Peak" }, { id: "t-warm", name: "Warm-up" }] },
+    { id: "2", name: "Components", tags: [{ id: "t-synth", name: "Synth" }, { id: "t-vocal", name: "Vocal" }] },
+  ];
+  let nextMyTag = 0;
+
+  /**
+   * An add's or a reorder's Undo or Redo (#499): refused, as the real
+   * backend refuses it, unless the playlist holds exactly `expected`.
+   */
+  const setMembersFrom = (playlist: string, expected: readonly string[], next: readonly string[]) => {
+    const now = membersOf(playlist);
+    if (now.length !== expected.length || now.some((track, i) => track !== expected[i])) {
+      throw new Error("the playlist's tracks have changed since");
+    }
+    membership.set(playlist, [...next]);
+  };
+
   const recordEdit = async (edit: MockEdit): Promise<EditHistoryState> => {
     await bump(false);
     editUndo.push(edit);
@@ -625,6 +697,22 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       undo: () => { for (const step of [...steps].reverse()) step.undo(); },
       redo: () => { for (const step of steps) step.redo(); },
     });
+  };
+
+  /**
+   * One Relocate, Relocate by location or Auto Relocate run (#502): its
+   * tracks stop being missing, and one "Relocate" entry puts them all back
+   * (missing again) or forward, as the real backend records the run.
+   */
+  const recordRelocation = (rows: readonly RowDto[]): Promise<EditHistoryState> => {
+    const relink = (missing: boolean) => {
+      for (const row of rows) {
+        if (missing) row.missing = true;
+        else delete row.missing;
+      }
+    };
+    relink(false);
+    return recordEdit({ label: "Relocate", undo: () => relink(true), redo: () => relink(false) });
   };
 
   const setHasArtwork = (track: string, value: boolean) => {
@@ -915,18 +1003,48 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     };
   };
 
+  /**
+   * A playlist, folder or intelligent playlist just made, as one Undo step
+   * (#500). Undo takes the same node away unless something has been put in
+   * it since, which it refuses, as the real backend does; Redo puts it back
+   * in the place it had.
+   */
+  const recordCreation = async (id: string, parent: string, label: string): Promise<number> => {
+    const made = findNode(id);
+    // The flat tree's next node: what the made one goes back in front of.
+    const next = tree[tree.findIndex((n) => n.id === id) + 1]?.id;
+    const state = await recordEdit({
+      label,
+      undo: () => {
+        const at = tree.findIndex((n) => n.id === id);
+        if (at < 0) throw new Error("the playlist is no longer there");
+        if (subtreeLength(at) > 1) throw new Error("playlists have been added to the folder since");
+        if ((membership.get(id) ?? []).length > 0) throw new Error("tracks have been added to the playlist since");
+        tree.splice(at, 1);
+      },
+      redo: () => {
+        if (!made) return;
+        const at = next === undefined ? -1 : tree.findIndex((n) => n.id === next);
+        if (at < 0) insertUnder(parent, { ...made });
+        else tree.splice(at, 0, { ...made });
+      },
+    });
+    return state.generation;
+  };
+
   const edits: Edits = {
     createPlaylist: (name, parent, index) => {
       const depth = parent === TREE_ROOT ? 1 : (findNode(parent)?.depth ?? 0) + 1;
       const id = `made-${nextId++}`;
       membership.set(id, []);
       insertUnder(parent, { id, name, kind: "playlist", depth, childCount: 0 }, index);
-      return bump();
+      return recordCreation(id, parent, "Create Playlist");
     },
     createFolder: (name, parent) => {
       const depth = parent === TREE_ROOT ? 1 : (findNode(parent)?.depth ?? 0) + 1;
-      insertUnder(parent, { id: `made-${nextId++}`, name, kind: "folder", depth, expanded: true });
-      return bump();
+      const id = `made-${nextId++}`;
+      insertUnder(parent, { id, name, kind: "folder", depth, expanded: true });
+      return recordCreation(id, parent, "Create Folder");
     },
     // The mock keeps the rule and answers it back; it does not evaluate
     // one, so a made intelligent playlist opens empty here.
@@ -936,11 +1054,21 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       smartRules.set(id, rule);
       membership.set(id, []);
       insertUnder(parent, { id, name, kind: "smartPlaylist", depth, childCount: 0 });
-      return bump();
+      return recordCreation(id, parent, "Create Intelligent Playlist");
     },
-    setSmartRule: (playlist, rule) => {
+    setSmartRule: async (playlist, rule) => {
+      const before = smartRules.get(playlist);
       smartRules.set(playlist, rule);
-      return bump();
+      const restore = (value: SmartRule | undefined) => {
+        if (value === undefined) smartRules.delete(playlist);
+        else smartRules.set(playlist, value);
+      };
+      const state = await recordEdit({
+        label: "Edit Intelligent Playlist",
+        undo: () => restore(before),
+        redo: () => restore(rule),
+      });
+      return state.generation;
     },
     renamePlaylist: (id, name) => {
       const node = findNode(id);
@@ -995,6 +1123,24 @@ export function createMockBackend(options: MockOptions = {}): Backend {
         redo: () => restoreTree(afterTree),
       });
     },
+    sortItems: async (folder, language) => {
+      // The Playlists heading's run, or a folder's, one level down.
+      const at = folder === TREE_ROOT ? tree.findIndex((n) => n.kind === "collection") : tree.findIndex((n) => n.id === folder);
+      const head = tree[at];
+      if (!head || (folder !== TREE_ROOT && head.kind !== "folder")) throw new Error(`${folder} is not a folder`);
+      const blocks: TreeNode[][] = [];
+      const end = at + subtreeLength(at);
+      for (let i = at + 1; i < end; i += subtreeLength(i)) blocks.push(tree.slice(i, i + subtreeLength(i)));
+      // The backend uses ICU4X; the webview's Intl.Collator is ICU too, with
+      // the same defaults (tertiary, not numeric). The sort is stable.
+      const collator = new Intl.Collator(language);
+      const sorted = [...blocks].sort((a, b) => collator.compare(a[0]?.name ?? "", b[0]?.name ?? ""));
+      if (sorted.every((block, i) => block === blocks[i])) return historyState();
+      const before = treeSnapshot();
+      tree.splice(at + 1, end - at - 1, ...sorted.flat());
+      const afterTree = treeSnapshot();
+      return recordEdit({ label: "Sort Items", undo: () => restoreTree(before), redo: () => restoreTree(afterTree) });
+    },
     deletePlaylist: async (id) => {
       const beforeTree = treeSnapshot();
       const beforeMembership = membershipSnapshot();
@@ -1015,8 +1161,15 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     undoEdit: async () => {
       const edit = editUndo.at(-1);
       if (!edit) throw new Error("There is no library edit to undo.");
-      // A refused undo stays on the stack, as in the real backend.
-      edit.undo();
+      // A refused entry leaves the history and nothing else does, as in
+      // the real backend (#506).
+      try {
+        edit.undo();
+      } catch (e) {
+        editUndo.pop();
+        announceHistory();
+        return historyConflict("undo", edit.label, e);
+      }
       editUndo.pop();
       editRedo.push(edit);
       await bump(false);
@@ -1025,20 +1178,42 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     redoEdit: async () => {
       const edit = editRedo.at(-1);
       if (!edit) throw new Error("There is no library edit to redo.");
-      edit.redo();
+      try {
+        edit.redo();
+      } catch (e) {
+        editRedo.pop();
+        announceHistory();
+        return historyConflict("redo", edit.label, e);
+      }
       editRedo.pop();
       editUndo.push(edit);
       await bump(false);
       return announceHistory();
     },
     createPlaylistWithTracks: () => Promise.reject(new Error("Building a playlist requires the desktop app.")),
-    addTracksToPlaylist: (playlist, tracks, allowDuplicates = false) => {
+    addTracksToPlaylist: async (playlist, tracks, allowDuplicates = false, transaction) => {
       // The real backend refuses while Rekordbox holds the database; the mock
       // never does, so the happy path is what `pnpm dev:mock` exercises.
+      const before = [...membersOf(playlist)];
       const current = membersOf(playlist);
       for (const track of tracks) if (allowDuplicates || !current.includes(track)) current.push(track);
       membership.set(playlist, current);
-      return bump();
+      const after = [...current];
+      if (after.length === before.length) return bump();
+      // A slice of the same add joins the entry its first slice made, as
+      // the real backend's history does (#499).
+      const open = editUndo.at(-1);
+      if (transaction && open?.transaction === transaction && open.playlist === playlist
+        && open.after?.join() === before.join()) {
+        open.after = after;
+        return bump();
+      }
+      const opened: MockEdit = {
+        label: "Add Tracks to Playlist", transaction, playlist, after,
+        undo: () => setMembersFrom(playlist, opened.after ?? after, before),
+        redo: () => setMembersFrom(playlist, before, opened.after ?? after),
+      };
+      return (await recordEdit(opened)).generation;
     },
     playlistDuplicates: (playlist, tracks) => {
       const current = new Set(membersOf(playlist));
@@ -1050,17 +1225,10 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       for (const track of tracks) if (!tagList.includes(track)) tagList.push(track);
       return tagListChanged();
     },
-    removeFromTagList: (tracks) => {
-      for (const track of tracks) {
-        const at = tagList.indexOf(track);
-        if (at >= 0) tagList.splice(at, 1);
-      }
-      return tagListChanged();
-    },
-    clearTagList: () => {
-      tagList.length = 0;
-      return tagListChanged();
-    },
+    // One Undo per removal or clear, as the real backend records them
+    // (#508); a removal of nothing records nothing.
+    removeFromTagList: (tracks) => recordTagListRemoval("Remove from Tag List", (t) => !tracks.includes(t)),
+    clearTagList: () => recordTagListRemoval("Clear Tag List", () => false),
     removeTracksFromPlaylist: (playlist, tracks) => {
       const before = [...membersOf(playlist)];
       const current = membersOf(playlist).filter((t) => !tracks.includes(t));
@@ -1088,7 +1256,13 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       return recordEdit({ label: "Track Edit", undo: () => apply(before), redo: () => apply(after) });
     },
     // The mock keeps no history sessions of its own to add to or take from.
-    recordPlay: () => wait(generation),
+    recordPlay: (track) => {
+      if (!deckPlayed.has(track)) {
+        deckPlayed.add(track);
+        playedChanged();
+      }
+      return wait(generation);
+    },
     removeFromHistory: (history, tracks) => {
       membership.set(history, membersOf(history).filter((t) => !tracks.includes(t)));
       return bump();
@@ -1110,8 +1284,15 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       // Mirrors the backend: tracks not named keep their place after the rest,
       // so a partial order cannot silently drop any.
       const named = tracks.filter((t) => current.includes(t));
-      membership.set(playlist, [...named, ...current.filter((t) => !named.includes(t))]);
-      return bump();
+      const after = [...named, ...current.filter((t) => !named.includes(t))];
+      const before = [...current];
+      membership.set(playlist, after);
+      if (after.join() === before.join()) return bump();
+      return recordEdit({
+        label: "Reorder Playlist",
+        undo: () => setMembersFrom(playlist, after, before),
+        redo: () => setMembersFrom(playlist, before, after),
+      }).then((history) => history.generation);
     },
     setTrackRating: (tracks, stars) => {
       const after = Math.max(0, Math.min(5, stars));
@@ -1162,7 +1343,56 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       apply(tags);
       return recordEdit({ label: "Track Edit", undo: () => apply(before), redo: () => apply(tags) });
     },
-    addPlaylistArtwork: () => bump(),
+    putMyTag: (tracks, tag, on) =>
+      recordTrackEdits(tracks, (track) => {
+        const row = all.find((r) => r.id === track);
+        const detail = row ? detailsOf(row) : undefined;
+        const before = [...(detail?.myTags ?? [])];
+        const after = on
+          ? (before.includes(tag) ? before : [...before, tag])
+          : before.filter((t) => t !== tag);
+        const apply = (value: readonly string[]) => { if (detail) detail.myTags = [...value]; };
+        apply(after);
+        return { undo: () => apply(before), redo: () => apply(after) };
+      }),
+    // The mock keeps no comment text for My Tags (#605); the run is still a
+    // step of history, as the real backend's is.
+    writeMyTagComments: () => recordEdit({ label: "Track Edit", undo: () => {}, redo: () => {} }),
+    createMyTag: async (category) => {
+      const into = myTagCategories.find((c) => c.id === category);
+      if (!into) throw new Error(`no My Tag category ${category}`);
+      if (into.tags.length >= MY_TAG_LIMIT) throw new Error(`a My Tag category holds at most ${MY_TAG_LIMIT} tags`);
+      const made = { id: `t-new-${(nextMyTag += 1)}`, name: newMyTagName(into.tags.map((t) => t.name)) };
+      into.tags.push(made);
+      await bump();
+      return { ...made };
+    },
+    renameMyTag: (id, name) => {
+      if (name === "") return Promise.reject(new Error("a My Tag needs a name"));
+      const category = myTagCategories.find((c) => c.id === id);
+      const owner = myTagCategories.find((c) => c.tags.some((t) => t.id === id));
+      const item = category ?? owner?.tags.find((t) => t.id === id);
+      if (!item) return Promise.reject(new Error(`no My Tag ${id}`));
+      const siblings: { id: string; name: string }[] = category ? myTagCategories : owner?.tags ?? [];
+      if (siblings.some((s) => s.id !== id && s.name === name)) {
+        return Promise.reject(new Error("An item with the same name already exists!"));
+      }
+      item.name = name;
+      return bump();
+    },
+    deleteMyTag: (id) => {
+      const owner = myTagCategories.find((c) => c.tags.some((t) => t.id === id));
+      if (!owner) return Promise.reject(new Error(`no My Tag ${id}`));
+      owner.tags = owner.tags.filter((t) => t.id !== id);
+      for (const detail of details.values()) detail.myTags = detail.myTags.filter((t) => t !== id);
+      // As the real backend: the history goes, since an older tick names it.
+      editUndo.length = 0;
+      return bump();
+    },
+    // The mock keeps no playlist artwork; the step is in the history as the
+    // real backend's is (#500).
+    addPlaylistArtwork: async () =>
+      (await recordEdit({ label: "Add Artwork", undo: () => {}, redo: () => {} })).generation,
     addArtwork: (tracks) => recordTrackEdits(tracks, (track) => setHasArtwork(track, true)),
     clearArtwork: (tracks) => recordTrackEdits(tracks, (track) => setHasArtwork(track, false)),
     setTrackField: (tracks, field, value) => {
@@ -1189,7 +1419,22 @@ export function createMockBackend(options: MockOptions = {}): Backend {
           return Promise.reject(new Error(`${JSON.stringify(value)} is not a BPM between 20 and 400`));
         }
         const row = all.find((r) => r.id === tracks[0]);
-        if (row) {
+        const held = tracks[0] === undefined ? null : gridOf(tracks[0]);
+        if (row && held) {
+          // As the real backend (#505): the grid editor's Set Tempo over the
+          // whole track, one entry in the track's grid history.
+          if (held.locked) return refuse("The beat grid is locked. Unlock it to edit.");
+          const next = applyEditFrom(held.beats, null, { kind: "tempo", bpmX100: Math.round(bpm * 100), anchorMs: 0 }, row.durationSec * 1000);
+          if (!sameGrid(next, held.beats)) {
+            held.undo.push({ beats: held.beats, label: "Set Tempo" });
+            held.transaction = undefined;
+            held.redo = [];
+            held.beats = next;
+          }
+          row.bpmX100 = Math.round(bpm * 100);
+          detailsOf(row).bpmX100 = row.bpmX100;
+          for (const listener of gridListeners) listener(row.id);
+        } else if (row) {
           row.bpmX100 = Math.round(bpm * 100);
           detailsOf(row).bpmX100 = row.bpmX100;
         }
@@ -1233,7 +1478,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       const id = `cue-${nextCueId++}`;
       cuesOf(track).push({
         id, positionMs, outMs: 0, letter: kind === "memory" ? "" : kind.hot, memory: kind === "memory",
-        colour: kind === "memory" ? null : DEFAULT_CUE_COLOUR,
+        colour: NO_COLOUR,
       });
       return cuesChanged(track, id);
     },
@@ -1243,7 +1488,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       const id = `cue-${nextCueId++}`;
       cuesOf(track).push({
         id, positionMs: inMs, outMs, letter: kind === "memory" ? "" : kind.hot, memory: kind === "memory",
-        colour: kind === "memory" ? null : DEFAULT_CUE_COLOUR,
+        colour: NO_COLOUR,
       });
       return cuesChanged(track, id);
     },
@@ -1253,7 +1498,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
         if (!cue) continue;
         const palette = ["#000000", "#305AFF", "#5073FF", "#508CFF", "#50A0FF", "#50B4FF", "#50B0F2", "#50AEE8", "#45ACDB", "#00E0FF", "#19DAF0", "#32D2E6", "#21B4B9", "#20AAA0", "#1FA392", "#19A08C", "#14A584", "#14AA7D", "#10B176", "#30D26E", "#37DE5A", "#3CEB50", "#28E214", "#7DC13D", "#8CC832", "#9BD723", "#A5E116", "#A5DC0A", "#AAD208", "#B4C805", "#B4BE04", "#BAB404", "#C3AF04", "#E1AA00", "#FFA000", "#FF9600", "#FF8C00", "#FF7500", "#E0641B", "#E0461E", "#E0301E", "#E02823", "#E62828", "#FF376F", "#FF2D6F", "#FF127B", "#F51E8C", "#EB2DA0", "#E637B4", "#DE44CF", "#DE448D", "#E630B4", "#E619DC", "#E600FF", "#DC00FF", "#CC00FF", "#B432FF", "#B93CFF", "#C542FF", "#AA5AFF", "#AA72FF", "#8272FF", "#6473FF", "#000000", "#FFFFFF"];
         const memoryPalette = ["#E778F1", "#E33122", "#EBA44A", "#F4E458", "#66DD42", "#56BDF3", "#204FEF", "#8B1EEF"];
-        cue.colour = colour === null ? (cue.memory ? null : DEFAULT_CUE_COLOUR) : (cue.memory ? memoryPalette : palette)[colour] ?? null;
+        cue.colour = colour === null ? NO_COLOUR : (cue.memory ? memoryPalette : palette)[colour] ?? null;
         return cuesChanged(trackId, undefined);
       }
       return refuse(`no cue ${cueId}`);
@@ -1263,6 +1508,18 @@ export function createMockBackend(options: MockOptions = {}): Backend {
         const cue = list.find((item) => item.id === cueId);
         if (!cue) continue;
         cue.comment = comment;
+        return cuesChanged(trackId, undefined);
+      }
+      return refuse(`no cue ${cueId}`);
+    },
+    setActiveLoop: (cueId, on) => {
+      for (const [trackId, list] of cueStore) {
+        const cue = list.find((item) => item.id === cueId);
+        if (!cue) continue;
+        if (!cue.memory || cue.outMs <= cue.positionMs) return refuse("only a memory loop can be the Active Loop");
+        // One Active Loop a track, as rekordbox's `MstSetActiveLoop` keeps.
+        if (on) for (const other of list) other.activeLoop = false;
+        cue.activeLoop = on;
         return cuesChanged(trackId, undefined);
       }
       return refuse(`no cue ${cueId}`);
@@ -1278,7 +1535,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
         if (letter === undefined) break;
         cues.push({
           id: `cue-${nextCueId++}`, positionMs: cue.positionMs, outMs: cue.outMs, letter, memory: false,
-          colour: DEFAULT_CUE_COLOUR,
+          colour: NO_COLOUR,
         });
         made += 1;
       }
@@ -1538,7 +1795,13 @@ export function createMockBackend(options: MockOptions = {}): Backend {
   const syncRow = (trackId: string) => {
     const row = all[Number.parseInt(trackId, 10) - 100000];
     if (!row) return;
-    row.memoryCues = cuesOf(trackId).filter(cue => cue.memory).map(cue => cue.positionMs);
+    const memory = cuesOf(trackId).filter(cue => cue.memory);
+    row.memoryCues = memory.map(cue => cue.positionMs);
+    // As the backend: each memory cue's `Color`, 255 for none, and nothing
+    // when none has one.
+    const colours = rowMemoryCueColours(memory.map((cue) => cue.colour));
+    if (colours) row.memoryCueColours = colours;
+    else delete row.memoryCueColours;
     row.hotCues = cuesOf(trackId)
       .filter((cue) => !cue.memory)
       .sort((a, b) => a.letter.localeCompare(b.letter))
@@ -1561,6 +1824,10 @@ export function createMockBackend(options: MockOptions = {}): Backend {
   const failed = (kind: AppErrorDto["kind"], message: string) =>
     Promise.reject(Object.assign(new Error(message), { kind }));
   const refuse = (message: string) => failed("readOnly", message);
+  // An Undo or Redo refused because what it would write changed since, in
+  // the real backend's words.
+  const historyConflict = (action: "undo" | "redo", label: string, reason: unknown) =>
+    failed("conflict", `Can't ${action} ${label}: ${reason instanceof Error ? reason.message : String(reason)}. The newer change was kept.`);
   const notFound = (message: string) => failed("notFound", message);
 
   /*
@@ -2721,9 +2988,26 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       return wait(mockLinkStatus());
     },
     onLinkStatus: () => () => undefined,
+    playedTracks: () => wait([...new Set([...deckPlayed, ...(linkMode === "on" ? linkPlayed : [])])].sort()),
+    resetPlayedTracks: () => {
+      const had = deckPlayed.size + linkPlayed.size > 0;
+      deckPlayed.clear();
+      linkPlayed.clear();
+      if (had) playedChanged();
+      return wait(undefined);
+    },
+    onPlayedChanged: (listener) => {
+      playedListeners.add(listener);
+      return () => playedListeners.delete(listener);
+    },
 
     // Analysis is real work in the app; here it just answers, so the queue's
     // sequencing and progress can be driven end to end without audio.
+    analysisStages: () => wait([
+      { id: "grid", label: "BPM / Grid", description: "", requires: ["core.audio"], produces: ["core.beat_grid"], defaultEnabled: true, requiresFullTrack: false, revision: "1" },
+      { id: "key", label: "KEY", description: "", requires: ["core.audio"], produces: ["core.key"], defaultEnabled: true, requiresFullTrack: false, revision: "1" },
+      { id: "waveform", label: "Waveform", description: "", requires: ["core.audio"], produces: ["core.waveform"], defaultEnabled: true, requiresFullTrack: false, revision: "1" },
+    ]),
     analyseTrack: (trackId, _mode, settings, _keyTag, drawing) => {
       const index = Number.parseInt(trackId, 10) - 100000;
       const row = all[index];
@@ -2882,8 +3166,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
           const listsUnder = () => childrenOf(parent).filter((n) => n.kind !== "history").map((n) => n.id);
           const afterIds = listsUnder();
           const root = nodes[0]?.id ?? "";
-          const refuse = (undo: boolean) => new Error(
-            `that replacement can no longer be ${undo ? "undone" : "redone"}`);
+          const refuse = (_undo: boolean) => new Error("the playlists have changed since");
           const sameList = (a: readonly string[], b: readonly string[]) =>
             a.length === b.length && a.every((value, i) => value === b[i]);
           // `entering` (a node and what is under it) put back right after the
@@ -2955,9 +3238,11 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     exportPlaylistFile: () => wait(null),
     exportXml: () => wait(null),
 
-    // The tracks `?missing=N` took the files of, in collection order.
-    missingTracks: (offset, limit) => {
-      const gone = all.filter((row) => row.missing === true);
+    // The tracks `?missing=N` took the files of, in collection order until
+    // a heading sorts them; a check after a change keeps that order.
+    missingTracks: (offset, limit, rescan, keepOrder) => {
+      if (rescan && !keepOrder) missingOrder = null;
+      const gone = missingListed();
       return wait({
         total: gone.length,
         tracks: gone.slice(offset, offset + limit).map((row) => ({
@@ -2968,6 +3253,34 @@ export function createMockBackend(options: MockOptions = {}): Backend {
           path: String(row.extra?.location ?? ""),
         })),
       });
+    },
+    trackMissing: (trackId) => {
+      const row = all.find((r) => r.id === trackId);
+      return wait(row ? row.missing === true : null);
+    },
+    sortMissingTracks: (column, forwards) => {
+      // `relocate::sorted_rows`, over the list as it stands: ICU's en-US
+      // order, then the row's place, reversed forwards (rekordbox's
+      // `compareEnd` answers -1).
+      const collator = new Intl.Collator("en-US");
+      const text = (a: string, b: string) => collator.compare(a, b);
+      const disc = (row: RowDto) => Number(row.extra?.discNo ?? 0);
+      const track = (row: RowDto) => Number(row.extra?.trackNumber ?? 0);
+      const album = (a: RowDto, b: RowDto) => text(a.album, b.album) || disc(a) - disc(b) || track(a) - track(b);
+      const keys = (a: RowDto, b: RowDto) => {
+        switch (column) {
+          case "title": return text(a.title, b.title);
+          case "artist": return text(a.artist, b.artist) || album(a, b);
+          case "album": return album(a, b);
+          case "location": return text(String(a.extra?.location ?? ""), String(b.extra?.location ?? ""));
+        }
+      };
+      const placed = missingListed().map((row, at) => ({ row, at }));
+      placed.sort((a, b) => forwards
+        ? Math.sign(keys(a.row, b.row)) || b.at - a.at
+        : Math.sign(keys(b.row, a.row)) || a.at - b.at);
+      missingOrder = placed.map(({ row }) => row.id);
+      return wait(undefined);
     },
     removeMissingTracks: async (tracks) => {
       const gone = all.filter((row) => row.missing === true && (tracks === null || tracks.includes(row.id)));
@@ -3027,10 +3340,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       const row = all.find((r) => r.id === trackId);
       const taken = all.some((r) => r.id !== trackId && r.missing !== true && String(r.extra?.location ?? "") === path);
       if (taken) return false;
-      if (row?.missing === true) {
-        delete row.missing;
-        await bump();
-      }
+      if (row?.missing === true) await recordRelocation([row]);
       return true;
     },
     relocationTargets: (tracks) => {
@@ -3052,8 +3362,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       const page = window as unknown as { __relocatedBy?: string[] };
       (page.__relocatedBy ??= []).push(`${from} -> ${to}`);
       const found = all.filter((row) => row.missing === true && tracks.includes(row.id));
-      for (const row of found) delete row.missing;
-      if (found.length > 0) await bump();
+      if (found.length > 0) await recordRelocation(found);
       return found.length;
     },
     // The search folders hold every other missing file, in list order, so a
@@ -3073,13 +3382,14 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       const searched = search.folders.length > 0 || search.music || search.video || search.desktop;
       const gone = all.filter((row) => row.missing === true && (tracks === null || tracks.includes(row.id)));
       const found = searched ? gone.filter((_, at) => at % 2 === 0) : [];
-      for (const row of found) delete row.missing;
-      if (found.length > 0) await bump();
+      if (found.length > 0) await recordRelocation(found);
       return { relocated: found.length, unresolved: gone.length - found.length, inCollection: [], inCollectionTotal: 0 };
     },
     // No dialogs in a browser: the folder is a fixed one, so the search
     // folders list can be driven end to end.
-    pickFolder: () => wait("/Users/mock/Music/Moved"),
+    pickFolder: () => wait((typeof window !== "undefined"
+      ? (window as unknown as { __mockPickedFolder?: string }).__mockPickedFolder
+      : undefined) ?? "/Users/mock/Music/Moved"),
     pickImage: () => wait("/Users/mock/Pictures/cover.jpg"),
     // No windows in a browser: the shell draws the Preferences over itself,
     // and its resets are its own to do.
@@ -3225,6 +3535,8 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     },
     // The fake disk above. Copies, as with the tree: the map is the mock's.
     deviceLibraries: (path) => wait(stickLibraries.libraries(path)),
+    devicePlaylistCollectionTracks: (path, format, tracks) =>
+      wait(stickLibraries.collectionTracks(path, format, tracks, [...(looseTracks.get(path) ?? [])])),
     devicePlaylistEdit: (path, format, edit) => {
       try {
         return wait(stickLibraries.edit(path, format, edit));
@@ -3244,8 +3556,12 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     // there, with the stick's entries in its order. An entry whose track
     // the collection lacks is copied in as a new track (one per stick
     // file), left out, or stops the import, as `missing` says.
-    devicePlaylistImport: (path, format, id, missing) => {
+    devicePlaylistImport: (path, format, id, missing, destination) => {
       if (!ready) return notReady();
+      // Where the copies would go, for the spec of rekordbox's Change….
+      if (typeof window !== "undefined") {
+        (window as unknown as { __deviceImportDestination?: string | null }).__deviceImportDestination = destination ?? null;
+      }
       let source: { name: string; entries: MockImportEntry[] };
       try {
         source = stickLibraries.playlist(path, format, id);
@@ -3254,7 +3570,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       }
       const held = (entry: MockImportEntry) => entry.master !== null && all.some((r) => r.id === entry.master);
       const lacking = source.entries.filter((entry) => !held(entry)).length;
-      const none = (cancelled: boolean) => wait({ id: null, name: source.name, renamed: false, tracks: 0, missing: lacking, copied: 0, cancelled });
+      const none = (cancelled: boolean) => wait({ id: null, name: source.name, renamed: false, tracks: 0, missing: lacking, copied: 0, analysed: 0, analysisFailed: 0, cancelled });
       if (lacking > 0 && missing === "cancel") return none(true);
       const copiedFrom = new Map<string, string>();
       const contents: string[] = [];
@@ -3281,10 +3597,13 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       membership.set(made, contents);
       insertUnder(TREE_ROOT, { id: made, name, kind: "playlist", depth: 1, childCount: contents.length });
       return bump().then(() => ({
-        id: made, name, renamed: name !== source.name, tracks: contents.length, missing: lacking, copied: copiedFrom.size, cancelled: false,
+        // The copies keep the stick row's BPM, key and cues, as the real
+        // backend gives them the stick's analysis.
+        id: made, name, renamed: name !== source.name, tracks: contents.length, missing: lacking, copied: copiedFrom.size,
+        analysed: copiedFrom.size, analysisFailed: 0, cancelled: false,
       }));
     },
-    devicePlaylistImportPlan: (path, format, id) => {
+    devicePlaylistImportPlan: (path, format, id, destination) => {
       let source: { name: string; entries: MockImportEntry[] };
       try {
         source = stickLibraries.playlist(path, format, id);
@@ -3295,7 +3614,12 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       const files = new Set(lacking.map((entry) => entry.row.id)).size;
       return wait({
         name: source.name, listed: source.entries.length, missing: lacking.length, files,
-        bytes: files * 9_437_184, destination: "/Users/dj/Music/PioneerDJ/Imported from Device", freeBytes: 128 * 1024 ** 3,
+        bytes: files * 9_437_184, destination: destination ?? "/Users/dj/Music/PioneerDJ/Imported from Device",
+        // A spec can make a picked folder's drive too small, for the OK
+        // rekordbox greys out when the files do not fit.
+        freeBytes: (destination && typeof window !== "undefined"
+          ? (window as unknown as { __mockPickedFreeBytes?: number }).__mockPickedFreeBytes
+          : undefined) ?? 128 * 1024 ** 3,
       });
     },
     explorerRoots: () => wait(EXPLORER_ROOTS.map((root) => ({ ...root }))),
@@ -3318,6 +3642,49 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       // A copy: the panel must not be able to edit the backend's own record.
       return wait({ ...detailsOf(row) });
     },
+    trackPlaylists: (trackId) => {
+      if (!ready) return notReady();
+      // Folder names above a playlist, as the real command's `path` holds
+      // them: ancestors walked back up the flat tree, joined and not named.
+      const pathOf = (id: string): string => {
+        let at = tree.findIndex((node) => node.id === id);
+        if (at < 0) return "";
+        let depth = tree[at]?.depth ?? 0;
+        const parents: string[] = [];
+        while (depth > 1) {
+          let holder = -1;
+          for (let i = at - 1; i >= 0; i -= 1) {
+            if ((tree[i]?.depth ?? 0) < depth) { holder = i; break; }
+          }
+          const parent = holder < 0 ? undefined : tree[holder];
+          if (parent?.kind !== "folder") break;
+          parents.push(parent.name);
+          at = holder;
+          depth = parent.depth;
+        }
+        return parents.reverse().join(" / ");
+      };
+      const seen = new Set<string>();
+      const result: { id: string; name: string; path: string }[] = [];
+      const add = (id: string) => {
+        if (seen.has(id)) return;
+        const node = tree.find((n) => n.id === id);
+        if (!node || (node.kind !== "playlist" && node.kind !== "smartPlaylist")) return;
+        seen.add(id);
+        result.push({ id, name: node.name, path: pathOf(id) });
+      };
+      for (const [id, members] of membership) {
+        if (members.includes(trackId)) add(id);
+      }
+      for (const node of tree) {
+        if (node.kind !== "playlist" && node.kind !== "smartPlaylist") continue;
+        if (membership.has(node.id)) continue;
+        const seeded = seededMembers(node.id).map((i) => all[i]?.id ?? "");
+        if (seeded.includes(trackId)) add(node.id);
+      }
+      // The real command's order the row repeats: path first, name second.
+      return wait(result.sort((a, b) => a.path.localeCompare(b.path) || a.name.localeCompare(b.name)));
+    },
     selectionDetails: (trackIds) => {
       if (!ready) return notReady();
       const rows = trackIds.flatMap((id) => all.filter((r) => r.id === id));
@@ -3339,11 +3706,15 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       wait({
         keys: [...KEYS],
         genres: GENRES.filter((g) => g !== ""),
-        myTagCategories: [
-          { name: "Situation", tags: [{ id: "t-peak", name: "Peak" }, { id: "t-warm", name: "Warm-up" }] },
-          { name: "Components", tags: [{ id: "t-synth", name: "Synth" }, { id: "t-vocal", name: "Vocal" }] },
-        ],
+        myTagCategories: myTagCategories.map((c) => ({ ...c, tags: c.tags.map((t) => ({ ...t })) })),
       }),
+    selectionMyTags: (trackIds) => {
+      if (!ready) return notReady();
+      const rows = trackIds.flatMap((id) => all.filter((r) => r.id === id));
+      const [head, ...rest] = rows.map(detailsOf);
+      if (!head) return wait([]);
+      return wait(head.myTags.filter((tag) => rest.every((d) => d.myTags.includes(tag))));
+    },
   };
 }
 
@@ -3365,6 +3736,13 @@ function readPlaylistFixtureFromUrl(): PlaylistFixture {
  * browser has no way to be on. `detected` hears two players and a mixer with
  * LINK off, `on` serves them, `blocked` reports the ports held.
  */
+/** `?played=1,2` marks those tracks as added to history by a player over LINK. */
+function readPlayedFromUrl(): string[] {
+  if (typeof location === "undefined") return [];
+  const raw = new URLSearchParams(location.search).get("played");
+  return raw ? raw.split(",").filter((id) => id !== "") : [];
+}
+
 function readLinkFromUrl(): "detected" | "on" | "blocked" | null {
   if (typeof location === "undefined") return null;
   const raw = new URLSearchParams(location.search).get("link");

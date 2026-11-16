@@ -17,7 +17,7 @@
  * value can be anything at all; none of those may produce a broken window.
  */
 import { asLayout, type PlayerLayout } from "./layout";
-import { DETAIL_BARS, ZOOM_STEPS } from "./player";
+import { DETAIL_BARS, JUMP_SIZE_ID, JUMP_SIZES, ZOOM_STEPS } from "./player";
 import type { RowDto, SortColumn, TreeNode } from "@/ipc/types";
 import { DEFAULT_SORT, type SortState } from "./viewSpec";
 
@@ -42,6 +42,8 @@ export interface Session {
   treeExpansion: TreeExpansion;
   sort: SortState;
   infoOpen: boolean;
+  /** The My Tag window, which shares the information window's place. */
+  myTagOpen: boolean;
   subOpen: boolean;
   /** Whether the track filter bar was showing. Its picks are not kept: a
    * library that opens already narrowed reads as a broken one. */
@@ -66,8 +68,17 @@ export interface Session {
   subTreeWidth: number;
   /** Which deck the browser's Traffic Light reads: the MASTER menu above the list. */
   trafficLight: TrafficLightSource;
+  /**
+   * The browser's artwork display pattern: the two buttons beside the MASTER
+   * menu. rekordbox keeps it in its browse settings as `ArtworkStatus-TrackList`
+   * (`<STATUS mode="0|1">`, 0 the upper part and the default), saved on every
+   * click, so it survives a restart there as it does here.
+   */
+  artworkMode: ArtworkMode;
   /** Bars visible across each deck's detail waveform. */
   waveformZoom: { a: number; b: number };
+  /** The beat-jump size each deck's menu had picked, by its id in JUMP_SIZES. */
+  jumpSize: { a: string; b: string };
   /** Whether DUAL CONTROL, which links both decks' zoom and beat jump, was on. */
   dualControl: boolean;
 }
@@ -90,6 +101,13 @@ export type TrafficLightSource = "master" | "a" | "b";
 
 const TRAFFIC_LIGHT_SOURCES: readonly TrafficLightSource[] = ["master", "a", "b"];
 
+/**
+ * rekordbox's `ArtworkStatus::ArtworkMode`: "partial" (mode 0) shows the upper
+ * part of each row's artwork, "full" (mode 1) the whole of it, in rows twice
+ * as tall with the Artwork column as wide as a row is tall.
+ */
+export type ArtworkMode = "partial" | "full";
+
 export const DEFAULT_TREE_WIDTH = 305;
 /** Measured from the 2026-09-09 capture: --s-sub-browse-w and --s-sub-tree-w. */
 export const DEFAULT_SUB_WIDTH = 878;
@@ -101,6 +119,7 @@ export const DEFAULT_SESSION: Session = {
   treeExpansion: { collapsed: [], expanded: [] },
   sort: DEFAULT_SORT,
   infoOpen: false,
+  myTagOpen: false,
   subOpen: false,
   filterOpen: false,
   tree: [],
@@ -110,7 +129,9 @@ export const DEFAULT_SESSION: Session = {
   subWidth: DEFAULT_SUB_WIDTH,
   subTreeWidth: DEFAULT_SUB_TREE_WIDTH,
   trafficLight: "master",
+  artworkMode: "partial",
   waveformZoom: { a: DETAIL_BARS, b: DETAIL_BARS },
+  jumpSize: { a: JUMP_SIZE_ID, b: JUMP_SIZE_ID },
   dualControl: false,
 };
 
@@ -148,6 +169,13 @@ function zoomOrDefault(value: unknown): number {
   return typeof value === "number" && ZOOM_STEPS.includes(value as (typeof ZOOM_STEPS)[number])
     ? value
     : DETAIL_BARS;
+}
+
+/** A jump size is one the menu offers; a renamed or hand-edited id is the default. */
+function jumpSizeOrDefault(value: unknown): string {
+  return typeof value === "string" && JUMP_SIZES.some((size) => size.id === value)
+    ? value
+    : JUMP_SIZE_ID;
 }
 
 /** Keeps only entries that are objects carrying a string id. */
@@ -188,6 +216,8 @@ export function sanitiseSession(value: unknown): Session {
     treeExpansion: treeExpansionOrDefault(raw.treeExpansion),
     sort: sortOrDefault(raw.sort),
     infoOpen: raw.infoOpen === true,
+    // One of the two at most: they share a place.
+    myTagOpen: raw.myTagOpen === true && raw.infoOpen !== true,
     subOpen: raw.subOpen === true,
     filterOpen: raw.filterOpen === true,
     tree: records<TreeNode>(raw.tree, SEEDED_NODES),
@@ -202,6 +232,7 @@ export function sanitiseSession(value: unknown): Session {
     trafficLight: TRAFFIC_LIGHT_SOURCES.includes(raw.trafficLight as TrafficLightSource)
       ? (raw.trafficLight as TrafficLightSource)
       : "master",
+    artworkMode: raw.artworkMode === "full" ? "full" : "partial",
     waveformZoom:
       typeof raw.waveformZoom === "object" && raw.waveformZoom !== null
         ? {
@@ -209,6 +240,13 @@ export function sanitiseSession(value: unknown): Session {
             b: zoomOrDefault((raw.waveformZoom as { b?: unknown }).b),
           }
         : { a: DETAIL_BARS, b: DETAIL_BARS },
+    jumpSize:
+      typeof raw.jumpSize === "object" && raw.jumpSize !== null
+        ? {
+            a: jumpSizeOrDefault((raw.jumpSize as { a?: unknown }).a),
+            b: jumpSizeOrDefault((raw.jumpSize as { b?: unknown }).b),
+          }
+        : { a: JUMP_SIZE_ID, b: JUMP_SIZE_ID },
     dualControl: raw.dualControl === true,
   };
 }

@@ -305,6 +305,24 @@ fn a_sync_keeps_the_settings_the_stick_already_carries() {
     export(dest.path(), &tracks, &one_list(&tracks)).unwrap();
     let after = StickSettings::read(&db).unwrap();
     assert_eq!(after, settings);
+
+    // export.pdb carries the categories, sorts and column too: a player that
+    // reads only it showed the defaults until #619.
+    let bytes = std::fs::read(dest.path().join("PIONEER/rekordbox/export.pdb")).unwrap();
+    let pdb = rbl_pdb::Pdb::parse(&bytes).unwrap();
+    let rows = |kind| {
+        let table = pdb.table(kind).unwrap();
+        pdb.rows(table).iter().map(|row| bytes[row.offset..row.offset + 8].to_vec()).collect::<Vec<_>>()
+    };
+    let (categories, sorts) = rbl_export::menu_rows(&settings);
+    assert_eq!(rows(rbl_pdb::PageType::Categories), categories);
+    assert_eq!(rows(rbl_pdb::PageType::Sorts), sorts);
+    // And the bytes themselves: GENRE shown eleventh, KEY the right column,
+    // COMMENTS no longer the right column.
+    assert!(rows(rbl_pdb::PageType::Categories).contains(&vec![0x01, 0x00, 0x01, 0x00, 0x63, 0x00, 0x0b, 0x00]));
+    let sorts_written = rows(rbl_pdb::PageType::Sorts);
+    assert!(sorts_written.contains(&vec![0x0b, 0x00, 0x0c, 0x00, 0x02, 0x07, 0x00, 0x00]));
+    assert!(sorts_written.contains(&vec![0x15, 0x00, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00]));
 }
 
 #[test]
@@ -508,4 +526,56 @@ fn an_older_record_without_the_copy_stamp_is_checked_by_hash_once() {
     assert_eq!((second.reused, second.bytes_copied), (0, 2048));
     assert_eq!(std::fs::read(&copy).unwrap()[0], 1, "the source's bytes are back");
     assert!(Manifest::load(dest.path()).unwrap().tracks[0].copy_stamp.is_some());
+}
+
+/// A track with its own cover: an `artwork.jpg` whose bytes are its id.
+fn with_artwork(dir: &std::path::Path, mut track: SourceTrack) -> SourceTrack {
+    let folder = dir.join(format!("art-{}", track.id));
+    std::fs::create_dir_all(&folder).unwrap();
+    let image = folder.join("artwork.jpg");
+    std::fs::write(&image, vec![track.id as u8; 512]).unwrap();
+    track.artwork = Some(image);
+    track
+}
+
+/// #626: adding a track whose cover comes first must not renumber every
+/// other cover on the stick. When it did, a sync of a few new tracks
+/// rewrote and republished the artwork of the whole library.
+#[test]
+fn a_new_cover_does_not_rewrite_the_covers_already_on_the_stick() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = common::stick();
+    let old: Vec<SourceTrack> = (1..=3)
+        .map(|id| with_artwork(src.path(), track(src.path(), id, &format!("Old {id}"), "A")))
+        .collect();
+    let first = export(dest.path(), &old, &one_list(&old)).unwrap();
+    assert_eq!(first.artwork_files, 12, "four files per cover");
+
+    // The new track comes first in the selection, as one added to the top
+    // of a playlist does.
+    let mut tracks = vec![with_artwork(src.path(), track(src.path(), 9, "New", "B"))];
+    tracks.extend(old);
+    let second = export(dest.path(), &tracks, &one_list(&tracks)).unwrap();
+    assert_eq!(second.artwork_files, 4, "only the new cover is written");
+}
+
+/// A removed track's cover frees its id, and the next new cover takes it:
+/// nothing deletes artwork files, so ids that only grew left a stick that
+/// filled with covers no track shows.
+#[test]
+fn a_new_cover_takes_the_id_a_removed_cover_left() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = common::stick();
+    let old: Vec<SourceTrack> = (1..=3)
+        .map(|id| with_artwork(src.path(), track(src.path(), id, &format!("Old {id}"), "A")))
+        .collect();
+    export(dest.path(), &old, &one_list(&old)).unwrap();
+
+    let mut tracks = vec![with_artwork(src.path(), track(src.path(), 9, "New", "B"))];
+    tracks.extend(old.into_iter().filter(|t| t.id != 2));
+    let second = export(dest.path(), &tracks, &one_list(&tracks)).unwrap();
+    assert_eq!(second.artwork_files, 4, "only the new cover is written");
+    let folder = dest.path().join("PIONEER/Artwork/00001");
+    assert!(folder.join("a2.jpg").is_file());
+    assert!(!folder.join("a4.jpg").exists(), "the new cover reuses id 2");
 }

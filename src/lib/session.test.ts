@@ -9,6 +9,7 @@ import {
   SEEDED_NODES,
   SEEDED_ROWS,
 } from "./session";
+import { JUMP_SIZE_ID } from "./player";
 import { DEFAULT_SORT } from "./viewSpec";
 import { CATALOGUE } from "./columns";
 
@@ -20,6 +21,7 @@ describe("sanitiseSession", () => {
       treeExpansion: { collapsed: ["folder-1"], expanded: ["dir:0:/Music"] },
       sort: { column: "bpm", descending: true },
       infoOpen: true,
+      myTagOpen: false,
       subOpen: false,
       filterOpen: true,
       tree: [{ id: "pl-7", name: "Set", kind: "playlist", depth: 1 }],
@@ -29,10 +31,21 @@ describe("sanitiseSession", () => {
       subWidth: 700,
       subTreeWidth: 240,
       trafficLight: "b",
+      artworkMode: "full",
       waveformZoom: { a: 4, b: 32 },
+      jumpSize: { a: "8bars", b: "fine" },
       dualControl: true,
     };
     expect(sanitiseSession(session)).toEqual(session);
+  });
+
+  it("opens on the upper part of the artwork unless the whole was chosen", () => {
+    // rekordbox's ArtworkStatus starts at mode 0, "Show the upper part of the
+    // artwork.", until the other button is clicked and saved.
+    expect(DEFAULT_SESSION.artworkMode).toBe("partial");
+    expect(sanitiseSession({}).artworkMode).toBe("partial");
+    expect(sanitiseSession({ artworkMode: "whole" }).artworkMode).toBe("partial");
+    expect(sanitiseSession({ artworkMode: "full" }).artworkMode).toBe("full");
   });
 
   it("gives a session from before the sub-browser had widths the measured ones", () => {
@@ -132,6 +145,23 @@ describe("sanitiseSession", () => {
       DEFAULT_SESSION.waveformZoom,
     );
     expect(sanitiseSession({}).waveformZoom).toEqual(DEFAULT_SESSION.waveformZoom);
+  });
+
+  it("restores only beat-jump sizes the menu offers, per deck", () => {
+    expect(sanitiseSession({ jumpSize: { a: "8bars", b: "16beats" } }).jumpSize).toEqual({
+      a: "8bars",
+      b: "16beats",
+    });
+    expect(sanitiseSession({ jumpSize: { a: "3beats", b: "8bars" } }).jumpSize).toEqual({
+      a: JUMP_SIZE_ID,
+      b: "8bars",
+    });
+    expect(sanitiseSession({ jumpSize: { a: 4, b: null } }).jumpSize).toEqual(
+      DEFAULT_SESSION.jumpSize,
+    );
+    expect(sanitiseSession({ jumpSize: "8bars" }).jumpSize).toEqual(DEFAULT_SESSION.jumpSize);
+    expect(sanitiseSession({}).jumpSize).toEqual(DEFAULT_SESSION.jumpSize);
+    expect(DEFAULT_SESSION.jumpSize).toEqual({ a: JUMP_SIZE_ID, b: JUMP_SIZE_ID });
   });
 
   it("remembers DUAL CONTROL across sessions, off unless it was left on", () => {

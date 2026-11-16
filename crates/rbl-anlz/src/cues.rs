@@ -4,10 +4,13 @@ use crate::Section;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExportCue {
-    /// Master database kind: memory=0, A-C=1-3, D-P=5-17.
+    /// Master database kind: memory=0, A-C=1-3, D-P=5-17, and 4 for the
+    /// memory loop set as the track's Active Loop.
     pub kind: u8,
     pub time_ms: u32,
     pub loop_time_ms: Option<u32>,
+    /// A memory cue's colour row, 1 (Pink) to 8 (Purple) or 0 for none: its
+    /// `djmdCue.Color` through [`memory_colour_row`]. 0 on a hot cue.
     pub color_id: u8,
     pub color_code: u8,
     pub comment: String,
@@ -17,13 +20,42 @@ pub struct ExportCue {
 }
 
 impl ExportCue {
+    /// The ANLZ hot-cue slot: 0 for a memory cue, 1-16 for A-P.
     pub fn slot(&self) -> u32 {
-        u32::from(if self.kind >= 5 {
-            self.kind - 1
-        } else {
-            self.kind
+        u32::from(match self.kind {
+            4 => 0,
+            kind if kind >= 5 => kind - 1,
+            kind => kind,
         })
     }
+
+    /// A memory cue or loop, the Active Loop (Kind 4) included: rekordbox
+    /// 7.2.19's `DatabaseMediator::getExportCue` @0x1009bc884 files kinds
+    /// 0 and 4 in the memory list [OBS static].
+    pub fn is_memory(&self) -> bool {
+        matches!(self.kind, 0 | 4)
+    }
+}
+
+/// The colour row a device is sent for a memory cue's `djmdCue.Color`: the
+/// eight colours, 0 (Pink) to 7 (Purple), are rows 1 to 8, and anything else
+/// (255, or the -1 rekordbox writes for No Color) is 0, no colour.
+///
+/// [OBS static, rekordbox 7.2.19 arm64] `PCP2`'s byte at `0x1c`
+/// (`DatabaseMediator::convert_cue_to_extPointdata` @0x1009bd51c: `Color + 1`
+/// when `Color <= 7`, else 0) and the LINK extended cue entry's byte at `0x3a`
+/// (`PSvDBMain::GetUsbCueExtSharedContent` @0x1018c9c98, the same test).
+pub fn memory_colour_row(color: i64) -> u8 {
+    u8::try_from(color).ok().filter(|c| *c <= 7).map_or(0, |c| c + 1)
+}
+
+/// The `djmdCue.Color` a device's memory colour row stands for, or `None`
+/// for none: [`memory_colour_row`] the other way. [OBS static, rekordbox
+/// 7.2.19 arm64] `CMusicAnalyzeFile::get_pmai_ext_specified_memcue_ext`
+/// @0x100f23590 reads `row - 1` for a row below 9 and 0xff (none) otherwise,
+/// so row 0 is none too.
+pub fn memory_colour_of_row(row: u8) -> Option<u8> {
+    (1..=8).contains(&row).then(|| row - 1)
 }
 
 fn put32(b: &mut [u8], at: usize, n: u32) {
@@ -46,7 +78,7 @@ pub fn sections(cues: &[ExportCue], extended: bool) -> Vec<Section> {
                 .iter()
                 .copied()
                 .filter(|c| {
-                    (c.kind != 0) == hot
+                    c.is_memory() != hot
                         && (modern
                             || if extended {
                                 hot && c.slot() > 3
@@ -289,5 +321,60 @@ mod tests {
             (2, 2000, 4000)
         );
         assert_eq!(&ext[3].payload[36..40], &[0, 4, 0, 1]);
+    }
+
+    /// The Active Loop is desktop Kind 4 (#577). rekordbox 7.2.19's
+    /// `getExportCue` @0x1009bc884 files it with the memory cues, hot slot 0,
+    /// and sets the PCPT word at 0x10 to 4; PCP2 has no such word, and the
+    /// entry is a loop there as in PCPT [OBS static].
+    #[test]
+    fn an_active_loop_is_exported_as_a_memory_loop_marked_active() {
+        let cues = vec![
+            ExportCue { kind: 1, time_ms: 500, ..Default::default() },
+            ExportCue {
+                kind: 4,
+                time_ms: 2000,
+                loop_time_ms: Some(4000),
+                active_loop: true,
+                color_id: 3,
+                ..Default::default()
+            },
+            ExportCue { kind: 5, time_ms: 9000, ..Default::default() },
+        ];
+        assert_eq!(cues[1].slot(), 0);
+        let dat = sections(&cues, false);
+        // PCPT entries are 56 bytes: one hot cue (A), one memory loop.
+        assert_eq!(dat[0].payload.len(), 56, "not a hot cue, not slot D");
+        assert_eq!(&dat[0].payload[12..16], &1_u32.to_be_bytes());
+        assert_eq!(dat[1].payload.len(), 56);
+        let memory = &dat[1].payload;
+        assert_eq!(&memory[12..16], &0_u32.to_be_bytes(), "hot slot 0");
+        assert_eq!(&memory[16..20], &4_u32.to_be_bytes(), "active");
+        assert_eq!(memory[28], 2, "a loop");
+        assert_eq!(&memory[32..40], &[0, 0, 7, 208, 0, 0, 15, 160], "2000 to 4000 ms");
+        let ext = sections(&cues, true);
+        let extended_hot = ext[2].as_cue_entries().unwrap();
+        assert_eq!(extended_hot.iter().map(|c| c.hot_cue).collect::<Vec<_>>(), [1, 4]);
+        let extended_memory = ext[3].as_cue_entries().unwrap();
+        assert_eq!(extended_memory.len(), 1);
+        assert_eq!((extended_memory[0].hot_cue, extended_memory[0].kind), (0, 2));
+        assert_eq!(extended_memory[0].color_id, 3, "a memory cue's colour");
+    }
+
+    /// #617: `djmdCue.Color` 0 (Pink) to 7 (Purple) goes to a device as rows
+    /// 1 to 8, none as 0, and a device's row comes back as the same Color.
+    #[test]
+    fn a_memory_cue_colour_is_one_row_up_on_a_device_and_back() {
+        let rows: Vec<u8> = (0..=7).map(memory_colour_row).collect();
+        assert_eq!(rows, [1, 2, 3, 4, 5, 6, 7, 8]);
+        for none in [255, -1, 8, 64, i64::from(u16::MAX)] {
+            assert_eq!(memory_colour_row(none), 0, "{none} is no colour");
+        }
+        let back: Vec<Option<u8>> = (0..=9).map(memory_colour_of_row).collect();
+        assert_eq!(
+            back,
+            [None, Some(0), Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), Some(7), None]
+        );
+        assert_eq!(memory_colour_of_row(255), None);
     }
 }

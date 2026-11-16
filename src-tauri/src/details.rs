@@ -72,6 +72,8 @@ pub struct MyTagDto {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MyTagCategoryDto {
+    /// `djmdMyTag.ID`: 1 to 4 in a library rekordbox made.
+    pub id: String,
     pub name: String,
     pub tags: Vec<MyTagDto>,
 }
@@ -156,6 +158,57 @@ fn details_dto(d: rbl_db::details::TrackDetails, has_artwork: bool) -> TrackDeta
     }
 }
 
+/// The playlists that hold a track, for the information panel's
+/// "Playlists" row. Smart playlists are tested one track at a time, so a
+/// track that their rule admits is listed too. Ordered by path, then name.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelatedPlaylistDto {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+}
+
+#[tauri::command]
+pub async fn track_playlists(
+    state: State<'_, Arc<AppState>>,
+    track: String,
+) -> AppResult<Vec<RelatedPlaylistDto>> {
+    let state = Arc::clone(&state);
+    blocking("track_playlists", move || {
+        let library = state.library()?;
+        let row = library
+            .row_of(&track)
+            .ok_or_else(|| AppError::new(ErrorKind::NotFound, "That track is no longer in the library.").with_detail(format!("track {track}")))?;
+        let indices = library.playlists_containing(row);
+        let playlists = library.playlists();
+        let mut out: Vec<RelatedPlaylistDto> = indices
+            // An index the id column no longer reaches is no playlist: a
+            // stale row lists nothing rather than a playlist "0".
+            .into_iter()
+            .filter_map(|index| {
+                let id = playlists.ids.get(index).copied()?;
+                let name = playlists.name(index).to_owned();
+                let mut parts = Vec::new();
+                let mut parent = playlists.parent.get(index).copied().unwrap_or(rbl_index::NO_ID);
+                while parent != rbl_index::NO_ID {
+                    let parent_index = parent as usize;
+                    if parent_index >= playlists.len() {
+                        break;
+                    }
+                    parts.push(playlists.name(parent_index).to_owned());
+                    parent = playlists.parent.get(parent_index).copied().unwrap_or(rbl_index::NO_ID);
+                }
+                parts.reverse();
+                Some(RelatedPlaylistDto { id: id.to_string(), name, path: parts.join(" / ") })
+            })
+            .collect();
+        out.sort_by(|a, b| a.path.cmp(&b.path).then(a.name.cmp(&b.name)));
+        Ok(out)
+    })
+    .await
+}
+
 /// Several tracks as the information panel shows them: the first one's
 /// record, how many there are, and which fields differ between them.
 #[derive(Debug, Clone, Serialize)]
@@ -221,7 +274,7 @@ pub async fn track_lookups(state: State<'_, Arc<AppState>>) -> AppResult<TrackLo
         let mut my_tag_categories: Vec<(String, MyTagCategoryDto)> = rows
             .iter()
             .filter(|t| t.attribute == 1)
-            .map(|t| (t.id.clone(), MyTagCategoryDto { name: t.name.clone(), tags: Vec::new() }))
+            .map(|t| (t.id.clone(), MyTagCategoryDto { id: t.id.clone(), name: t.name.clone(), tags: Vec::new() }))
             .collect();
         for tag in rows.iter().filter(|t| t.attribute == 0) {
             if let Some((_, category)) = my_tag_categories.iter_mut().find(|(id, _)| *id == tag.parent) {
@@ -245,17 +298,225 @@ pub async fn track_lookups(state: State<'_, Arc<AppState>>) -> AppResult<TrackLo
     .await
 }
 
-/// Sets the My Tags on a track to exactly the ids given.
+/// Sets the My Tags on a track to exactly the ids given. With `comments`
+/// (Add "My Tag" to the "Comments" on, #605) the track's comment is
+/// rewritten with them, in the same history entry.
 #[tauri::command]
 pub async fn set_my_tags<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, Arc<AppState>>,
     track: String,
     tags: Vec<String>,
+    comments: Option<bool>,
 ) -> AppResult<crate::dto::EditHistoryDto> {
     recorded_edit(app, state, "set_my_tags", Touched::Tracks, "Track Edit", move |w| {
-        w.set_my_tags_with_undo(&track, &tags).map(|(_, edit)| LibraryEdit::TrackTags(edit))
+        let (_, edit) = w.set_my_tags_with_undo(&track, &tags)?;
+        let tags = vec![edit];
+        let comments = if comments.unwrap_or(false) {
+            refresh_comments(w, std::slice::from_ref(&track), &tags)?
+        } else {
+            Vec::new()
+        };
+        Ok(LibraryEdit::TrackTags { tags, comments })
     }).await
+}
+
+/// Add "My Tag" to the "Comments" (#605): rewrites the comment of each of
+/// `tracks` with its My Tags, as rekordbox's `BrowseListViewer::
+/// updateCommentWithMyTag` does for every selected track after a My Tag
+/// edit, whether or not that track's own tags changed. A track no longer in
+/// the collection is passed over. On a failure the comments already
+/// written and `tags` are put back, and the error returned.
+fn refresh_comments(
+    w: &mut rbl_db::write::Writer,
+    tracks: &[String],
+    tags: &[rbl_db::write::TrackTagEdit],
+) -> Result<Vec<rbl_db::write::TrackEdit>, rbl_db::DbError> {
+    let mut comments: Vec<rbl_db::write::TrackEdit> = Vec::with_capacity(tracks.len());
+    for track in tracks {
+        let step = match w.has_track(track) {
+            Ok(false) => continue,
+            Ok(true) => w.refresh_my_tag_comment_with_undo(track),
+            Err(error) => Err(error),
+        };
+        match step {
+            Ok((_, edit)) => {
+                if !edit.is_empty() {
+                    comments.push(edit);
+                }
+            }
+            Err(error) => {
+                for applied in comments.iter().rev() {
+                    if let Err(undo) = w.undo_track_edit(applied) {
+                        tracing::error!(%undo, "a My Tag comment could not be put back after a failure");
+                    }
+                }
+                for applied in tags.iter().rev().filter(|edit| !edit.is_empty()) {
+                    if let Err(undo) = w.undo_tag_edit(applied) {
+                        tracing::error!(%undo, "a My Tag edit could not be put back after a failure");
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(comments)
+}
+
+/// The My Tags every one of `tracks` has: the ticks of the My Tag panel.
+#[tauri::command]
+pub async fn selection_my_tags(
+    state: State<'_, Arc<AppState>>,
+    tracks: Vec<String>,
+) -> AppResult<Vec<String>> {
+    let state = Arc::clone(&state);
+    blocking("selection_my_tags", move || {
+        state
+            .read_db(|db| Ok(rbl_db::details::shared_my_tags(db.connection(), &tracks)))
+            .map_err(write_error)
+    })
+    .await
+}
+
+/// A tick in the My Tag panel: `tag` goes on each of `tracks`, or comes
+/// off, as one step of history. Every track or none, as [`each_track`].
+/// With `comments` (Add "My Tag" to the "Comments" on, #605) each track's
+/// comment is rewritten too, in the same step.
+#[tauri::command]
+pub async fn put_my_tag<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, Arc<AppState>>,
+    tracks: Vec<String>,
+    tag: String,
+    on: bool,
+    comments: Option<bool>,
+) -> AppResult<crate::dto::EditHistoryDto> {
+    recorded_edit(app, state, "put_my_tag", Touched::Tracks, "Track Edit", move |w| {
+        let mut edits: Vec<rbl_db::write::TrackTagEdit> = Vec::with_capacity(tracks.len());
+        for track in &tracks {
+            let step = match w.has_track(track) {
+                Ok(false) => continue,
+                Ok(true) => w.put_my_tag_with_undo(track, &tag, on),
+                Err(error) => Err(error),
+            };
+            match step {
+                Ok((_, edit)) => {
+                    if !edit.is_empty() {
+                        edits.push(edit);
+                    }
+                }
+                Err(error) => {
+                    for applied in edits.iter().rev() {
+                        if let Err(undo) = w.undo_tag_edit(applied) {
+                            tracing::error!(%undo, "a My Tag edit could not be put back after a failure");
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let comments = if comments.unwrap_or(false) { refresh_comments(w, &tracks, &edits)? } else { Vec::new() };
+        Ok(LibraryEdit::TrackTags { tags: edits, comments })
+    }).await
+}
+
+/// Preferences > Advanced > Browse > My Tag > Add "My Tag" to the
+/// "Comments" turned on (`on`) or off (#605): every track with a My Tag has
+/// the tags written after its comment, or taken off, as one step of
+/// history. The window asks first, as rekordbox does ("This operation can
+/// take few minutes."), and changes the setting only once this succeeds.
+#[tauri::command]
+pub async fn write_my_tag_comments<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, Arc<AppState>>,
+    on: bool,
+) -> AppResult<crate::dto::EditHistoryDto> {
+    recorded_edit(app, state, "write_my_tag_comments", Touched::Tracks, "Track Edit", move |w| {
+        let (_, comments) = w.write_my_tag_comments_with_undo(on)?;
+        Ok(LibraryEdit::TrackTags { tags: Vec::new(), comments })
+    }).await
+}
+
+/// The tag Adding My Tag made.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewMyTagDto {
+    pub id: String,
+    pub name: String,
+}
+
+/// Adding My Tag: a new tag at the end of `category`, named "My Comment"
+/// or the first "My Comment (n)" the category does not have yet.
+#[tauri::command]
+pub async fn create_my_tag<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, Arc<AppState>>,
+    category: String,
+) -> AppResult<NewMyTagDto> {
+    let made = Arc::new(parking_lot::Mutex::new(None::<rbl_db::write::NewMyTag>));
+    let slot = Arc::clone(&made);
+    // A new tag is on no track yet, but the index's tag list (which the
+    // Track Filter's tag columns read) is loaded with the tracks, so they
+    // are read again; the user may keep "My Comment" without renaming it.
+    edit(app, state, "create_my_tag", Touched::Tracks, move |w| {
+        *slot.lock() = Some(w.create_my_tag(&category)?);
+        Ok(())
+    })
+    .await?;
+    let Some(made) = made.lock().take() else {
+        return Err(AppError::new(ErrorKind::Malformed, "The new My Tag was not made."));
+    };
+    Ok(NewMyTagDto { id: made.id, name: made.name })
+}
+
+/// Renames a My Tag or a category. The My Tag column shows names, so the
+/// track list is read again.
+///
+/// `comments` are the selected tracks while Add "My Tag" to the "Comments"
+/// is on (#605): their comments are rewritten with the new name, as
+/// rekordbox's `didChangeMyTagName` refreshes only the selected tracks.
+/// Not recorded, as the rename is not.
+#[tauri::command]
+pub async fn rename_my_tag<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    name: String,
+    comments: Option<Vec<String>>,
+) -> AppResult<u32> {
+    edit(app, state, "rename_my_tag", Touched::Tracks, move |w| {
+        w.rename_my_tag(&id, &name)?;
+        rewrite_comments(w, comments.as_deref().unwrap_or_default())
+    }).await
+}
+
+/// Deletes a My Tag and takes it off every track. Not undoable, and the
+/// history before it goes: an older tick could name the tag it removes.
+/// `comments` as for [`rename_my_tag`]: the selected tracks' comments lose
+/// the tag (rekordbox's `didDeleteMyTag`); other tracks keep theirs.
+#[tauri::command]
+pub async fn delete_my_tag<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    comments: Option<Vec<String>>,
+) -> AppResult<u32> {
+    crate::commands::permanent_edit(app, state, "delete_my_tag", Touched::Tracks, move |w| {
+        w.delete_my_tag(&id)?;
+        rewrite_comments(w, comments.as_deref().unwrap_or_default())
+    })
+    .await
+}
+
+/// The comment rewrite after a rename or a delete, which no history entry
+/// holds: each track still in the collection, written as it comes.
+fn rewrite_comments(w: &mut rbl_db::write::Writer, tracks: &[String]) -> Result<(), rbl_db::DbError> {
+    for track in tracks {
+        if w.has_track(track)? {
+            w.refresh_my_tag_comment_with_undo(track)?;
+        }
+    }
+    Ok(())
 }
 
 /// Add Artwork: the image at `image` is filed in the share tree and each of
@@ -286,10 +547,12 @@ pub async fn add_playlist_artwork<R: tauri::Runtime>(
     playlist: String,
     image: String,
 ) -> AppResult<u32> {
-    edit(app, state, "add_playlist_artwork", Touched::Playlists, move |w| {
-        w.set_playlist_artwork(&playlist, Some(std::path::Path::new(&image))).map(|_| ())
+    recorded_edit(app, state, "add_playlist_artwork", Touched::Playlists, "Add Artwork", move |w| {
+        w.set_playlist_artwork_with_undo(&playlist, Some(std::path::Path::new(&image)))
+            .map(|(_, edit)| LibraryEdit::PlaylistEdit(edit))
     })
     .await
+    .map(|history| history.generation)
 }
 
 /// Delete Artwork: each of `tracks` points at no image; the files stay.
@@ -341,11 +604,14 @@ pub async fn set_track_field<R: tauri::Runtime>(
         let state = Arc::clone(&state);
         let writing = Arc::clone(&state);
         let reported = track.clone();
-        if let Some(editor) = app.try_state::<Arc<crate::grid::GridEditor>>() {
-            if editor.is_locked(&track) { return Err(AppError::new(ErrorKind::ReadOnly, "The beat grid is locked. Unlock it to edit.")); }
-        }
-        blocking("set_track_bpm", move || crate::grid::set_tempo(&writing, &track, &value)).await?;
-        if let Some(editor) = app.try_state::<Arc<crate::grid::GridEditor>>() { editor.forget_history(&reported); }
+        let Some(editor) = app.try_state::<Arc<crate::grid::GridEditor>>().map(|editor| Arc::clone(&editor)) else {
+            return Err(AppError::internal("the grid editor is not running"));
+        };
+        if editor.is_locked(&track) { return Err(AppError::new(ErrorKind::ReadOnly, "The beat grid is locked. Unlock it to edit.")); }
+        // Recorded in the track's grid history as the grid editor's Set
+        // Tempo, so the grid panel's Undo puts back the grid and the BPM
+        // together and the track's earlier grid edits stay undoable (#505).
+        blocking("set_track_bpm", move || crate::grid::set_tempo(&writing, &editor, &track, &value)).await?;
         let _ = tauri::Emitter::emit(&app, "grid:changed", reported);
         let generation = crate::commands::reload(app.clone(), state.clone()).await?;
         let dto = {
@@ -370,37 +636,29 @@ pub async fn set_track_field<R: tauri::Runtime>(
     // differs [static 7.2.19 `TrackInfoConcreteMediator::updateDB`
     // @0x100371814; #279], so a file whose key already matched, or a cleared
     // key on a track that had none, is not rewritten.
-    let key_tag = (which == rbl_db::write::TrackField::Key && write_key_tag == Some(true))
-        .then(|| (Arc::new(parking_lot::Mutex::new(Vec::<String>::new())), value.trim().to_owned()));
-    let changed = key_tag.as_ref().map(|(changed, _)| Arc::clone(changed));
-    let shared = Arc::clone(&state);
-    let dto = recorded_edit(app, state, "set_track_field", Touched::Tracks, "Track Edit", move |w| {
-        each_track(w, &tracks, |w, track| {
-            let step = w.set_field_with_undo(track, which, &value)?;
-            if let Some(changed) = &changed {
-                if !step.1.is_empty() {
-                    changed.lock().push(track.to_owned());
-                }
-            }
-            Ok(step)
-        })
-    })
-    .await?;
-    if let Some((changed, key)) = key_tag {
-        let tracks = std::mem::take(&mut *changed.lock());
-        if tracks.is_empty() {
-            return Ok(dto);
+    //
+    // The files are written under the edit gate, right after the library,
+    // and the history entry keeps each one written with the key its tag
+    // held, so Undo and Redo put the file back with the library (#507).
+    let key_tag = which == rbl_db::write::TrackField::Key && write_key_tag == Some(true);
+    let library = if key_tag { Some(state.library()?) } else { None };
+    let key = value.trim().to_owned();
+    recorded_edit(app, state, "set_track_field", Touched::Tracks, crate::commands::TRACK_EDIT, move |w| {
+        let edit = each_track(w, &tracks, |w, track| w.set_field_with_undo(track, which, &value))?;
+        let (Some(library), LibraryEdit::Track(steps)) = (library, &edit) else { return Ok(edit) };
+        let files: Vec<_> = steps
+            .iter()
+            .filter_map(|step| {
+                let track = step.content();
+                let row = library.row_of(track)?;
+                crate::key_tag::write_recorded(track, library.folder_path.get(row as usize), &key)
+            })
+            .collect();
+        if files.is_empty() {
+            return Ok(edit);
         }
-        let library = shared.library()?;
-        blocking("write_key_tag", move || {
-            for track in &tracks {
-                if let Some(row) = library.row_of(track) {
-                    crate::key_tag::write_logged(track, library.folder_path.get(row as usize), &key);
-                }
-            }
-            Ok(())
-        })
-        .await?;
-    }
-    Ok(dto)
+        let LibraryEdit::Track(tracks) = edit else { return Ok(edit) };
+        Ok(LibraryEdit::KeyEdit { tracks, files })
+    })
+    .await
 }

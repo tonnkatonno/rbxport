@@ -5,12 +5,84 @@
  * The rules asserted here are the ones `crates/rbl-db/tests/writes.rs` asserts
  * on the other side.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createMockBackend } from "./backend-mock";
 import { TREE_ROOT } from "./types";
 
+describe("related playlists", () => {
+  it("lists edited playlists a track belongs to, alongside the seeded ones", async () => {
+    const backend = createMockBackend({ trackCount: 20 });
+    const track = "100000";
+    const before = new Set((await backend.playlistTree()).map((node) => node.id));
+    await backend.edits.createPlaylist("Alpha", TREE_ROOT);
+    await backend.edits.createPlaylist("Beta", TREE_ROOT);
+    const [alpha = "", beta = ""] = (await backend.playlistTree())
+      .filter((node) => !before.has(node.id)).map((node) => node.id);
+    await backend.edits.addTracksToPlaylist(alpha, [track], false);
+    await backend.edits.addTracksToPlaylist(beta, [track], true);
+    expect((await backend.trackPlaylists(track)).map((p) => p.name))
+      .toEqual(expect.arrayContaining(["Alpha", "Beta"]));
+  });
+
+  it("leaves a playlist out once the track has been taken off it", async () => {
+    const backend = createMockBackend({ trackCount: 20 });
+    const track = "100000";
+    const id = (await backend.playlistTree()).filter((node) => node.kind === "playlist")[0]?.id ?? "";
+    await backend.edits.addTracksToPlaylist(id, [track], false);
+    await backend.edits.removeTracksFromPlaylist(id, [track]);
+    expect((await backend.trackPlaylists(track)).map((p) => p.id)).not.toContain(id);
+  });
+
+  it("spells the folders above a playlist as its path, ordered path then name", async () => {
+    const backend = createMockBackend({ trackCount: 20 });
+    const track = "100000";
+    await backend.edits.createPlaylist("Alpha", TREE_ROOT);
+    await backend.edits.createFolder("Gigs", TREE_ROOT);
+    const gigs = (await backend.playlistTree()).find((node) => node.name === "Gigs");
+    await backend.edits.createPlaylist("Friday", gigs?.id ?? TREE_ROOT);
+    const friday = (await backend.playlistTree()).find((node) => node.name === "Friday")?.id ?? "";
+    await backend.edits.addTracksToPlaylist(friday, [track], false);
+    const got = await backend.trackPlaylists(track);
+    expect(got).toEqual(expect.arrayContaining([{ id: friday, name: "Friday", path: "Gigs" }]));
+    // The real command sorts by path, then name, and the tree repeats that.
+    const names = got.map((p) => p.name);
+    expect(names.indexOf("Alpha")).toBeLessThan(names.indexOf("Friday"));
+  });
+});
+
 describe("mock edits", () => {
+  it("sorts a folder's children by name as one Undo step, as sort_playlist_items does", async () => {
+    const backend = createMockBackend({ trackCount: 20 });
+    await backend.edits.createFolder("Crate", TREE_ROOT);
+    const folder = (await backend.playlistTree()).find((n) => n.name === "Crate")!;
+    await backend.edits.createFolder("Bravo", folder.id);
+    const bravo = (await backend.playlistTree()).find((n) => n.name === "Bravo")!;
+    await backend.edits.createPlaylist("zulu", bravo.id);
+    for (const name of ["delta", "élan", "alpha", "elan"]) await backend.edits.createPlaylist(name, folder.id);
+    const children = async () => {
+      const tree = await backend.playlistTree();
+      const at = tree.findIndex((n) => n.id === folder.id);
+      const out: string[] = [];
+      for (let i = at + 1; i < tree.length && (tree[i]?.depth ?? 0) > folder.depth; i += 1) {
+        if (tree[i]?.depth === folder.depth + 1) out.push(tree[i]!.name);
+      }
+      return out;
+    };
+    expect(await children()).toEqual(["Bravo", "delta", "élan", "alpha", "elan"]);
+    const history = await backend.edits.sortItems(folder.id, "en");
+    expect(history.undoLabel).toBe("Sort Items");
+    expect(await children()).toEqual(["alpha", "Bravo", "delta", "elan", "élan"]);
+    // The folder keeps what is inside it.
+    const tree = await backend.playlistTree();
+    expect(tree[tree.findIndex((n) => n.name === "Bravo") + 1]?.name).toBe("zulu");
+    // Sorted already: nothing recorded.
+    expect((await backend.edits.sortItems(folder.id, "en")).undoLabel).toBe("Sort Items");
+    await backend.edits.undoEdit();
+    expect(await children()).toEqual(["Bravo", "delta", "élan", "alpha", "elan"]);
+    await expect(backend.edits.sortItems(tree.find((n) => n.name === "alpha")!.id)).rejects.toThrow();
+  });
+
   it("bumps the generation on every edit, as a real write does", async () => {
     const backend = createMockBackend({ trackCount: 20 });
     const first = await backend.edits.createPlaylist("A", TREE_ROOT);
@@ -108,12 +180,13 @@ describe("mock edits", () => {
     const before = await topLevel();
 
     // One drop: the clash replaced at index 0, then a new folder at the
-    // drop's same index, then a playlist made later; none but the first is
-    // in the history.
+    // drop's same index, then a playlist made later by another drop; none
+    // but the first is in the history (a playlist made from the menu would
+    // be, since #500).
     const replaced = await backend.importFolderPlaylist("/music/Warm Up", TREE_ROOT, old.id, 0);
     const fresh = await backend.importFolderPlaylist("/music/Brand New", TREE_ROOT, undefined, replaced.at);
-    await backend.edits.createPlaylist("Later", TREE_ROOT);
-    const later = (await backend.playlistTree()).find((n) => n.name === "Later")!;
+    const laterDrop = await backend.importFolderPlaylist("/music/Later", TREE_ROOT, undefined, null);
+    const later = (await backend.playlistTree()).find((n) => n.id === laterDrop.playlist)!;
     const dropped = await topLevel();
     expect(dropped.slice(0, 2)).toEqual([fresh.playlist, replaced.playlist]);
 
@@ -126,17 +199,77 @@ describe("mock edits", () => {
     expect(await topLevel()).toEqual(dropped);
   });
 
-  it("refuses to undo a Replace existing once its playlist changed, and keeps the entry (#426)", async () => {
+  it("refuses to undo a Replace existing once its playlist changed, and drops only that entry (#426, #506)", async () => {
     const backend = createMockBackend({ trackCount: 20 });
     await backend.edits.createPlaylist("Warm Up", TREE_ROOT);
     const old = (await backend.playlistTree()).find((n) => n.name === "Warm Up")!;
     const replaced = await backend.importFolderPlaylist("/music/Warm Up", TREE_ROOT, old.id, null);
-    await backend.edits.addTracksToPlaylist(replaced.playlist!, ["100003"]);
+    await backend.edits.addTracksToPlaylist(replaced.playlist!, ["100003", "100004"]);
+    // Another program takes one out again. The mock has no second writer;
+    // Remove from History writes the list's tracks outside the history.
+    await backend.edits.removeFromHistory(replaced.playlist!, ["100004"]);
     const tree = (await backend.playlistTree()).map((n) => n.id);
-    await expect(backend.edits.undoEdit()).rejects.toThrow("can no longer be undone");
+    // The add (#499) is refused first, then the replacement.
+    await expect(backend.edits.undoEdit()).rejects.toMatchObject({
+      kind: "conflict",
+      message: "Can't undo Add Tracks to Playlist: the playlist's tracks have changed since. The newer change was kept.",
+    });
+    await expect(backend.edits.undoEdit()).rejects.toMatchObject({
+      kind: "conflict",
+      message: "Can't undo Replace Playlist: the playlists have changed since. The newer change was kept.",
+    });
     expect((await backend.playlistTree()).map((n) => n.id)).toEqual(tree);
-    // Kept on top, as the real backend keeps it: the next Undo refuses too.
-    await expect(backend.edits.undoEdit()).rejects.toThrow("can no longer be undone");
+    // Gone, as the real backend drops it, so it blocks nothing older: next
+    // is the replaced playlist's own creation, which is refused too since
+    // the replacement took it away (#500).
+    await expect(backend.edits.undoEdit()).rejects.toMatchObject({
+      kind: "conflict",
+      message: "Can't undo Create Playlist: the playlist is no longer there. The newer change was kept.",
+    });
+    await expect(backend.edits.undoEdit()).rejects.toThrow("no library edit to undo");
+  });
+
+  it("undoes and redoes a playlist, folder and intelligent playlist creation, one step each (#500)", async () => {
+    const backend = createMockBackend({ trackCount: 20 });
+    const ids = async () => (await backend.playlistTree()).map((n) => n.id);
+    const before = await ids();
+    await backend.edits.createFolder("Crates", TREE_ROOT);
+    const folder = (await backend.playlistTree()).find((n) => n.name === "Crates")!;
+    await backend.edits.createPlaylist("Friday", folder.id);
+    await backend.edits.createSmartPlaylist("Sevens", TREE_ROOT, { logic: "all", conditions: [] });
+    await backend.edits.setSmartRule((await backend.playlistTree()).find((n) => n.name === "Sevens")!.id, {
+      logic: "any",
+      conditions: [],
+    });
+    const after = await ids();
+
+    expect(await backend.edits.undoEdit()).toMatchObject({ redoLabel: "Edit Intelligent Playlist", undoLabel: "Create Intelligent Playlist" });
+    expect(await backend.edits.undoEdit()).toMatchObject({ undoLabel: "Create Playlist" });
+    expect(await backend.edits.undoEdit()).toMatchObject({ undoLabel: "Create Folder" });
+    expect(await backend.edits.undoEdit()).toMatchObject({ canUndo: false });
+    expect(await ids()).toEqual(before);
+    for (let i = 0; i < 4; i += 1) await backend.edits.redoEdit();
+    expect(await ids()).toEqual(after);
+  });
+
+  it("refuses to undo a creation once something was put in it, and keeps it (#500, #506)", async () => {
+    const backend = createMockBackend({ trackCount: 20 });
+    await backend.edits.createPlaylist("Friday", TREE_ROOT);
+    const friday = (await backend.playlistTree()).find((n) => n.name === "Friday")!;
+    await backend.edits.addTracksToPlaylist(friday.id, ["100001", "100002"]);
+    // Another program takes one out again, so the add (#499) is refused
+    // first. The mock has no second writer; Remove from History writes the
+    // list's tracks outside the history.
+    await backend.edits.removeFromHistory(friday.id, ["100002"]);
+    await expect(backend.edits.undoEdit()).rejects.toMatchObject({
+      kind: "conflict",
+      message: "Can't undo Add Tracks to Playlist: the playlist's tracks have changed since. The newer change was kept.",
+    });
+    await expect(backend.edits.undoEdit()).rejects.toMatchObject({
+      kind: "conflict",
+      message: "Can't undo Create Playlist: tracks have been added to the playlist since. The newer change was kept.",
+    });
+    expect((await backend.playlistTree()).some((n) => n.id === friday.id)).toBe(true);
   });
 
   it("clears library redo when a new edit branches from an undo", async () => {
@@ -181,6 +314,62 @@ describe("mock edits", () => {
     expect(generation).toBeGreaterThan(4);
   });
 
+  it("undoes one add sent in slices, and a reorder, as one step each (#499)", async () => {
+    const backend = createMockBackend({ trackCount: 20 });
+    await backend.edits.createPlaylist("Set", TREE_ROOT);
+    const list = (await backend.playlistTree()).find((n) => n.name === "Set")!;
+    const order = async () => (await backend.fetchRows(
+      (await backend.openView({ source: { kind: "playlist", id: list.id }, sort: "trackNo", descending: false, query: "" })).viewId,
+      0, 20,
+    )).map((row) => row.id);
+
+    await backend.edits.addTracksToPlaylist(list.id, ["100000"]);
+    await backend.edits.addTracksToPlaylist(list.id, ["100001", "100002"], false, "job-499");
+    await backend.edits.addTracksToPlaylist(list.id, ["100003"], false, "job-499");
+    expect(await order()).toEqual(["100000", "100001", "100002", "100003"]);
+    await backend.edits.reorderPlaylist(list.id, ["100003", "100000"]);
+    expect(await order()).toEqual(["100003", "100000", "100001", "100002"]);
+
+    expect((await backend.edits.undoEdit()).undoLabel).toBe("Add Tracks to Playlist");
+    expect(await order()).toEqual(["100000", "100001", "100002", "100003"]);
+    const undone = await backend.edits.undoEdit();
+    expect(await order()).toEqual(["100000"]);
+    expect(undone.redoLabel).toBe("Add Tracks to Playlist");
+    await backend.edits.redoEdit();
+    expect(await order()).toEqual(["100000", "100001", "100002", "100003"]);
+    expect((await backend.edits.redoEdit()).undoLabel).toBe("Reorder Playlist");
+    expect(await order()).toEqual(["100003", "100000", "100001", "100002"]);
+  });
+
+  it("undoes Remove from Tag List and Clear Tag List one step each, in order, and refuses a list changed since (#508)", async () => {
+    const backend = createMockBackend({ trackCount: 20 });
+    const tagged = async () => (await backend.fetchRows(
+      (await backend.openView({ source: { kind: "tagList" }, sort: "trackNo", descending: false, query: "" })).viewId,
+      0, 20,
+    )).map((row) => row.id);
+    await backend.edits.addToTagList(["100003", "100001", "100004", "100002"]);
+    await backend.edits.removeFromTagList(["100001", "100002"]);
+    expect(await tagged()).toEqual(["100003", "100004"]);
+    await backend.edits.clearTagList();
+    expect(await tagged()).toEqual([]);
+
+    expect(await backend.edits.undoEdit()).toMatchObject({ undoLabel: "Remove from Tag List", redoLabel: "Clear Tag List" });
+    expect(await tagged()).toEqual(["100003", "100004"]);
+    await backend.edits.undoEdit();
+    expect(await tagged()).toEqual(["100003", "100001", "100004", "100002"]);
+    expect(await backend.edits.redoEdit()).toMatchObject({ undoLabel: "Remove from Tag List" });
+    expect(await tagged()).toEqual(["100003", "100004"]);
+
+    // A removal of nothing records nothing; a tag added since refuses the Undo.
+    await backend.edits.removeFromTagList(["100009"]);
+    await backend.edits.addToTagList(["100007"]);
+    await expect(backend.edits.undoEdit()).rejects.toMatchObject({
+      kind: "conflict",
+      message: "Can't undo Remove from Tag List: the Tag List has changed since. The newer change was kept.",
+    });
+    expect(await tagged()).toEqual(["100003", "100004", "100007"]);
+  });
+
   it("clamps a rating to the range the backend accepts", async () => {
     const backend = createMockBackend({ trackCount: 20 });
     await backend.edits.setTrackRating(["100000"], 9);
@@ -205,6 +394,27 @@ describe("mock edits", () => {
     await backend.edits.undoEdit();
     for (const id of ids) expect((await backend.trackDetails(id)).rating).not.toBe(4);
     expect((await backend.trackDetails("100001")).genre).toBe("Techno");
+  });
+
+  it("records an info-panel BPM as the grid's Set Tempo and keeps the earlier grid Undo (#505)", async () => {
+    const backend = createMockBackend({ trackCount: 20 });
+    let id = "";
+    for (let n = 100000; n < 100020 && !id; n++) {
+      if (await backend.gridState(String(n)).then(() => true, () => false)) id = String(n);
+    }
+    expect(id).not.toBe("");
+    const original = (await backend.gridState(id)).bpmX100;
+    await backend.edits.gridEdit(id, { kind: "nudge", ms: 5 });
+    await backend.edits.setTrackField([id], "bpm", "150");
+    const typed = await backend.gridState(id);
+    expect(typed.bpmX100).toBe(15_000);
+    expect(typed.undoLabel).toBe("Set Tempo");
+    expect((await backend.trackDetails(id)).bpmX100).toBe(15_000);
+    const undone = await backend.edits.gridUndo(id);
+    expect(undone.bpmX100).toBe(original);
+    expect(undone.undoLabel).toBe("Shift Beat Grid Right");
+    expect((await backend.trackDetails(id)).bpmX100).toBe(original);
+    expect((await backend.edits.gridRedo(id)).bpmX100).toBe(15_000);
   });
 
   it("refuses a title for several tracks, as rekordbox greys the box", async () => {
@@ -339,5 +549,45 @@ describe("mock File Created column (#308)", () => {
     const known = values.slice(2) as number[];
     expect(known.every((value) => typeof value === "number")).toBe(true);
     expect([...known].sort((a, b) => a - b)).toEqual(known);
+  });
+});
+
+describe("mock Relocate Undo (#502)", () => {
+  // The mock's relocate keeps what it was asked on `window`.
+  afterEach(() => vi.unstubAllGlobals());
+  const backendWithMissing = () => {
+    vi.stubGlobal("window", {});
+    return createMockBackend({ trackCount: 20, missingEvery: 5 });
+  };
+  const missingIds = async (backend: ReturnType<typeof createMockBackend>) =>
+    (await backend.missingTracks(0, 100, true)).tracks.map((track) => track.id);
+
+  it("undoes one Relocate and one Relocate by location as one step each", async () => {
+    const backend = backendWithMissing();
+    const missing = await missingIds(backend);
+    expect(missing.length).toBe(4);
+    const [first = "", ...rest] = missing;
+
+    expect(await backend.relocateTrack(first, "/Users/mock/Music/Moved/a.mp3")).toBe(true);
+    expect(await backend.relocateByLocation(rest, "/old", "/new")).toBe(3);
+    expect(await missingIds(backend)).toEqual([]);
+
+    const undone = await backend.edits.undoEdit();
+    expect(undone).toMatchObject({ undoLabel: "Relocate", redoLabel: "Relocate" });
+    expect(await missingIds(backend)).toEqual(rest);
+    await backend.edits.undoEdit();
+    expect(await missingIds(backend)).toEqual(missing);
+    await backend.edits.redoEdit();
+    expect(await missingIds(backend)).toEqual(rest);
+  });
+
+  it("undoes an Auto Relocate run as one step", async () => {
+    const backend = backendWithMissing();
+    const missing = await missingIds(backend);
+    const report = await backend.autoRelocate({ folders: ["/x"], music: false, video: false, desktop: false }, null);
+    expect(report.relocated).toBe(2);
+    const history = await backend.edits.undoEdit();
+    expect(history).toMatchObject({ canUndo: false, redoLabel: "Relocate" });
+    expect(await missingIds(backend)).toEqual(missing);
   });
 });

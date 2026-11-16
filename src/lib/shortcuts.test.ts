@@ -50,9 +50,9 @@ describe("actionFor", () => {
     expect(actionFor({ key: "ArrowUp", ctrlKey: true }, WIN)).toBe("toTop");
   });
 
-  it("loads Player 1 on plain Enter, but leaves modified Enter alone", () => {
+  it("loads Player 1 on plain Enter and Player 2 on Shift+Enter, but leaves other modified Enter alone", () => {
     expect(actionFor({ key: "Enter" }, MAC)).toBe("loadPlayer1");
-    expect(actionFor({ key: "Enter", shiftKey: true }, MAC)).toBe("loadPlayer1");
+    expect(actionFor({ key: "Enter", shiftKey: true }, MAC)).toBe("loadPlayer2");
     expect(actionFor({ key: "Enter", metaKey: true }, MAC)).toBeNull();
     expect(actionFor({ key: "Enter", ctrlKey: true }, WIN)).toBeNull();
   });
@@ -506,5 +506,24 @@ describe("PERFORMANCE mode's fixed-distance beat jumps", () => {
     expect(matchBinding({ key: "ArrowRight", metaKey: true, altKey: true }, MAC)).toBeNull();
     // Not while typing into a field.
     expect(dispatch({ key: "ArrowRight", metaKey: true, altKey: true }, MAC, { tagName: "INPUT" }, overrides)).toBeNull();
+  });
+});
+
+describe("Sort Items (#443)", () => {
+  const binding = BINDINGS.find((b) => b.action === "sortItems");
+
+  it("is rekordbox's Playlist command 0x500d, which no preset binds", () => {
+    expect(binding).toMatchObject({ group: "Playlist", label: "Sort Items", command: "500d" });
+    expect(binding?.chord.key).toBe("");
+    for (const chord of [{ key: "s" }, { key: "s", metaKey: true }]) {
+      expect(actionFor(chord, MAC)).not.toBe("sortItems");
+      expect(actionFor(chord, WIN)).not.toBe("sortItems");
+    }
+  });
+
+  it("answers the key the Keyboard pane gives it", () => {
+    const overrides = { sortItems: { key: "s", metaKey: true, altKey: true } };
+    expect(actionFor({ key: "s", metaKey: true, altKey: true }, MAC, overrides)).toBe("sortItems");
+    expect(actionFor({ key: "s", ctrlKey: true, altKey: true }, WIN, overrides)).toBe("sortItems");
   });
 });

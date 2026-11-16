@@ -157,6 +157,9 @@ pub fn interfaces() -> Vec<InterfaceDto> {
     rbl_link::interfaces().iter().map(InterfaceDto::from).collect()
 }
 
+/// Tells the window which rows to colour as played has changed (#540).
+pub const PLAYED_CHANGED: &str = "played:changed";
+
 /// Tells the window the library changed: an event name and its payload,
 /// the generation for `library:changed`, the track's id for `cues:changed`.
 pub type LibraryEvents = Arc<dyn Fn(&'static str, serde_json::Value) + Send + Sync>;
@@ -268,6 +271,10 @@ impl Source for StateSource {
 
     fn remove_from_history(&self, history: u32, track: u32) -> bool {
         self.history_write(Vec::new(), |writer| writer.remove_from_history(&history.to_string(), &[track.to_string()])).is_some()
+    }
+
+    fn played_changed(&self) {
+        (self.1)(PLAYED_CHANGED, serde_json::Value::Null);
     }
 
     fn library(&self) -> Option<Arc<rbl_index::Library>> {
@@ -502,6 +509,7 @@ impl Session {
             chosen,
             Ports::REKORDBOX,
             Some(unsupported_command_reporter),
+            state.link_played(),
         )
         .map_err(|e| e.to_string())?;
         let rx3_activation = match rx3 {
@@ -941,7 +949,7 @@ mod grid_offset_tests {
             rbl_prolink::DeviceSettings::default(),
             rbl_link::KeyOrder::Musical,
         );
-        let catalog = rbl_link::IndexCatalog::new(Arc::new(source), rbl_link::Played::default());
+        let catalog = rbl_link::IndexCatalog::new(Arc::new(source), rbl_link::Played::default()).with_colour(state.link_played());
         // The fixture's own histories are not the menu.
         assert!(!state.library().unwrap().histories().is_empty());
         assert_eq!(catalog.list(&Query::Histories), [] as [rbl_dbserver::catalog::Row; 0]);
@@ -957,7 +965,14 @@ mod grid_offset_tests {
         let tracks = catalog.list(&Query::Tracks { scope: TrackScope::History(*session), sort: Sort::Default });
         assert_eq!(tracks, vec![Row::Track { id: track, position: 1 }]);
         assert_eq!(state.library().unwrap().play_count[row], before + 1);
-        assert_eq!(notifications.lock().unwrap().last(), Some(&("library:changed", state.summary().3.into())));
+        // The window hears of the history, then of the played mark (#540).
+        let heard = notifications.lock().unwrap().clone();
+        assert_eq!(heard[heard.len() - 2..], [
+            ("library:changed", state.summary().3.into()),
+            (PLAYED_CHANGED, serde_json::Value::Null),
+        ]);
+        assert!(state.link_played().contains(track));
+        assert_eq!(state.played_tracks(), [] as [String; 0], "LINK is off in this test, so nothing is coloured");
 
         // Persisted: a fresh read of the database has the session and the play.
         let reopened = state.open_read_only().unwrap();
@@ -1106,5 +1121,77 @@ mod grid_offset_tests {
         }
         assert_eq!(std::fs::read(&dat).unwrap(), original);
         assert!(save_grid_offset(&state, "999999", 234).is_err());
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    /// #506: a rating recorded in the window, then changed by a player over
+    /// LINK. Undo refuses to put the old rating back over the player's, says
+    /// why, and drops only that entry: the rename before it still undoes.
+    /// The LINK write also ends the Redo branch, as any write the history
+    /// does not record does, and the window is told.
+    #[test]
+    fn undo_keeps_a_rating_a_player_set_over_link_and_the_rest_of_the_history() {
+        use tauri::async_runtime::block_on as run;
+        use tauri::{Listener, Manager};
+        let dir = tempfile::tempdir().unwrap();
+        let location = rbl_db::fixture::build(dir.path(), rbl_db::fixture::Shape::default()).unwrap();
+        let db = rbl_db::Library::open(location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
+        let (library, _) = rbl_index::load(&db).unwrap();
+        let state = Arc::new(AppState::with_backups(dir.path().join("backups")));
+        state.set_library(library, false, db.schema().db_version, 0, location);
+        crate::backups::create(&state).unwrap();
+        let ended = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&ended);
+        state.on_history_changed(move || { counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst); });
+        let app = tauri::test::mock_app();
+        app.manage(Arc::clone(&state));
+        let announced = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let heard = Arc::clone(&announced);
+        app.listen("edit-history:changed", move |event| {
+            heard.lock().unwrap().push(serde_json::from_str(event.payload()).unwrap());
+        });
+        let source = StateSource(
+            Arc::downgrade(&state),
+            Arc::new(|_, _| {}),
+            rbl_prolink::DeviceSettings::default(),
+            rbl_link::KeyOrder::Musical,
+        );
+        let id = rbl_db::fixture::track_id(1);
+        let track: u32 = id.parse().unwrap();
+        let rating = |state: &AppState| state.read_db(|db| db.track_details(&id)).unwrap().unwrap().rating;
+        let playlist = rbl_db::fixture::playlist_id(0);
+        let name = |state: &AppState| state.read_db(|db| {
+            Ok(db.connection().query_row("SELECT Name FROM djmdPlaylist WHERE ID = ?1", [&playlist], |r| r.get::<_, String>(0))?)
+        }).unwrap();
+        let original = name(&state);
+
+        run(crate::commands::rename_playlist(app.handle().clone(), app.state(), playlist.clone(), "Renamed 506".into())).unwrap();
+        run(crate::commands::set_track_rating(app.handle().clone(), app.state(), vec![id.clone()], 4)).unwrap();
+        assert!(source.edit(&rbl_link::Edit::Rating { track, stars: 5 }));
+        assert_eq!(rating(&state), 5);
+
+        let error = run(crate::commands::undo_edit(app.handle().clone(), app.state())).unwrap_err();
+        assert_eq!(error.kind, crate::error::ErrorKind::Conflict);
+        assert_eq!(error.message, "Can't undo Track Edit: the track has changed since. The newer change was kept.");
+        assert_eq!(rating(&state), 5, "the player's rating is kept");
+        let menu = announced.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(menu["undoLabel"], "Rename Playlist", "only the conflicting entry left");
+        assert_eq!(menu["canRedo"], false, "nothing refused goes to Redo");
+
+        run(crate::commands::undo_edit(app.handle().clone(), app.state())).unwrap();
+        assert_eq!(name(&state), original, "the unrelated rename still undoes");
+        assert_eq!(ended.load(std::sync::atomic::Ordering::SeqCst), 0, "no Redo yet for LINK to end");
+
+        // With the rename undone there is a Redo; a player's rating ends it.
+        assert!(source.edit(&rbl_link::Edit::Rating { track, stars: 2 }));
+        assert_eq!(ended.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let error = run(crate::commands::redo_edit(app.handle().clone(), app.state())).unwrap_err();
+        assert_eq!(error.kind, crate::error::ErrorKind::NotFound);
+        assert_eq!(name(&state), original);
     }
 }

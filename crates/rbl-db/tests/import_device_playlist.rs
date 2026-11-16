@@ -311,3 +311,112 @@ fn a_file_the_collection_already_holds_is_used_as_it_is() {
     assert!(made.added.is_empty());
     assert_eq!(f.entries(&made.id), vec![(1, id)]);
 }
+
+fn cue(hot_cue: u32, kind: u8, time_ms: u32, loop_time_ms: u32) -> rbl_anlz::CueEntry {
+    rbl_anlz::CueEntry { hot_cue, kind, time_ms, loop_time_ms, color_id: 0, comment: None, color_code: Some(if hot_cue == 0 { 0 } else { 1 }), rgb: None }
+}
+
+#[test]
+fn a_copied_track_takes_the_devices_bpm_key_analysis_and_cues() {
+    // rekordbox gives each track Import Playlist copies the device's row
+    // (BPM, key), its analysis files and its cues [static, rekordbox 7.2.19
+    // importFromDeviceThread::run @0x1001d9618]. Without that the copy came
+    // in as a bare file: no BPM, waveform, cues or key (#568).
+    let mut f = fixture_with(Shape::default());
+    f.conn()
+        .execute("INSERT INTO djmdKey (ID, ScaleName, Seq, created_at, updated_at) VALUES ('12', 'Fm', 7, '2026-01-01', '2026-01-01')", [])
+        .unwrap();
+    let audio = tempfile::tempdir().unwrap();
+    let copy = audio.path().join("Copied.wav");
+    write_wav(&copy, 1);
+    let made = f.writer.import_device_playlist_entries("From USB", &[DeviceEntry::File(copy)]).unwrap();
+    let (content, _) = made.added[0].clone();
+    let path = f.writer.analysis_data_path_for(&content).unwrap();
+    let cues = [cue(1, 1, 1000, 0), cue(0, 2, 2000, 4000), cue(17, 1, 5, 0), cue(0, 2, 9000, 8000)];
+    f.writer
+        .import_device_analysis(
+            &content,
+            &rbl_db::write::DeviceAnalysis { bpm_x100: 12_800, key: Some("Fm"), analysis_data_path: Some(&path), cues: &cues },
+        )
+        .unwrap();
+    let row: (i64, String, String, i64, i64) = f
+        .conn()
+        .query_row(
+            "SELECT BPM, KeyID, AnalysisDataPath, Analysed, CAST(COALESCE(AnalysisUpdated,'0') AS INTEGER) FROM djmdContent WHERE ID = ?1",
+            params![content],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(row, (12_800, "12".to_owned(), path, rbl_db::write::ANALYSED_FULL, 1));
+    let mut stmt = f
+        .conn()
+        .prepare("SELECT InMsec, OutMsec, Kind FROM djmdCue WHERE ContentID = ?1 AND rb_local_deleted = 0 ORDER BY InMsec")
+        .unwrap();
+    let stored: Vec<(i64, Option<i64>, i64)> =
+        stmt.query_map(params![content], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect();
+    assert_eq!(stored, vec![(1000, None, 1), (2000, Some(4000), 0)], "the hot cue past H and the backwards loop are left out");
+}
+
+/// #617: a memory cue copied from a device keeps its colour. rekordbox reads
+/// a `PCP2` memory entry's colour row 1-8 as `Color` 0-7 and anything else
+/// as none (`CMusicAnalyzeFile::get_pmai_ext_specified_memcue_ext`
+/// @0x100f23590, rekordbox 7.2.19 arm64); RBX dropped it and kept 255.
+#[test]
+fn a_copied_memory_cue_keeps_its_colour() {
+    let mut f = fixture_with(Shape::default());
+    let audio = tempfile::tempdir().unwrap();
+    let copy = audio.path().join("Coloured.wav");
+    write_wav(&copy, 1);
+    let made = f.writer.import_device_playlist_entries("Coloured", &[DeviceEntry::File(copy)]).unwrap();
+    let (content, _) = made.added[0].clone();
+    let coloured = |time_ms: u32, color_id: u8| rbl_anlz::CueEntry { color_id, ..cue(0, 1, time_ms, 0) };
+    let mut hot = cue(1, 1, 6000, 0);
+    hot.color_code = Some(42);
+    let cues = [coloured(1000, 1), coloured(2000, 3), coloured(3000, 8), coloured(4000, 0), coloured(5000, 9), hot];
+    f.writer
+        .import_device_analysis(
+            &content,
+            &rbl_db::write::DeviceAnalysis { bpm_x100: 12_800, key: None, analysis_data_path: None, cues: &cues },
+        )
+        .unwrap();
+    let mut stmt = f
+        .conn()
+        .prepare("SELECT InMsec, Color, ColorTableIndex FROM djmdCue WHERE ContentID = ?1 AND rb_local_deleted = 0 ORDER BY InMsec")
+        .unwrap();
+    let stored: Vec<(i64, i64, i64)> =
+        stmt.query_map(params![content], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect();
+    assert_eq!(
+        stored,
+        vec![(1000, 0, 0), (2000, 2, 0), (3000, 7, 0), (4000, 255, 0), (5000, 255, 0), (6000, -1, 42)],
+        "Pink, Orange and Purple kept; rows 0 and 9 are none; the hot cue keeps its code"
+    );
+}
+
+#[test]
+fn a_copied_track_without_analysis_files_keeps_its_own_path_and_flag() {
+    let mut f = fixture_with(Shape::default());
+    let audio = tempfile::tempdir().unwrap();
+    let copy = audio.path().join("Bare.wav");
+    write_wav(&copy, 1);
+    let made = f.writer.import_device_playlist_entries("Bare", &[DeviceEntry::File(copy)]).unwrap();
+    let (content, _) = made.added[0].clone();
+    let before: (Option<String>, Option<i64>) = f
+        .conn()
+        .query_row("SELECT AnalysisDataPath, Analysed FROM djmdContent WHERE ID = ?1", params![content], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    f.writer
+        .import_device_analysis(
+            &content,
+            &rbl_db::write::DeviceAnalysis { bpm_x100: 9_950, key: Some("not a key"), analysis_data_path: None, cues: &[] },
+        )
+        .unwrap();
+    let after: (i64, Option<String>, Option<i64>, Option<String>) = f
+        .conn()
+        .query_row("SELECT BPM, AnalysisDataPath, Analysed, KeyID FROM djmdContent WHERE ID = ?1", params![content], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .unwrap();
+    assert_eq!(after.0, 9_950);
+    assert_eq!((after.1, after.2), before, "no analysis path, no analysed flag");
+    assert!(after.3.is_none_or(|k| k.is_empty() || k == "0"), "an unknown key name invents nothing");
+}

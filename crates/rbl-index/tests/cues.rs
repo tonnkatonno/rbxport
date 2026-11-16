@@ -144,11 +144,11 @@ fn a_library_built_without_cues_takes_its_first_track_s_cues() {
         TestTrack { id: 3, title: "three", ..TestTrack::default() },
     ]);
     assert!(lib.cues_of(1).is_empty());
-    lib.set_cues_of(1, vec![Cue { id: 7, position_ms: 500, out_ms: 0, kind: 0, colour: 0 }]);
+    lib.set_cues_of(1, vec![Cue { id: 7, position_ms: 500, out_ms: 0, kind: 0, colour: 0, memory_colour: None }]);
     assert_eq!(lib.cues_of(1).len(), 1);
     assert!(lib.cues_of(0).is_empty());
     assert!(lib.cues_of(2).is_empty());
-    lib.set_cues_of(2, vec![Cue { id: 8, position_ms: 900, out_ms: 0, kind: 1, colour: 21 }]);
+    lib.set_cues_of(2, vec![Cue { id: 8, position_ms: 900, out_ms: 0, kind: 1, colour: 21, memory_colour: None }]);
     assert_eq!(lib.cues_of(1)[0].id, 7);
     assert_eq!(lib.cues_of(2)[0].id, 8);
     // Out of range is a no-op, not a panic.
@@ -162,7 +162,8 @@ fn a_library_built_without_cues_takes_its_first_track_s_cues() {
 fn a_track_s_cues_come_back_in_position_order_with_their_colour_index() {
     let mut f = open();
     let track = track_id(0);
-    f.writer.add_cue(&track, 2, 90_000).unwrap(); // hot cue B, later
+    let b = f.writer.add_cue(&track, 2, 90_000).unwrap(); // hot cue B, later
+    f.writer.set_cue_colour(&b, Some(46)).unwrap();
     f.writer.add_cue(&track, 1, 46).unwrap(); // hot cue A, first
     f.writer.add_cue(&track, 0, 46).unwrap(); // memory cue beside it
     f.writer.add_cue(&track_id(2), 6, 24).unwrap(); // hot cue E on another track
@@ -171,13 +172,14 @@ fn a_track_s_cues_come_back_in_position_order_with_their_colour_index() {
 
     let shape: Vec<(u32, Option<char>, u8)> =
         f.cues(&track).iter().map(|c| (c.position_ms, c.hot_letter(), c.colour)).collect();
-    // The writer stores rekordbox's default index 21 on a hot cue and 0 on a
-    // memory cue; the loader must hand both back untouched.
-    assert_eq!(shape, vec![(46, None, 0), (46, Some('A'), 21), (90_000, Some('B'), 21)]);
+    // The writer stores 0, no colour, on a new cue of either kind, as
+    // rekordbox's deck does, and B's chosen index; the loader must hand
+    // them back untouched.
+    assert_eq!(shape, vec![(46, None, 0), (46, Some('A'), 0), (90_000, Some('B'), 46)]);
 
     assert!(f.cues(&track_id(1)).is_empty());
     let other = f.cues(&track_id(2));
-    assert_eq!((other.len(), other[0].hot_letter(), other[0].colour), (1, Some('E'), 21));
+    assert_eq!((other.len(), other[0].hot_letter(), other[0].colour), (1, Some('E'), 0));
 }
 
 #[test]
@@ -206,10 +208,10 @@ fn a_track_s_hot_letters_read_in_letter_order_whatever_order_they_sit_in() {
     lib.set_cues_of(
         0,
         vec![
-            Cue { id: 1, position_ms: 100, out_ms: 0, kind: Cue::kind_of_letter('D').unwrap(), colour: 0 },
-            Cue { id: 2, position_ms: 200, out_ms: 0, kind: Cue::MEMORY, colour: 0 },
-            Cue { id: 3, position_ms: 300, out_ms: 900, kind: Cue::kind_of_letter('A').unwrap(), colour: 0 },
-            Cue { id: 4, position_ms: 400, out_ms: 0, kind: Cue::kind_of_letter('P').unwrap(), colour: 0 },
+            Cue { id: 1, position_ms: 100, out_ms: 0, kind: Cue::kind_of_letter('D').unwrap(), colour: 0, memory_colour: None },
+            Cue { id: 2, position_ms: 200, out_ms: 0, kind: Cue::MEMORY, colour: 0, memory_colour: None },
+            Cue { id: 3, position_ms: 300, out_ms: 900, kind: Cue::kind_of_letter('A').unwrap(), colour: 0, memory_colour: None },
+            Cue { id: 4, position_ms: 400, out_ms: 0, kind: Cue::kind_of_letter('P').unwrap(), colour: 0, memory_colour: None },
         ],
     );
     assert_eq!(lib.cues().hot_letters_of(0), "ADP");
@@ -220,8 +222,8 @@ fn a_track_s_hot_letters_read_in_letter_order_whatever_order_they_sit_in() {
     lib.set_cues_of(
         1,
         vec![
-            Cue { id: 5, position_ms: 100, out_ms: 0, kind: 1, colour: 0 },
-            Cue { id: 6, position_ms: 200, out_ms: 0, kind: 1, colour: 0 },
+            Cue { id: 5, position_ms: 100, out_ms: 0, kind: 1, colour: 0, memory_colour: None },
+            Cue { id: 6, position_ms: 200, out_ms: 0, kind: 1, colour: 0, memory_colour: None },
         ],
     );
     assert_eq!(lib.cues().hot_letters_of(1), "A");

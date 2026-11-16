@@ -23,6 +23,10 @@ const MAX_VIEWS: usize = 16;
 pub struct AppState {
     pub(crate) edit_gate: parking_lot::ReentrantMutex<()>,
     pub(crate) edit_history: parking_lot::Mutex<EditHistory>,
+    /// Told when a write outside the library history ended its Redo branch,
+    /// so the window's Edit menu stops offering it. Set once by the app;
+    /// tests run without one.
+    history_changed: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     pub(crate) analysis_write: parking_lot::Mutex<()>,
     pub(crate) backup_progress: parking_lot::Mutex<crate::backups::BackupProgress>,
     pub(crate) backup_sizes: parking_lot::Mutex<crate::backup_sizes::SizeCache>,
@@ -53,6 +57,28 @@ pub struct AppState {
     /// The waveform of each track an analysis is still drawing, by id: what
     /// it has decoded so far, laid out over the whole track.
     drawing: parking_lot::Mutex<HashMap<String, Arc<rbl_analysis::waveform::Waveform>>>,
+    /// The tracks the track list colours as played (#540).
+    played: PlayedMarks,
+}
+
+/// What rekordbox 7.2.19 colours green in its track list, held for the life
+/// of the app as its cached rows hold it (bits `0x08` and `0x10` that
+/// `rekordboxDBController::updatePlayedStatus` @`0x1017f429c` sets)
+/// [OBS static]. rekordbox's "Reset color when exiting" boxes are ticked by
+/// default (`SettingIF::getCurrentPlayedOption` / `getCurrentLinkPlayedOption`
+/// default `true`), so nothing is kept past quitting.
+#[derive(Default)]
+struct PlayedMarks {
+    /// The tracks players added to history over LINK, mirrored from each
+    /// link session so the colouring outlives LINK going off and on. What
+    /// players are told was played is that session's own set, which starts
+    /// empty at every LINK start.
+    link: rbl_link::Played,
+    /// The tracks the deck here recorded a play of: what PERFORMANCE mode
+    /// marks when it adds a track to history
+    /// (`DatabaseMediator::addTrackToPlayHistory` -> `updatePlayedStatus(id,
+    /// true, false)` @`0x100c55e14`).
+    deck: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 /// One reversible library operation. Grid edits keep their own history because
@@ -65,9 +91,56 @@ pub(crate) enum LibraryEdit {
     /// A folder drop's Replace existing (#426): the replaced list and the
     /// playlist made in its place, undone and redone as one step.
     ReplacePlaylist(rbl_db::write::ListReplacement),
+    /// An XML or iTunes import's Replace existing (#501): the members of
+    /// every playlist it replaced, undone and redone as one step. The tracks
+    /// and lists the import added are not part of it.
+    ReplacePlaylistContents(Vec<rbl_db::write::MembershipReplacement>),
+    SortPlaylists(rbl_db::write::PlaylistSort),
     RemovePlaylistTracks(rbl_db::write::PlaylistTrackRemoval),
+    /// One Add Tracks to Playlist (#499): every slice of one drop or menu
+    /// choice, joined while they share `transaction`.
+    AddPlaylistTracks {
+        addition: rbl_db::write::PlaylistTrackAddition,
+        transaction: Option<String>,
+    },
+    /// One reorder or Renumber Track Order of a playlist (#499).
+    ReorderPlaylist(rbl_db::write::PlaylistReorder),
     Track(Vec<rbl_db::write::TrackEdit>),
-    TrackTags(rbl_db::write::TrackTagEdit),
+    /// A key edit that also wrote the key into audio files, with "Write the
+    /// value to the ID3 tag" on (#507): the library's steps, as `Track`, and
+    /// each file written with the key its tag held. Undo and Redo put both
+    /// back or neither. A key edit that wrote no file is a `Track` entry.
+    KeyEdit {
+        tracks: Vec<rbl_db::write::TrackEdit>,
+        files: Vec<crate::key_tag::KeyTagWrite>,
+    },
+    /// One My Tag set per track: the Info tab's toggles edit one track,
+    /// a tick in the My Tag panel every selected track. `comments` are the
+    /// comments Add "My Tag" to the "Comments" rewrote with it (#605), put
+    /// back and written again with the tags. Turning that setting on or off
+    /// is an entry with comments and no tags.
+    TrackTags {
+        tags: Vec<rbl_db::write::TrackTagEdit>,
+        comments: Vec<rbl_db::write::TrackEdit>,
+    },
+    /// The categories, or one category's tags, put in a new order (#584).
+    MyTagOrder(rbl_db::write::MyTagOrder),
+    /// One cue or loop command on one track (#504): an add, move, slot,
+    /// colour, comment, Active Loop or delete, or a whole Convert Memory
+    /// Cues to Hot Cues.
+    Cues(rbl_db::write::CueRevision),
+    /// A playlist, folder or intelligent playlist made (#500). Undo
+    /// tombstones the same row unless something has been put in it since.
+    CreatePlaylist(rbl_db::write::PlaylistCreation),
+    /// An intelligent playlist's rule saved, or a playlist's or folder's
+    /// artwork reference changed (#500).
+    PlaylistEdit(rbl_db::write::PlaylistEdit),
+    /// One Relocate, Relocate by location or Auto Relocate run (#502):
+    /// every track's file link before and after, put back in one step.
+    Relocate(rbl_db::write::TrackRelocation),
+    /// One Remove from Tag List, Clear Tag List or Remove from History
+    /// (#508): the rows taken off the list and its order before and after.
+    ListRemoval(rbl_db::write::ListRemoval),
 }
 
 impl LibraryEdit {
@@ -75,9 +148,23 @@ impl LibraryEdit {
         match self {
             Self::DeletePlaylist(edit) => edit.is_empty(),
             Self::RemovePlaylistTracks(edit) => edit.is_empty(),
-            Self::Track(edits) => edits.is_empty() || edits.iter().all(rbl_db::write::TrackEdit::is_empty),
-            Self::TrackTags(edit) => edit.is_empty(),
-            Self::RenamePlaylist(_) | Self::MovePlaylist(_) | Self::ReplacePlaylist(_) => false,
+            Self::ReplacePlaylistContents(edits) => edits.is_empty(),
+            Self::AddPlaylistTracks { addition, .. } => addition.is_empty(),
+            Self::ReorderPlaylist(edit) => edit.is_empty(),
+            Self::Track(edits) | Self::KeyEdit { tracks: edits, .. } => {
+                edits.is_empty() || edits.iter().all(rbl_db::write::TrackEdit::is_empty)
+            }
+            Self::TrackTags { tags, comments } => {
+                tags.iter().all(rbl_db::write::TrackTagEdit::is_empty)
+                    && comments.iter().all(rbl_db::write::TrackEdit::is_empty)
+            }
+            Self::MyTagOrder(edit) => edit.is_empty(),
+            Self::RenamePlaylist(_) | Self::MovePlaylist(_) | Self::ReplacePlaylist(_) | Self::CreatePlaylist(_) => false,
+            Self::SortPlaylists(edit) => edit.is_empty(),
+            Self::Cues(edit) => edit.is_empty(),
+            Self::PlaylistEdit(edit) => edit.is_empty(),
+            Self::Relocate(edit) => edit.is_empty(),
+            Self::ListRemoval(edit) => edit.is_empty(),
         }
     }
 }
@@ -108,8 +195,40 @@ impl EditHistory {
         self.redo.clear();
     }
 
+    /// Records one slice of an Add Tracks to Playlist (#499). A slice of the
+    /// same add (the same `transaction`) that carries on from the entry on
+    /// top of Undo joins it, so a drop of thousands, sent a hundred at a
+    /// time, is still one Undo. Anything else is an entry of its own.
+    pub(crate) fn record_addition(
+        &mut self,
+        addition: rbl_db::write::PlaylistTrackAddition,
+        transaction: Option<String>,
+        label: &'static str,
+    ) {
+        if addition.is_empty() {
+            return;
+        }
+        if let (Some(id), Some(HistoryEntry { edit: LibraryEdit::AddPlaylistTracks { addition: open, transaction: Some(open_id) }, .. }))
+            = (&transaction, self.undo.last_mut())
+        {
+            if open_id == id && open.absorb(&addition) {
+                self.redo.clear();
+                return;
+            }
+        }
+        self.record(LibraryEdit::AddPlaylistTracks { addition, transaction }, label);
+    }
+
     pub(crate) fn clear_redo(&mut self) {
         self.redo.clear();
+    }
+
+    /// Takes the next Undo (`undo`) or Redo entry off its stack and leaves
+    /// every other entry where it is: what a refused, conflicting entry
+    /// comes to (#506). Each remaining entry checks its own rows when it
+    /// runs, so keeping them cannot overwrite anything either.
+    pub(crate) fn drop_next(&mut self, undo: bool) -> Option<HistoryEntry> {
+        if undo { self.undo.pop() } else { self.redo.pop() }
     }
 
     pub(crate) fn clear(&mut self) {
@@ -178,6 +297,7 @@ impl AppState {
         Self {
             edit_gate: parking_lot::ReentrantMutex::new(()),
             edit_history: parking_lot::Mutex::new(EditHistory::default()),
+            history_changed: std::sync::OnceLock::new(),
             analysis_write: parking_lot::Mutex::new(()),
             backup_progress: parking_lot::Mutex::new(crate::backups::BackupProgress::default()),
             backup_sizes: parking_lot::Mutex::new(crate::backup_sizes::SizeCache::default()),
@@ -189,7 +309,39 @@ impl AppState {
             device_assets: RwLock::new(HashMap::new()),
             fresh_analysis: parking_lot::Mutex::new(HashMap::new()),
             drawing: parking_lot::Mutex::new(HashMap::new()),
+            played: PlayedMarks::default(),
         }
+    }
+
+    /// The colouring marks a LINK session copies its played marks into.
+    pub fn link_played(&self) -> rbl_link::Played {
+        self.played.link.clone()
+    }
+
+    /// Marks a track the deck recorded a play of; whether it was new.
+    pub fn mark_deck_played(&self, track: &str) -> bool {
+        self.played.deck.lock().insert(track.to_owned())
+    }
+
+    /// The tracks to colour as played, by id. rekordbox draws a link mark
+    /// only while LINK is on (`ListViewer::paintTextColumn` @`0x1003f1f48`
+    /// reads it behind `ProDJLink`'s flag at `+0x38`, which the LINK-on path
+    /// sets and the link-off paths clear in `UiProDJLink::handleSwitchEvent`)
+    /// [OBS static]; the marks themselves stay.
+    pub fn played_tracks(&self) -> Vec<String> {
+        let link = if self.link_running() { self.played.link.ids() } else { Vec::new() };
+        let mut ids: std::collections::BTreeSet<String> = self.played.deck.lock().iter().cloned().collect();
+        ids.extend(link.into_iter().map(|id| id.to_string()));
+        ids.into_iter().collect()
+    }
+
+    /// Preferences' RESET: every mark goes. Whether there were any.
+    pub fn reset_played(&self) -> bool {
+        let link = self.played.link.clear();
+        let mut deck = self.played.deck.lock();
+        let had = link || !deck.is_empty();
+        deck.clear();
+        had
     }
 
     /// Stable local recovery directory, independent of the backup destination.
@@ -281,8 +433,43 @@ impl AppState {
 
     /// Keep the encrypted connection and edit gate through the refresh, so
     /// a small edit neither pays for another key derivation nor races a writer.
+    ///
+    /// A write here is outside the library history: if it changed any row,
+    /// the history's Redo branch ends, as after any edit the history does
+    /// not record ("a non-recorded edit after an undo starts a new branch").
+    /// A Redo replayed over it would put back values it has since changed.
+    /// That holds for every such writer at once (cue edits, analysis, grid
+    /// saves, players over LINK, imports) rather than each having to
+    /// remember (#506). Undo itself stays: each entry refuses to run over
+    /// rows changed since ([`rbl_db::DbError::Conflict`]).
     pub fn write_then<T, U>(
         &self,
+        edit: impl FnOnce(&mut rbl_db::write::Writer) -> Result<T, rbl_db::DbError>,
+        refresh: impl FnOnce(&rbl_db::Library, T) -> Result<U, rbl_db::DbError>,
+    ) -> Result<U, rbl_db::DbError> {
+        self.write_inner(false, edit, refresh)
+    }
+
+    /// [`Self::write_then`] for the code that keeps the library history
+    /// itself (recording an entry, Undo, Redo): the Redo branch is left for
+    /// it to manage.
+    pub(crate) fn write_history_then<T, U>(
+        &self,
+        edit: impl FnOnce(&mut rbl_db::write::Writer) -> Result<T, rbl_db::DbError>,
+        refresh: impl FnOnce(&rbl_db::Library, T) -> Result<U, rbl_db::DbError>,
+    ) -> Result<U, rbl_db::DbError> {
+        self.write_inner(true, edit, refresh)
+    }
+
+    /// Who to tell when a write outside the history ended its Redo branch.
+    /// The first call wins; the app makes it once, at start.
+    pub fn on_history_changed(&self, listener: impl Fn() + Send + Sync + 'static) {
+        let _ = self.history_changed.set(Box::new(listener));
+    }
+
+    fn write_inner<T, U>(
+        &self,
+        owns_history: bool,
         edit: impl FnOnce(&mut rbl_db::write::Writer) -> Result<T, rbl_db::DbError>,
         refresh: impl FnOnce(&rbl_db::Library, T) -> Result<U, rbl_db::DbError>,
     ) -> Result<U, rbl_db::DbError> {
@@ -307,11 +494,34 @@ impl AppState {
         let open_ms = started.elapsed().as_millis();
         let result = edit(&mut writer);
         let edit_ms = started.elapsed().as_millis();
+        // Counted before the refresh, which only reads. A failed edit that
+        // changed rows before it stopped counts too: its rows may not all
+        // have been put back.
+        let wrote = writer.library().connection().total_changes() > 0;
         let result = result.and_then(|value| refresh(writer.library(), value));
         tracing::debug!(gate_ms, open_ms = open_ms - gate_ms,
             edit_ms = edit_ms - open_ms, refresh_ms = started.elapsed().as_millis() - edit_ms,
             "library write phases");
+        if wrote && !owns_history {
+            self.end_redo_branch();
+        }
         result
+    }
+
+    /// Ends the Redo branch after a write the history does not record, and
+    /// tells the window when there was one to end.
+    fn end_redo_branch(&self) {
+        let ended = {
+            let mut history = self.edit_history.lock();
+            let had = !history.redo.is_empty();
+            history.clear_redo();
+            had
+        };
+        if ended {
+            if let Some(listener) = self.history_changed.get() {
+                listener();
+            }
+        }
     }
 
     /// Runs one read against the database, opening the handle if needed.
@@ -358,6 +568,11 @@ impl AppState {
             library.row_of(track).is_some_and(|row| library.analysis_path.get(row as usize).is_empty())
         });
         let mut inner = self.inner.write();
+        // Another library's ids name other tracks: its rows start unmarked,
+        // as rekordbox's do when it opens another master database.
+        if inner.location.as_ref().is_some_and(|old| old.master_db != location.master_db) {
+            self.reset_played();
+        }
         inner.library = Some(Arc::new(library));
         inner.library_problem = None;
         inner.location = Some(location);
@@ -821,6 +1036,22 @@ fn hot_cues_in_slot_order(library: &Library, row: rbl_index::Row) -> Vec<RowCueD
     hot.into_iter().map(|(_, dto)| dto).collect()
 }
 
+/// A row's memory cue colours for its preview, in `memory_cues` order: each
+/// `djmdCue.Color`, 255 for none, and nothing at all when none has one.
+///
+/// [OBS] static, rekordbox 7.2.19: `BrowseHelper::getCueImageForPreview`
+/// @`0x101fc96c4` draws a memory cue on a row's preview with the image for
+/// its `Color` (`skins/p2254_mempink.png` … `p2261_mempurple.png`), and the
+/// red one for none; seen on chris-win11 (issue #533).
+fn memory_cue_colours(library: &Library, row: rbl_index::Row) -> Vec<u8> {
+    let cues = library.cues_of(row);
+    let memory = cues.iter().filter(|cue| cue.is_memory());
+    if memory.clone().all(|cue| cue.memory_colour.is_none()) {
+        return Vec::new();
+    }
+    memory.map(|cue| cue.memory_colour.unwrap_or(u8::MAX)).collect()
+}
+
 /// Builds the wire rows for a window. `position` is the row's 1-based place in
 /// the view, which is what the `#` column shows.
 pub fn rows_to_dto(library: &Library, rows: &[rbl_index::Row], first_position: usize) -> Vec<RowDto> {
@@ -846,6 +1077,7 @@ pub fn rows_to_dto(library: &Library, rows: &[rbl_index::Row], first_position: u
                 release_date: library.release_date.get(index).to_owned(),
                 hot_cues: hot_cues_in_slot_order(library, row),
                 memory_cues: library.cues_of(row).iter().filter(|cue| cue.is_memory()).map(|cue| cue.position_ms).collect(),
+                memory_cue_colours: memory_cue_colours(library, row),
                 // Stable per track so the placeholder tint does not flicker on scroll.
                 has_artwork: !library.artwork_path.get(index).is_empty(),
                 artwork_hue: u16::try_from(
@@ -873,6 +1105,26 @@ mod tests {
         Cue { position_ms, kind, colour, ..Cue::default() }
     }
 
+    /// rekordbox draws a row's memory cues in their own colours, red for
+    /// none (`BrowseHelper::getCueImageForPreview`, issue #533); the row
+    /// carries `djmdCue.Color` beside each position, 255 for none.
+    #[test]
+    fn a_row_carries_its_memory_cue_colours_when_any_has_one() {
+        let library = library_from(&[TestTrack {
+            id: 7,
+            cues: vec![
+                Cue { memory_colour: Some(6), ..cue(0, 25_804, 0) },
+                cue(1, 30_000, 21),
+                Cue { memory_colour: None, ..cue(0, 60_023, 0) },
+                Cue { memory_colour: Some(0), out_ms: 99_000, ..cue(4, 93_773, 0) },
+            ],
+            ..TestTrack::default()
+        }]);
+        let json = serde_json::to_value(&rows_to_dto(&library, &[0], 0)[0]).unwrap();
+        assert_eq!(json["memoryCues"], serde_json::json!([25_804, 60_023, 93_773]));
+        assert_eq!(json["memoryCueColours"], serde_json::json!([6, 255, 0]));
+    }
+
     #[test]
     fn a_row_carries_hot_badges_and_memory_positions_separately() {
         let library = library_from(&[TestTrack {
@@ -888,6 +1140,8 @@ mod tests {
         let rows = rows_to_dto(&library, &[0], 0);
         let json = serde_json::to_value(&rows[0]).unwrap();
         assert_eq!(json["memoryCues"], serde_json::json!([46, 1000]));
+        // No memory cue has a colour of its own, so the row says nothing.
+        assert!(json.get("memoryCueColours").is_none());
         // In slot order, letters from `Kind` and rekordbox's resolved colour;
         // a hot cue with no colour carries none, so the frontend draws its
         // slot's HOT CUE color default rather than the palette's black at
@@ -1022,5 +1276,50 @@ mod edit_refresh_tests {
             refresh_after_edit(&state, db, Touched::Metadata(vec![track.clone()]))
         }).is_err());
         assert_eq!(state.summary().3, generation);
+    }
+}
+
+#[cfg(test)]
+mod played_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// Issue 540: the deck's plays are coloured at once; a player's are
+    /// kept but drawn only while LINK is on, as rekordbox 7.2.19 draws its
+    /// link played bit; RESET and another library clear both.
+    #[test]
+    fn played_tracks_show_deck_plays_and_hold_link_plays_until_link_is_on() {
+        let state = AppState::with_backups(tempfile::tempdir().unwrap().path().join("backups"));
+        assert_eq!(state.played_tracks(), [] as [String; 0]);
+        assert!(state.mark_deck_played("12"));
+        assert!(!state.mark_deck_played("12"), "already marked");
+        state.link_played().mark(34);
+        assert!(!state.link_running());
+        assert_eq!(state.played_tracks(), ["12"], "a player's play waits for LINK");
+        assert!(state.link_played().contains(34), "but is kept");
+
+        assert!(state.reset_played());
+        assert_eq!(state.played_tracks(), [] as [String; 0]);
+        assert!(!state.link_played().contains(34));
+        assert!(!state.reset_played(), "nothing left to reset");
+    }
+
+    #[test]
+    fn another_library_starts_with_nothing_played() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::with_backups(dir.path().join("backups"));
+        let one = rbl_db::fixture::build(&dir.path().join("one"), rbl_db::fixture::Shape::default()).unwrap();
+        let two = rbl_db::fixture::build(&dir.path().join("two"), rbl_db::fixture::Shape::default()).unwrap();
+        let load = |location: &rbl_db::LibraryLocation| {
+            let db = rbl_db::Library::open(location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
+            rbl_index::load(&db).unwrap().0
+        };
+        state.set_library(load(&one), true, None, 0, one.clone());
+        assert!(state.mark_deck_played("1"));
+        // The same library read again after an edit keeps its marks.
+        state.set_library(load(&one), true, None, 0, one);
+        assert_eq!(state.played_tracks(), ["1"]);
+        state.set_library(load(&two), true, None, 0, two);
+        assert_eq!(state.played_tracks(), [] as [String; 0]);
     }
 }

@@ -491,6 +491,11 @@
    the 49pt left dark: giving the waveform the whole band drew it half again as
    tall as rekordbox does and flattened every quiet passage into a slab. */
 .overviewStack {
+  /* The playhead's box: it spans the band, not just the waveform (#570).
+     Clipped, so a head at 100% does not land in the panel beside the deck,
+     as the overview alone used to clip it. */
+  position: relative;
+  overflow: hidden;
   flex: 1;
   min-width: 0;
   display: grid;
@@ -658,8 +663,10 @@
   top: 0;
   bottom: 0;
   left: 0;
+  /* Whole device pixels, written by the frame loop with its place: 1px
+     here is what it is before the first frame. */
   width: 1px;
-  background: var(--c-text);
+  background: var(--c-playhead);
   pointer-events: none;
   will-change: transform;
 }
@@ -667,10 +674,25 @@
    things the arrow keys are about to move. */
 .player[data-armed] .playhead { background: var(--c-playhead-armed); }
 
+/* The overview's head runs the band's full height, from its top through the
+   position bar to its bottom, two device pixels wide (the frame loop writes
+   the width; 1px is what it is before the first frame). rekordbox 7.2.14 at
+   150% draws it from 19pt above its waveform's peaks to 7pt under the
+   position bar, 48pt in all against this band's 49 (#393's capture, measured
+   for #570); 7.2.19 draws it as two one-pixel lines whatever the waveform's
+   colour (WidgetLoudView::drawTextures @0x100fd17dc). Over the waveform and
+   a loop band, under the cue markers, which rekordbox draws after it. */
+.overviewStack > .playhead { z-index: 1; }
+
 /* Cues sit over the waveform, the grid and the bar count — a marker behind a
    downbeat line is a marker nobody can find. A hot cue sits over a memory cue:
    rekordbox keeps one beside each hot cue, and the user's crop shows the badge
-   covering the red triangle's point. */
+   covering the red triangle's point.
+
+   Vertically they keep to a lane of their own along the band's top: the
+   memory cue's triangle and the hot cue's badge first, the beat heads on the
+   row after the badge's last, then the waveform, so no marker covers the
+   audio. That is the order rekordbox 7.2.14 draws them in (#393). */
 /* A loop is a band over the waveform: a stored memory loop dim, the deck's
    own lit while it plays, in the pad blue the AU button lights with. */
 .loopBand {
@@ -695,9 +717,12 @@
 }
 .hotCue { z-index: 3; }
 
-/* In the overview a memory cue is a small red head at its position, widest at
+/* In the overview a memory cue is a small head at its position, widest at
    the top and tapering to a point, and no line at all: measured beside each
-   hot cue badge, with the waveform under it unbroken. */
+   hot cue badge, with the waveform under it unbroken. Both heads take the
+   cue's own colour, set on the marker as --cue-colour, and red without one:
+   rekordbox picks the row of its memoryCueImageDown sprite by djmdCue.Color
+   (memoryCueColours.ts). */
 .cueHead {
   position: absolute;
   top: 0;
@@ -705,13 +730,14 @@
   translate: -50% 0;
   width: var(--s-cue-head-w);
   height: var(--s-cue-head-h);
-  background: var(--c-cue-head);
+  background: var(--cue-colour, var(--c-cue-head));
   clip-path: polygon(0 0, 100% 0, 50% 100%);
 }
 
 /* In the detail a memory cue is a red triangle pointing down at what it marks,
-   16pt across and 11pt tall, centred on the cue and 8.25pt under the band's
-   top: measured off the user's crop, where it shows over the hot cue's badge.
+   16pt across and 11pt tall, centred on the cue, at the top of the cue lane
+   above the beat heads: measured off the user's crop, where it shows over the
+   hot cue's badge, and placed by rekordbox 7.2.14's own (#393).
    No line under it — the only line in the crop is the downbeat's, and a memory
    cue on its own is in no capture. */
 .cueMarker {
@@ -721,7 +747,7 @@
   translate: -50% 0;
   width: var(--s-cue-marker-w);
   height: var(--s-cue-marker-h);
-  background: var(--c-cue-head);
+  background: var(--cue-colour, var(--c-cue-head));
   clip-path: polygon(0 0, 100% 0, 50% 100%);
 }
 
@@ -748,9 +774,9 @@
   font-weight: 700;
   line-height: 1;
 }
-/* The detail centres the same badge on the cue, 15pt under the band's top:
-   measured off the user's crop, where its last row is the one before the beat
-   head's first. */
+/* The detail centres the same badge on the cue in the cue lane, its last row
+   the one before the beat head's first, as both the user's crop and rekordbox
+   7.2.14 on the rig have it (#393). */
 .hotCue[data-band="detail"] .hotCueBadge {
   top: var(--s-cue-badge-top);
   left: 0;
@@ -766,10 +792,9 @@
   pointer-events: none;
 }
 /* A beat marker is a line with a small triangle at each end, and it does not
-   span the band: measured, the head starts 26pt below the band's top and the
-   foot ends 6.5pt above its bottom, with the line between them a point's gap
-   inside each — 31pt to 11.5pt, which the user's crop has too. Every fourth
-   is white with red heads. */
+   span the band: the head starts under the cue lane (#393) and the foot ends
+   just above the band's bottom, with the line between them a point's gap
+   inside each. Every fourth is white with red heads. */
 .beat,
 .downbeat {
   position: absolute;
@@ -1173,6 +1198,21 @@ button.pageNumber:disabled { color: var(--c-icon-off); }
 /* A row holding a saved loop carries rekordbox's orange loop mark before
    the ✕, at the skin's own 10x6. */
 .cueLoopIcon { width: 10px; height: 6px; flex: none; color: var(--c-cue-loop-icon); }
+/* The loop mark is rekordbox's Active Loop toggle (#577): a bare button
+   around the icon, so the row keeps the capture's layout. */
+.cueLoopButton {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  border: 0;
+  border-radius: 2px;
+  background: none;
+  padding: 2px;
+  margin: -2px;
+  color: inherit;
+  cursor: default;
+}
+.cueLoopButton:focus-visible { outline: 1px solid var(--c-accent); outline-offset: 0; }
 .cueDelete { color: var(--c-cue-delete); flex: none; }
 /* The memory list's ✕ is a button of its own; the hot-cue list's is still a
    glyph. Same glyph, same place, and disabled it dims like the pad row's. */

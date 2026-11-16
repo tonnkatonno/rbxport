@@ -463,3 +463,51 @@ fn last_row_index_pages_fill_up_and_read_back_whole() {
     assert_eq!(&bytes[first + 0x20..first + 0x24], &[221, 0, 0, 0]);
     assert_eq!(&bytes[first + PAGE - 4..first + PAGE], &[0xff, 0xff, 0xff, 0xff]);
 }
+
+/// A player shows and sorts DATE ADDED from string slot 15 and keeps the
+/// file's creation date in slot 10. rekordbox 7 wrote StockDate 2025-08-12 to
+/// slot 15 and DateCreated 2025-08-07 to slot 10, and an XDJ-1000 showed
+/// 2025-08-12. With slot 15 empty it showed no date and did not sort by it.
+#[test]
+fn the_date_added_goes_where_a_player_reads_it() {
+    use rbl_pdb::rows::{slot, track_row, TrackInput, TRACK_STRINGS};
+    let row = track_row(&TrackInput {
+        id: 1,
+        title: "Rise Up".into(),
+        date_added: "2025-08-12".into(),
+        date_created: "2025-08-07".into(),
+        ..Default::default()
+    });
+    let mut file = FileBuilder::new(PAGE);
+    file.add_table(0, &[row]);
+    let bytes = file.finish();
+    let pdb = Pdb::parse(&bytes).unwrap();
+    let table = pdb.table(PageType::Tracks).unwrap();
+    assert_eq!(pdb.track_rows(table)[0].date_added, "2025-08-12");
+
+    // The raw slots, as a player reads them.
+    let at = pdb.rows(table)[0].offset;
+    let text = |s: usize| {
+        assert!(s < TRACK_STRINGS);
+        let offset = u16::from_le_bytes([bytes[at + 0x5e + 2 * s], bytes[at + 0x5f + 2 * s]]) as usize;
+        pdb.string_at(at + offset)
+    };
+    assert_eq!(text(slot::DATE_ADDED), "2025-08-12");
+    assert_eq!(text(slot::DATE_CREATED), "2025-08-07");
+    assert_eq!((slot::DATE_CREATED, slot::DATE_ADDED), (10, 15));
+}
+
+/// A stick an older rbxport wrote has the date added in slot 10 and slot 15
+/// empty. Reading it keeps the date rather than losing it (#637).
+#[test]
+fn a_date_added_in_the_old_slot_still_reads_back() {
+    use rbl_pdb::rows::{track_row, TrackInput};
+    let row = track_row(&TrackInput { id: 1, title: "Old".into(), date_created: "2024-01-10".into(), ..Default::default() });
+    let mut file = FileBuilder::new(PAGE);
+    file.add_table(0, &[row]);
+    let bytes = file.finish();
+    let pdb = Pdb::parse(&bytes).unwrap();
+    let track = &pdb.track_rows(pdb.table(PageType::Tracks).unwrap())[0];
+    assert_eq!(track.date_added, "2024-01-10");
+    assert_eq!(track.date_created, "2024-01-10");
+}

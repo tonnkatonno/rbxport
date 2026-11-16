@@ -104,6 +104,7 @@ fn the_extended_cue_list_matches_the_capture() {
         hot_slot: slot,
         comment: "CUE(Auto)".into(),
         colour: if slot == 0 { 0 } else { 21 },
+        memory_colour: None,
     };
     // Memory cues in rekordbox's table order, which the reply keeps.
     let cues = vec![
@@ -128,7 +129,7 @@ fn an_index_cue_becomes_an_extended_cue_by_its_hot_letter() {
         position_ms: 100,
         out_ms: 0,
         kind: 5,
-        colour: 0,
+        colour: 0,        memory_colour: None,
     };
     assert_eq!(ExtendedCue::from(&hot_d).hot_slot, 4, "kind 5 is D");
     let memory = Cue {
@@ -136,7 +137,7 @@ fn an_index_cue_becomes_an_extended_cue_by_its_hot_letter() {
         position_ms: 200,
         out_ms: 900,
         kind: 0,
-        colour: 0,
+        colour: 0,        memory_colour: None,
     };
     let e = ExtendedCue::from(&memory);
     assert_eq!((e.hot_slot, e.out_ms), (0, 900));
@@ -144,6 +145,28 @@ fn an_index_cue_becomes_an_extended_cue_by_its_hot_letter() {
     let (blob, _) = blobs::extended_cues_blob(&[e]);
     assert_eq!(blob[6], 2);
     assert_eq!(&blob[16..20], &900_u32.to_le_bytes());
+}
+
+/// #617: a memory cue's colour goes over LINK one row up from its `Color`
+/// at 0x3a, as rekordbox 7.2.19's `GetUsbCueExtSharedContent` @0x1018c9c98
+/// writes it; none, and every hot cue, is 0 there.
+#[test]
+fn a_memory_cues_colour_is_sent_one_row_up() {
+    let memory = |colour: Option<u8>| Cue {
+        id: 2,
+        position_ms: 200,
+        out_ms: 0,
+        kind: 0,
+        colour: 0,
+        memory_colour: colour,
+    };
+    for (colour, row) in [(Some(0), 1), (Some(1), 2), (Some(7), 8), (None, 0)] {
+        let (blob, _) = blobs::extended_cues_blob(&[ExtendedCue::from(&memory(colour))]);
+        assert_eq!(blob[0x3a], row, "Color {colour:?}");
+    }
+    let hot = Cue { kind: 1, colour: 42, memory_colour: Some(3), ..memory(None) };
+    let (blob, _) = blobs::extended_cues_blob(&[ExtendedCue::from(&hot)]);
+    assert_eq!(blob[0x3a], 0, "a hot cue's colour is its code, after the comment");
 }
 
 #[test]
@@ -174,6 +197,7 @@ fn a_hot_cue_carries_its_own_colour() {
             out_ms: 0,
             kind,
             colour,
+            memory_colour: None,
         })
     };
     for (kind, colour, expected) in [
@@ -202,6 +226,7 @@ fn a_memory_cue_carries_no_colour() {
         out_ms: 0,
         kind: 0,
         colour: 42,
+        memory_colour: None,
     });
     let (blob, _) = blobs::extended_cues_blob(&[memory]);
     assert_eq!(colour_of(&blob), [0; 4]);

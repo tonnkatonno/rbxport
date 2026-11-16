@@ -64,6 +64,13 @@ pub fn install(app: &AppHandle) {
         RbxAddCommand::class(),
         RbxRemoveCommand::class(),
         RbxExportCommand::class(),
+        RbxMyTagCatalogCommand::class(),
+        RbxWaveformCommand::class(),
+        RbxRemoveCollectionCommand::class(),
+        RbxReadMyTagsCommand::class(),
+        RbxAddMyTagsCommand::class(),
+        RbxRemoveMyTagsCommand::class(),
+        RbxReorderMyTagsCommand::class(),
     );
     extend_application();
 }
@@ -508,6 +515,12 @@ define_class!(
             track_specifier(self.mtm(), self.ivars().id, self.ivars().playlist)
         }
 
+        #[unsafe(method_id(scriptReadMyTags:))]
+        fn script_read_my_tags(&self, command: &NSScriptCommand) -> Option<Retained<AnyObject>> {
+            once(command, read_my_tags);
+            None
+        }
+
         #[unsafe(method_id(scriptLoad:))]
         fn script_load(&self, command: &NSScriptCommand) -> Option<Retained<AnyObject>> {
             once(command, load);
@@ -826,19 +839,23 @@ fn insert_playlist(value: &AnyObject, parent: String, index: Option<NSUInteger>)
         let app = app()?;
         let written = Arc::new(StdMutex::new(None::<String>));
         let into = Arc::clone(&written);
-        let under = parent.clone();
-        crate::commands::edit(app.clone(), app.state(), "create_playlist", crate::commands::Touched::Playlists, move |w| {
-            let id = if folder { w.create_folder(&name, &under)? } else { w.create_playlist(&name, &under)? };
+        let under = parent;
+        // One Undo step, as the window's Create New Playlist (#500): the
+        // place it is made at is part of the same entry.
+        let (attribute, label) = if folder {
+            (rbl_db::write::ATTRIBUTE_FOLDER, "Create Folder")
+        } else {
+            (rbl_db::write::ATTRIBUTE_PLAYLIST, "Create Playlist")
+        };
+        crate::commands::recorded_edit(app.clone(), app.state(), "create_playlist", crate::commands::Touched::Playlists, label, move |w| {
+            let (id, made) = w.create_with_undo(&name, &under, attribute, index)?;
             if let Ok(mut slot) = into.lock() {
                 *slot = Some(id);
             }
-            Ok(())
+            Ok(crate::state::LibraryEdit::CreatePlaylist(made))
         })
         .await?;
         let id: u64 = written.lock().ok().and_then(|slot| slot.clone()).and_then(|id| id.parse().ok()).unwrap_or(0);
-        if let Some(index) = index {
-            crate::commands::move_playlist(app.clone(), app.state(), id.to_string(), parent, Some(index)).await?;
-        }
         Ok(ScriptValue::Playlist(id))
     });
     // `make` answers with the object it built, which now names the playlist
@@ -856,7 +873,7 @@ async fn delete_work(id: u64) -> Result<ScriptValue, ScriptError> {
 async fn add_work(playlist: u64, tracks: Vec<u64>) -> Result<ScriptValue, ScriptError> {
     let app = app()?;
     let tracks = tracks.iter().map(u64::to_string).collect();
-    done(crate::commands::add_tracks_to_playlist(app.clone(), app.state(), playlist.to_string(), tracks, None).await)
+    done(crate::commands::add_tracks_to_playlist(app.clone(), app.state(), playlist.to_string(), tracks, None, None).await)
 }
 
 async fn remove_work(playlist: u64, tracks: Vec<u64>) -> Result<ScriptValue, ScriptError> {
@@ -1427,6 +1444,132 @@ fn export(command: &NSScriptCommand) {
     });
 }
 
+define_class!(
+    // SAFETY: NSScriptCommand is designed for subclassing; no additional ivars.
+    #[unsafe(super(NSScriptCommand, NSObject))]
+    #[name = "RbxRemoveCollectionCommand"]
+    struct RbxRemoveCollectionCommand;
+    impl RbxRemoveCollectionCommand {
+        #[unsafe(method_id(performDefaultImplementation))]
+        fn perform(&self) -> Option<Retained<AnyObject>> {
+            once(self, |command| {
+                let ScriptValue::Text(request) = from_objc(command.directParameter().as_deref()) else {
+                    return fail(&ScriptError::wrong_type("Supply a checked removal request as JSON text."));
+                };
+                defer(async move { super::collection::remove(app()?.clone(), &request).await });
+            });
+            None
+        }
+    }
+);
+
+// --------------------------------------------------------- My Tag automation
+
+define_class!(
+    // SAFETY: NSScriptCommand is designed for subclassing; no additional ivars.
+    #[unsafe(super(NSScriptCommand, NSObject))]
+    #[name = "RbxMyTagCatalogCommand"]
+    struct RbxMyTagCatalogCommand;
+
+    impl RbxMyTagCatalogCommand {
+        #[unsafe(method_id(performDefaultImplementation))]
+        fn perform(&self) -> Option<Retained<AnyObject>> {
+            once(self, |_| defer(async { super::my_tags::catalog(state()?).await }));
+            None
+        }
+    }
+);
+
+define_class!(
+    // SAFETY: NSScriptCommand is designed for subclassing; no additional ivars.
+    #[unsafe(super(NSScriptCommand, NSObject))]
+    #[name = "RbxReadMyTagsCommand"]
+    struct RbxReadMyTagsCommand;
+
+    impl RbxReadMyTagsCommand {
+        #[unsafe(method_id(performDefaultImplementation))]
+        fn perform(&self) -> Option<Retained<AnyObject>> {
+            once(self, read_my_tags);
+            None
+        }
+    }
+);
+
+define_class!(
+    // SAFETY: NSScriptCommand is designed for subclassing; no additional ivars.
+    #[unsafe(super(NSScriptCommand, NSObject))]
+    #[name = "RbxAddMyTagsCommand"]
+    struct RbxAddMyTagsCommand;
+
+    impl RbxAddMyTagsCommand {
+        #[unsafe(method_id(performDefaultImplementation))]
+        fn perform(&self) -> Option<Retained<AnyObject>> {
+            once(self, |command| change_my_tags(command, "to", rbl_db::write::MyTagOperation::Add));
+            None
+        }
+    }
+);
+
+define_class!(
+    // SAFETY: NSScriptCommand is designed for subclassing; no additional ivars.
+    #[unsafe(super(NSScriptCommand, NSObject))]
+    #[name = "RbxRemoveMyTagsCommand"]
+    struct RbxRemoveMyTagsCommand;
+
+    impl RbxRemoveMyTagsCommand {
+        #[unsafe(method_id(performDefaultImplementation))]
+        fn perform(&self) -> Option<Retained<AnyObject>> {
+            once(self, |command| change_my_tags(command, "from", rbl_db::write::MyTagOperation::Remove));
+            None
+        }
+    }
+);
+
+define_class!(
+    // SAFETY: NSScriptCommand is designed for subclassing; no additional ivars.
+    #[unsafe(super(NSScriptCommand, NSObject))]
+    #[name = "RbxReorderMyTagsCommand"]
+    struct RbxReorderMyTagsCommand;
+
+    impl RbxReorderMyTagsCommand {
+        #[unsafe(method_id(performDefaultImplementation))]
+        fn perform(&self) -> Option<Retained<AnyObject>> {
+            once(self, |command| {
+                match super::my_tags::tag_ids(from_objc(command.directParameter().as_deref())) {
+                    Ok(order) => defer(async move { super::my_tags::reorder(app()?.clone(), order).await }),
+                    Err(error) => fail(&error),
+                }
+            });
+            None
+        }
+    }
+);
+
+fn read_my_tags(command: &NSScriptCommand) {
+    let objects = direct(command);
+    let [object] = objects.as_slice() else {
+        return fail(&ScriptError::wrong_type("Read My Tags from exactly one track at a time."));
+    };
+    let Some(track) = object.downcast_ref::<RbxTrack>() else {
+        return fail(&ScriptError::no_such_object("Say which track to read."));
+    };
+    let track = track.ivars().id.to_string();
+    defer(async move { super::my_tags::assigned(state()?, track).await });
+}
+
+fn change_my_tags(command: &NSScriptCommand, key: &str, operation: rbl_db::write::MyTagOperation) {
+    let tags = match super::my_tags::tag_ids(from_objc(command.directParameter().as_deref())) {
+        Ok(tags) => tags,
+        Err(error) => return fail(&error),
+    };
+    let Some(track) = argument(command, key).and_then(|value| {
+        value.downcast_ref::<RbxTrack>().map(|track| track.ivars().id.to_string())
+    }) else {
+        return fail(&ScriptError::no_such_object("Say which track to update."));
+    };
+    defer(async move { super::my_tags::update(app()?.clone(), track, tags, operation).await });
+}
+
 // ------------------------------------------------------- the application
 
 /// Adds the dictionary's application keys to `NSApplication`.
@@ -1633,3 +1776,22 @@ extern "C-unwind" fn app_set_link_export(_: &AnyObject, _: Sel, value: *mut AnyO
 extern "C-unwind" fn app_rekordbox_running(_: &AnyObject, _: Sel) -> *mut AnyObject {
     returned(Some(any(NSNumber::numberWithBool(rbl_db::is_rekordbox_running()))))
 }
+
+define_class!(
+    // SAFETY: NSScriptCommand supports subclassing; no additional ivars.
+    #[unsafe(super(NSScriptCommand, NSObject))]
+    #[name = "RbxWaveformCommand"]
+    struct RbxWaveformCommand;
+    impl RbxWaveformCommand {
+        #[unsafe(method_id(performDefaultImplementation))]
+        fn perform(&self) -> Option<Retained<AnyObject>> {
+            once(self, |command| {
+                let ScriptValue::Text(request) = from_objc(command.directParameter().as_deref()) else {
+                    return fail(&ScriptError::wrong_type("Supply a waveform request as JSON text."));
+                };
+                defer(async move { super::waveform::overview(state()?, request).await });
+            });
+            None
+        }
+    }
+);

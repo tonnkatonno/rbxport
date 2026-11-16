@@ -51,7 +51,10 @@ pub enum AnlzError {
 
 pub type Result<T> = std::result::Result<T, AnlzError>;
 
-pub use encode::{author, author_with_overview, share_tree_ppth, AnalysisFiles, BandColumn, Existing};
+pub use encode::{
+    author, author_with_overview, author_with_rekordbox_waves, share_tree_ppth, AnalysisFiles, BandColumn, Existing,
+    RekordboxWaves,
+};
 pub use phrase::{Mood, Phrase, PhraseEdit, SongStructure};
 pub use vocal::{VOCAL_FRAME_MS, VOCAL_MAX};
 pub use write::AnlzBuilder;
@@ -206,6 +209,33 @@ pub struct CueEntry {
     pub color_code: Option<u8>,
     /// What rekordbox paints for that index.
     pub rgb: Option<[u8; 3]>,
+}
+
+impl CueEntry {
+    /// The `djmdCue.Kind` this entry is stored as: 0 a memory cue, 1-3 hot
+    /// cues A-C, 5-17 D-P (Kind 4 is the Active Loop, not a slot).
+    pub fn library_kind(&self) -> u32 {
+        if self.hot_cue >= 4 { self.hot_cue + 1 } else { self.hot_cue }
+    }
+
+    /// The `djmdCue.Color` this entry is stored with: a memory cue's colour
+    /// row read back as rekordbox does ([`cues::memory_colour_of_row`]), 255
+    /// for a memory cue without one, and -1 on a hot cue, as RBX writes both.
+    pub fn library_color(&self) -> i64 {
+        if self.hot_cue == 0 {
+            cues::memory_colour_of_row(self.color_id).map_or(255, i64::from)
+        } else {
+            -1
+        }
+    }
+
+    /// The `djmdCue.ColorTableIndex` this entry is stored with: its colour
+    /// code. A hot cue whose entry ends before the code falls back to the
+    /// colour row; a memory cue's colour is [`Self::library_color`], so it
+    /// takes 0, as a memory cue RBX adds does.
+    pub fn library_color_table_index(&self) -> u8 {
+        self.color_code.unwrap_or(if self.hot_cue == 0 { 0 } else { self.color_id })
+    }
 }
 
 /// Magic, the two lengths, the hot cue, the kind, the two times, the colour
@@ -559,6 +589,28 @@ impl Anlz {
         self.sections.iter().find_map(Section::as_path)
     }
 
+    /// The file with its `PPTH` naming `path` and every other section
+    /// byte-for-byte as it was; a file without one gains it first.
+    ///
+    /// What rekordbox does to a stick's analysis files when Import Playlist
+    /// copies a track to the computer: the stick's `PPTH` is the full
+    /// `/Contents/…` path, and the copies in the share tree are given the
+    /// new file's [static, rekordbox 7.2.19 macOS arm64:
+    /// `importFromDeviceThread::import_device_analysis` @0x1001db460 copies
+    /// the `.DAT`, `.EXT` and `.2EX`, then
+    /// `CAnalyzerIF::initPathAndDeviceCue` sets their path].
+    #[must_use]
+    pub fn with_path(&self, path: &str) -> Vec<u8> {
+        let replacement = write::path_section(path);
+        let mut sections = self.sections.clone();
+        if let Some(at) = sections.iter().position(|s| s.tag == FourCc::new(b"PPTH")) {
+            sections[at] = replacement;
+        } else {
+            sections.insert(0, replacement);
+        }
+        write::render(&self.header_extra, &sections)
+    }
+
     /// Waveform payload and its stride for a given tag.
     pub fn waveform(&self, tag: &[u8; 4]) -> Option<(u32, &[u8])> {
         let section = self.section(tag)?;
@@ -735,5 +787,38 @@ mod grid_offset_tests {
             assert_eq!(parsed.with_grid_offset(0).unwrap(), before);
         }
         assert!(Anlz::default().with_grid_offset(1).is_none());
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn a_new_path_replaces_the_old_and_leaves_every_other_section_as_it_was() {
+        let mut stick = write::AnlzBuilder::new();
+        stick
+            .path("/Contents/Artist/Album/track.mp3")
+            .beat_grid(&[Beat { beat_number: 1, tempo_x100: 12800, time_ms: 250 }])
+            .waveform_preview(b"PWAV", &[1, 2, 3])
+            .cue_lists(true);
+        let original = parse(&stick.finish()).unwrap();
+        let moved = parse(&original.with_path("?/track.mp3")).unwrap();
+        assert_eq!(moved.path().as_deref(), Some("?/track.mp3"));
+        assert_eq!(moved.sections.len(), original.sections.len());
+        assert_eq!(moved.sections[1..], original.sections[1..]);
+        assert_eq!(moved.header_extra, original.header_extra);
+        // Back again gives the stick's own bytes.
+        assert_eq!(moved.with_path("/Contents/Artist/Album/track.mp3"), original.to_bytes());
+    }
+
+    #[test]
+    fn a_file_without_a_path_gains_one_first() {
+        let mut bare = write::AnlzBuilder::new();
+        bare.beat_grid(&[Beat { beat_number: 1, tempo_x100: 12000, time_ms: 0 }]);
+        let named = parse(&parse(&bare.finish()).unwrap().with_path("?/a.wav")).unwrap();
+        assert_eq!(named.sections[0].as_path().as_deref(), Some("?/a.wav"));
+        assert!(named.beat_grid().is_some());
     }
 }

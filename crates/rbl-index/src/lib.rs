@@ -14,6 +14,7 @@
 
 pub mod cache;
 mod category;
+pub mod collate;
 pub mod device;
 pub mod file_time;
 mod filter;
@@ -286,6 +287,11 @@ pub struct Cue {
     /// paints is the complete `rbl_anlz::cue_colour_drawn` desktop palette;
     /// this field stores the raw number so export retains the device colour.
     pub colour: u8,
+    /// A memory cue's own colour, `djmdCue.Color` 0 to 7 (Pink, Red, Orange,
+    /// Yellow, Green, Aqua, Blue, Purple), or `None`: rekordbox 7.2.14 writes
+    /// -1 on a memory cue it creates and older rows carry 255 [OBS chris-win11
+    /// test library, issue #533], and a hot cue's colour is [`Cue::colour`].
+    pub memory_colour: Option<u8>,
 }
 
 /// Every cue, grouped by track and ordered by position within each.
@@ -569,6 +575,38 @@ impl Library {
     /// look one up.
     pub fn row_of_id(&self, id: u64) -> Option<Row> {
         self.row_by_id().get(&id).copied()
+    }
+
+    /// The playlist indices that contain a track, ordinary and intelligent.
+    ///
+    /// Folders are excluded: they hold playlists, not tracks. Intelligent
+    /// playlists are tested one row at a time, so a track that matches their
+    /// rule counts; the cost of a call is one pass over the playlists'
+    /// member lists and one evaluation of each rule's conditions, never
+    /// one whole-library evaluation per intelligent playlist.
+    pub fn playlists_containing(&self, row: Row) -> Vec<usize> {
+        let playlists = self.playlists();
+        let today = crate::smart::Date::today();
+        let mut out = Vec::new();
+        for index in 0..playlists.len() {
+            if playlists.is_folder(index) {
+                continue;
+            }
+            let contains = if playlists.is_smart(index) {
+                playlists
+                    .smart_rule(index)
+                    .is_some_and(|rule| rule.admits(self, row, &today))
+            } else {
+                playlists
+                    .members
+                    .get(index)
+                    .is_some_and(|members| members.contains(&row))
+            };
+            if contains {
+                out.push(index);
+            }
+        }
+        out
     }
 
     /// A track's cues, ordered by position.

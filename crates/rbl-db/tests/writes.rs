@@ -7,7 +7,7 @@
 
 use rbl_db::fixture::{self, playlist_id, track_id, Shape};
 use rbl_db::write::{
-    FolderClash,
+    CueRevision, FolderClash,
     AnalysisRegistration, Changed, TrackField, Unsupported, Writer, ANALYSED_FULL, ATTRIBUTE_FOLDER,
     ATTRIBUTE_PLAYLIST, ROOT,
 };
@@ -350,6 +350,111 @@ fn a_playlist_deletion_can_be_undone_and_redone_exactly() {
     assert!(f.order(&list).is_empty());
 }
 
+/// `parent`'s live children as `(ID, Seq)`, in tree order.
+fn seq_run(f: &Fixture, parent: &str) -> Vec<(String, Option<i64>)> {
+    let mut stmt = f
+        .conn()
+        .prepare("SELECT ID, Seq FROM djmdPlaylist WHERE ParentID = ?1 AND rb_local_deleted = 0 ORDER BY Seq, ID")
+        .unwrap();
+    stmt.query_map(params![parent], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
+}
+
+fn conflict<T: std::fmt::Debug>(result: Result<T, DbError>, reason: &str) {
+    match result {
+        Err(DbError::Conflict(message)) => assert_eq!(message, reason),
+        other => panic!("expected a conflict ({reason}), got {other:?}"),
+    }
+}
+
+/// #500: a playlist made at a place renumbers its siblings; Undo tombstones
+/// the same row and gives every sibling the `Seq` it had, Redo brings the
+/// same row back with the run as the creation left it.
+#[test]
+fn a_creation_is_undone_and_redone_with_the_exact_sibling_numbering() {
+    let mut f = fixture();
+    // A gap in the run, as rekordbox leaves after a delete.
+    let gap = f.children(ROOT)[1].clone();
+    f.conn().execute("UPDATE djmdPlaylist SET Seq = Seq + 5 WHERE ID = ?1", params![gap]).unwrap();
+    let before = seq_run(&f, ROOT);
+    let rows = f.count("SELECT COUNT(*) FROM djmdPlaylist");
+
+    let (id, made) = f.writer.create_with_undo("Opening", ROOT, ATTRIBUTE_PLAYLIST, Some(1)).unwrap();
+    assert_eq!(made.id(), id);
+    let after = seq_run(&f, ROOT);
+    assert_eq!(after[1].0, id);
+    assert_ne!(after.iter().filter(|(i, _)| *i != id).cloned().collect::<Vec<_>>(), before, "renumbered");
+
+    f.writer.undo_creation(&made).unwrap();
+    assert_eq!(seq_run(&f, ROOT), before, "every sibling's Seq as it was");
+    assert_eq!(f.one::<i64>("SELECT rb_local_deleted FROM djmdPlaylist WHERE ID = ?1", &[&id]), 1, "a tombstone");
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdPlaylist"), rows + 1, "never DELETE");
+
+    f.writer.redo_creation(&made).unwrap();
+    assert_eq!(seq_run(&f, ROOT), after, "the same row in the same place");
+    conflict(f.writer.redo_creation(&made), "the playlist is already there");
+}
+
+/// #500: Undo of a creation refuses, writing nothing, when the row has had
+/// tracks or playlists put in it, or was renamed, moved or deleted since.
+#[test]
+fn undo_of_a_creation_refuses_when_the_new_row_changed_since() {
+    let mut f = fixture();
+    let (playlist, made_playlist) = f.writer.create_with_undo("Friday", ROOT, ATTRIBUTE_PLAYLIST, None).unwrap();
+    let (folder, made_folder) = f.writer.create_with_undo("Crates", ROOT, ATTRIBUTE_FOLDER, None).unwrap();
+
+    f.writer.add_tracks(&playlist, &[track_id(1)]).unwrap();
+    conflict(f.writer.undo_creation(&made_playlist), "tracks have been added to the playlist since");
+    assert_eq!(f.order(&playlist), [track_id(1)], "kept");
+    f.writer.remove_tracks(&playlist, &[track_id(1)]).unwrap();
+
+    f.writer.rename(&playlist, "Saturday").unwrap();
+    conflict(f.writer.undo_creation(&made_playlist), "the playlist has been renamed since");
+    f.writer.rename(&playlist, "Friday").unwrap();
+
+    f.writer.move_to(&playlist, &folder, None).unwrap();
+    conflict(f.writer.undo_creation(&made_folder), "playlists have been added to the folder since");
+    conflict(f.writer.undo_creation(&made_playlist), "the playlist has been moved since");
+    f.writer.move_to(&playlist, ROOT, None).unwrap();
+
+    // As made again: both undo.
+    f.writer.undo_creation(&made_playlist).unwrap();
+    f.writer.undo_creation(&made_folder).unwrap();
+    conflict(f.writer.undo_creation(&made_folder), "the playlist is no longer there");
+    assert!(!f.children(ROOT).contains(&playlist));
+}
+
+/// #500: an intelligent playlist's creation keeps its rule; Undo refuses a
+/// rule changed since, and Redo brings the row back with the rule it had.
+#[test]
+fn an_intelligent_playlist_creation_and_rule_edit_undo_exactly() {
+    let mut f = fixture();
+    let (id, made) = f.writer.create_smart_playlist_with_undo("Smart", ROOT, |id| format!("<NODE Id=\"{id}\"/>")).unwrap();
+    let first = format!("<NODE Id=\"{id}\"/>");
+    let (_, edit) = f.writer.set_smart_list_with_undo(&id, "<NODE Id=\"2\"/>").unwrap();
+    conflict(f.writer.undo_creation(&made), "the playlist's rule has changed since");
+
+    f.writer.undo_playlist_edit(&edit).unwrap();
+    assert_eq!(f.one::<String>("SELECT SmartList FROM djmdPlaylist WHERE ID = ?1", &[&id]), first);
+    conflict(f.writer.undo_playlist_edit(&edit), "the playlist's rule has changed since");
+    f.writer.undo_creation(&made).unwrap();
+    f.writer.redo_creation(&made).unwrap();
+    assert_eq!(f.one::<String>("SELECT SmartList FROM djmdPlaylist WHERE ID = ?1", &[&id]), first);
+    f.writer.redo_playlist_edit(&edit).unwrap();
+    assert_eq!(f.one::<String>("SELECT SmartList FROM djmdPlaylist WHERE ID = ?1", &[&id]), "<NODE Id=\"2\"/>");
+
+    // Playlist artwork: the reference goes back, the file stays.
+    let image = f._dir.path().join("cover-500.png");
+    std::fs::write(&image, b"\x89PNG not really").unwrap();
+    let list = playlist_id(1);
+    let before: Option<String> = f.one("SELECT ImagePath FROM djmdPlaylist WHERE ID = ?1", &[&list]);
+    let (_, artwork) = f.writer.set_playlist_artwork_with_undo(&list, Some(&image)).unwrap();
+    let after: String = f.one("SELECT ImagePath FROM djmdPlaylist WHERE ID = ?1", &[&list]);
+    f.writer.undo_playlist_edit(&artwork).unwrap();
+    assert_eq!(f.one::<Option<String>>("SELECT ImagePath FROM djmdPlaylist WHERE ID = ?1", &[&list]), before);
+    f.writer.redo_playlist_edit(&artwork).unwrap();
+    assert_eq!(f.one::<String>("SELECT ImagePath FROM djmdPlaylist WHERE ID = ?1", &[&list]), after);
+}
+
 #[test]
 fn a_delete_is_always_soft() {
     // rekordbox's sync relies on the tombstone; a real DELETE loses it.
@@ -446,6 +551,69 @@ fn setting_a_playlists_tracks_replaces_them_in_the_order_given() {
     let again = f.writer.set_tracks(&list, &[track_id(3), track_id(1)]).unwrap();
     assert_eq!(again.rows, 0, "already holding exactly these writes nothing");
     assert_eq!(f.count("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'"), usn);
+}
+
+/// #501: the rows `set_tracks_with_undo` tombstoned and wrote, for several
+/// playlists at once, swap back and forth exactly: the same row ids, in the
+/// same order, numbered 1..N, in one transaction for every playlist.
+#[test]
+fn a_set_of_playlists_tracks_undoes_and_redoes_with_the_same_rows() {
+    let mut f = fixture();
+    let first = f.writer.create_playlist("First 501", ROOT).unwrap();
+    let second = f.writer.create_playlist("Second 501", ROOT).unwrap();
+    f.writer.add_tracks(&first, &[track_id(0), track_id(1), track_id(2)]).unwrap();
+    f.writer.add_tracks(&second, &[track_id(4)]).unwrap();
+    let rows = |f: &Fixture, list: &str| -> Vec<String> {
+        let mut stmt = f.conn().prepare(
+            "SELECT ID FROM djmdSongPlaylist WHERE PlaylistID = ?1 AND rb_local_deleted = 0 ORDER BY TrackNo",
+        ).unwrap();
+        stmt.query_map([list], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    };
+    let (first_before, second_before) = (rows(&f, &first), rows(&f, &second));
+
+    let (_, unchanged) = f.writer.set_tracks_with_undo(&second, &[track_id(4)]).unwrap();
+    assert!(unchanged.is_none(), "writing nothing records nothing");
+    let (_, a) = f.writer.set_tracks_with_undo(&first, &[track_id(2), track_id(5)]).unwrap();
+    let (_, b) = f.writer.set_tracks_with_undo(&second, &[]).unwrap();
+    let edits = vec![a.unwrap(), b.unwrap()];
+    let (first_after, second_after) = (rows(&f, &first), rows(&f, &second));
+    assert_eq!(f.order(&first), vec![track_id(2), track_id(5)]);
+    assert!(second_after.is_empty());
+
+    let usn = f.count("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'");
+    let undone = f.writer.undo_membership_replacements(&edits).unwrap();
+    assert!(undone.usn > usn, "restored rows get new USNs");
+    assert_eq!(rows(&f, &first), first_before, "the old rows themselves come back");
+    assert_eq!(f.order(&first), vec![track_id(0), track_id(1), track_id(2)]);
+    assert_eq!(f.track_numbers(&first), vec![1, 2, 3]);
+    assert_eq!(rows(&f, &second), second_before);
+
+    f.writer.redo_membership_replacements(&edits).unwrap();
+    assert_eq!(rows(&f, &first), first_after);
+    assert_eq!(f.track_numbers(&first), vec![1, 2]);
+    assert!(rows(&f, &second).is_empty());
+
+    // A track added to one of them since: neither playlist is written.
+    f.writer.add_tracks(&second, &[track_id(6)]).unwrap();
+    let held = (rows(&f, &first), rows(&f, &second));
+    let err = f.writer.undo_membership_replacements(&edits).unwrap_err();
+    assert!(matches!(err, DbError::Conflict(ref reason) if reason == "the playlist's tracks have changed since"), "{err:?}");
+    assert_eq!((rows(&f, &first), rows(&f, &second)), held, "nothing was written");
+}
+
+/// #501: a row Undo would bring back must still name a track in the
+/// collection; a track removed since refuses the whole step.
+#[test]
+fn a_set_of_a_playlists_tracks_is_not_undone_onto_a_removed_track() {
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set 501", ROOT).unwrap();
+    f.writer.add_tracks(&list, &[track_id(0), track_id(1)]).unwrap();
+    let (_, edit) = f.writer.set_tracks_with_undo(&list, &[track_id(1)]).unwrap();
+    f.writer.delete_track(&track_id(0)).unwrap();
+
+    let err = f.writer.undo_membership_replacements(&[edit.unwrap()]).unwrap_err();
+    assert!(matches!(err, DbError::Conflict(_)), "{err:?}");
+    assert_eq!(f.order(&list), vec![track_id(1)]);
 }
 
 #[test]
@@ -1149,6 +1317,138 @@ fn relocating_leaves_the_analysis_and_memberships_alone() {
     assert_eq!(after, analysis, "the grid's files stay the track's");
 }
 
+/// A track's stored link to its file: `FolderPath`, `FileNameL`,
+/// `rb_file_id`, exactly as stored.
+fn link(f: &Fixture, id: &str) -> (Option<String>, Option<String>, Option<String>) {
+    f.conn()
+        .query_row(
+            "SELECT FolderPath, FileNameL, rb_file_id FROM djmdContent WHERE ID = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_relocation_run_undoes_and_redoes_every_link_at_once() {
+    // #502: one run over two tracks is one entry; Undo restores the path,
+    // the name and the file number each had, including a NULL number, and
+    // Redo the run's. The old files are not there either way.
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a moved.mp3"), dir.path().join("b moved.mp3"));
+    std::fs::write(&a, b"audio a").unwrap();
+    std::fs::write(&b, b"audio b").unwrap();
+    let mut f = fixture();
+    f.conn().execute("UPDATE djmdContent SET rb_file_id = '77' WHERE ID = ?1", params![track_id(0)]).unwrap();
+    let before = (link(&f, &track_id(0)), link(&f, &track_id(1)));
+    assert_eq!(before.1 .2, None, "the fixture's second track has no file number");
+
+    let (changed, run) = f
+        .writer
+        .relocate_with_undo(&[(track_id(0), a.clone()), (track_id(1), b.clone())])
+        .unwrap();
+    assert_eq!(changed.rows, 2);
+    assert_eq!(run.len(), 2);
+    assert!(!run.is_empty());
+    assert_eq!(run.tracks().collect::<Vec<_>>(), vec![track_id(0).as_str(), track_id(1).as_str()]);
+    let after = (link(&f, &track_id(0)), link(&f, &track_id(1)));
+    assert_eq!(after.0 .0.as_deref(), Some(a.to_string_lossy().as_ref()));
+    assert_eq!(after.1 .1.as_deref(), Some("b moved.mp3"));
+    assert_eq!(after.0 .2, Some(rbl_db::file_id::column(&a)));
+
+    let usn_before: i64 = f.one("SELECT rb_local_usn FROM djmdContent WHERE ID = ?1", &[&track_id(0)]);
+    f.writer.undo_relocation(&run).unwrap();
+    assert_eq!((link(&f, &track_id(0)), link(&f, &track_id(1))), before);
+    let usn_after: i64 = f.one("SELECT rb_local_usn FROM djmdContent WHERE ID = ?1", &[&track_id(0)]);
+    assert!(usn_after > usn_before, "an Undo is a write rekordbox must see");
+    assert!(std::fs::metadata("/fixture/audio/track000.mp3").is_err(), "the old file stays missing");
+    assert!(a.is_file() && b.is_file(), "no file is moved or deleted");
+
+    f.writer.redo_relocation(&run).unwrap();
+    assert_eq!((link(&f, &track_id(0)), link(&f, &track_id(1))), after);
+}
+
+#[test]
+fn a_relocation_names_each_track_once_and_refuses_a_run_with_a_bad_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.mp3");
+    std::fs::write(&a, b"audio").unwrap();
+    let mut f = fixture();
+    let before = link(&f, &track_id(0));
+
+    let refused = f.writer.relocate_with_undo(&[(track_id(0), a.clone()), (track_id(1), dir.path().join("none.mp3"))]);
+    assert!(matches!(refused, Err(DbError::WriteRefused(_))));
+    assert_eq!(link(&f, &track_id(0)), before, "nothing of a refused run is written");
+
+    let (_, run) = f
+        .writer
+        .relocate_with_undo(&[(track_id(0), a.clone()), (track_id(0), a.clone()), ("no such track".into(), a.clone())])
+        .unwrap();
+    assert_eq!(run.len(), 1);
+    f.writer.undo_relocation(&run).unwrap();
+    assert_eq!(link(&f, &track_id(0)), before);
+}
+
+#[test]
+fn undo_of_a_relocation_refuses_a_track_pointed_elsewhere_since() {
+    // #506's policy: the newer link stays and nothing of the run is put back.
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, c) = (dir.path().join("a.mp3"), dir.path().join("b.mp3"), dir.path().join("c.mp3"));
+    for file in [&a, &b, &c] {
+        std::fs::write(file, b"audio").unwrap();
+    }
+    let mut f = fixture();
+    let (_, run) = f.writer.relocate_with_undo(&[(track_id(0), a.clone()), (track_id(1), b.clone())]).unwrap();
+    f.writer.relocate(&track_id(1), &c).unwrap();
+    let held = (link(&f, &track_id(0)), link(&f, &track_id(1)));
+
+    let reason = f.writer.relocation_conflict(&run, true).unwrap();
+    assert_eq!(reason.as_deref(), Some("one of the tracks has been pointed at another file since"));
+    match f.writer.undo_relocation(&run) {
+        Err(DbError::Conflict(reason)) => assert_eq!(reason, "one of the tracks has been pointed at another file since"),
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+    assert_eq!((link(&f, &track_id(0)), link(&f, &track_id(1))), held, "neither track was written");
+
+    // A removed track refuses too.
+    let (_, single) = f.writer.relocate_with_undo(&[(track_id(2), a.clone())]).unwrap();
+    f.writer.delete_track(&track_id(2)).unwrap();
+    assert_eq!(
+        f.writer.relocation_conflict(&single, true).unwrap().as_deref(),
+        Some("the track is no longer in the collection"),
+    );
+}
+
+#[test]
+fn undo_and_redo_of_a_relocation_refuse_a_file_another_track_took_since() {
+    // Undo or Redo must not leave two tracks on one file: a track imported
+    // at the old (or new) place since keeps it.
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.mp3");
+    std::fs::write(&a, b"audio").unwrap();
+    let mut f = fixture();
+    let old = link(&f, &track_id(0));
+    let (_, run) = f.writer.relocate_with_undo(&[(track_id(0), a.clone())]).unwrap();
+
+    // Another track now points at the old path.
+    f.conn()
+        .execute("UPDATE djmdContent SET FolderPath = ?1 WHERE ID = ?2", params![old.0, track_id(5)])
+        .unwrap();
+    assert!(matches!(f.writer.undo_relocation(&run), Err(DbError::Conflict(reason)) if reason == "another track in the collection uses that file"));
+    f.conn()
+        .execute("UPDATE djmdContent SET FolderPath = '/fixture/audio/track005.mp3' WHERE ID = ?1", params![track_id(5)])
+        .unwrap();
+    f.writer.undo_relocation(&run).unwrap();
+    assert_eq!(link(&f, &track_id(0)), old);
+
+    // Another track now points at the new file.
+    f.conn()
+        .execute("UPDATE djmdContent SET FolderPath = ?1 WHERE ID = ?2", params![a.to_string_lossy(), track_id(5)])
+        .unwrap();
+    assert!(matches!(f.writer.redo_relocation(&run), Err(DbError::Conflict(_))));
+    assert_eq!(link(&f, &track_id(0)), old, "the refused Redo wrote nothing");
+}
+
 // ------------------------------------------------------------------- cues
 
 #[test]
@@ -1206,7 +1506,9 @@ fn a_cue_is_written_in_the_shape_the_reference_library_shows() {
     assert_eq!(kind, 1, "hot cue A");
     assert_eq!(in_ms, 45_000);
     assert_eq!(color, -1, "hot cues carry -1");
-    assert_eq!(index, 21, "the default colour rekordbox writes");
+    // rekordbox's deck stores 0, "no colour", and draws the slot's HOT CUE
+    // color default; 21 drew every cue RBXport set green (issue #593).
+    assert_eq!(index, 0, "no colour of its own, as rekordbox's deck writes");
     assert_eq!(loop_size, None, "not a loop");
     assert_eq!(active, 0);
     assert_eq!(out_ms, None);
@@ -1323,6 +1625,63 @@ fn a_hot_cue_moves_to_a_slot_and_the_cues_between_shift_over() {
     assert_eq!(kinds(&f), before);
 }
 
+/// #504: a hot cue moved across slots rewrites three rows; the revision
+/// holds those three and no other, and Undo/Redo write them back exactly
+/// under a new change counter, as any other edit.
+#[test]
+fn a_cue_revision_names_only_the_rows_the_command_changed_and_restores_them() {
+    let mut f = fixture();
+    let track = track_id(0);
+    let a = f.writer.add_cue(&track, 1, 1_000).unwrap();
+    let b = f.writer.add_cue(&track, 2, 2_000).unwrap();
+    let c = f.writer.add_cue(&track, 3, 3_000).unwrap();
+    let memory = f.writer.add_cue(&track, 0, 9_000).unwrap();
+    let other = f.writer.add_cue(&track_id(1), 1, 1_000).unwrap();
+    let kinds = |f: &Fixture| -> Vec<i64> {
+        [&a, &b, &c, &memory].iter().map(|id| f.one("SELECT Kind FROM djmdCue WHERE ID = ?1", &[*id])).collect()
+    };
+
+    let before = f.writer.cue_rows(&track).unwrap();
+    f.writer.move_hot_cue(&c, 1).unwrap();
+    let after = f.writer.cue_rows(&track).unwrap();
+    let revision = CueRevision::between(&track, &before, &after);
+    assert_eq!(kinds(&f), [2, 3, 1, 0]);
+
+    let usn: i64 = f.one("SELECT rb_local_usn FROM djmdCue WHERE ID = ?1", &[&c]);
+    assert_eq!(f.writer.undo_cue_revision(&revision).unwrap().rows, 3, "A, B and C; not the memory cue");
+    assert_eq!(kinds(&f), [1, 2, 3, 0]);
+    let undone: i64 = f.one("SELECT rb_local_usn FROM djmdCue WHERE ID = ?1", &[&c]);
+    assert!(undone > usn, "the restored rows carry a new change counter for rekordbox's sync");
+    f.writer.redo_cue_revision(&revision).unwrap();
+    assert_eq!(kinds(&f), [2, 3, 1, 0]);
+    let theirs: i64 = f.one("SELECT Kind FROM djmdCue WHERE ID = ?1", &[&other]);
+    assert_eq!(theirs, 1, "another track's cue is never named");
+}
+
+/// An add is undone as a soft delete of the same row, and a revision whose
+/// rows changed since is refused in the transaction that would write it.
+#[test]
+fn a_cue_revision_refuses_rows_changed_since() {
+    let mut f = fixture();
+    let track = track_id(0);
+    let before = f.writer.cue_rows(&track).unwrap();
+    let id = f.writer.add_cue(&track, 0, 1_000).unwrap();
+    let revision = CueRevision::between(&track, &before, &f.writer.cue_rows(&track).unwrap());
+    assert!(!revision.is_empty());
+
+    f.writer.undo_cue_revision(&revision).unwrap();
+    let deleted: i64 = f.one("SELECT rb_local_deleted FROM djmdCue WHERE ID = ?1", &[&id]);
+    assert_eq!(deleted, 1);
+    assert_eq!(f.writer.cue_revision_conflict(&revision, false).unwrap(), None);
+    f.writer.redo_cue_revision(&revision).unwrap();
+
+    f.writer.move_cue(&id, 5_000).unwrap();
+    assert!(f.writer.cue_revision_conflict(&revision, true).unwrap().is_some());
+    assert!(matches!(f.writer.undo_cue_revision(&revision), Err(DbError::Conflict(_))));
+    let position: i64 = f.one("SELECT InMsec FROM djmdCue WHERE ID = ?1", &[&id]);
+    assert_eq!(position, 5_000, "the newer move kept");
+}
+
 #[test]
 fn a_memory_cue_has_no_slot_to_move_to_or_from() {
     let mut f = fixture();
@@ -1385,7 +1744,28 @@ fn cue_colours_use_the_field_rekordbox_assigns_to_each_kind() {
     f.writer.set_cue_colour(&memory, None).unwrap();
     f.writer.set_cue_colour(&hot, None).unwrap();
     assert_eq!(columns(&f.writer, &memory), (255, 0));
-    assert_eq!(columns(&f.writer, &hot), (-1, 21));
+    // Reset is `changePadColour(0)` in rekordbox: back to the slot default.
+    assert_eq!(columns(&f.writer, &hot), (-1, 0));
+}
+
+#[test]
+fn hot_cues_and_hot_loops_are_added_without_a_colour_of_their_own() {
+    // Issue #593: every slot, and a hot loop, starts with ColorTableIndex 0
+    // so the HOT CUE color table picks its colour, as on rekordbox's deck.
+    let mut f = fixture();
+    let cues: Vec<String> = [1_u8, 2, 3, 5, 6, 17]
+        .iter()
+        .enumerate()
+        .map(|(n, kind)| f.writer.add_cue(&track_id(0), *kind, 1_000 * (n as u32 + 1)).unwrap())
+        .collect();
+    let looped = f.writer.add_loop(&track_id(0), 9, 20_000, 22_000, 4).unwrap();
+    for id in cues.iter().chain([&looped]) {
+        let (color, index): (i64, i64) = f.conn().query_row(
+            "SELECT Color, ColorTableIndex FROM djmdCue WHERE ID = ?1", params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!((color, index), (-1, 0), "cue {id}");
+    }
 }
 
 #[test]
@@ -2477,6 +2857,602 @@ fn my_tags_are_set_as_a_whole_and_read_back_on_the_details() {
 }
 
 #[test]
+fn a_new_my_tag_is_named_as_rekordbox_names_one() {
+    use rbl_db::write::new_my_tag_name;
+    let names = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    assert_eq!(new_my_tag_name(&[]), "My Comment");
+    assert_eq!(new_my_tag_name(&names(&["Peak"])), "My Comment");
+    assert_eq!(new_my_tag_name(&names(&["My Comment"])), "My Comment (1)");
+    // The scan starts over after each bump, so the order does not matter.
+    assert_eq!(new_my_tag_name(&names(&["My Comment (1)", "My Comment"])), "My Comment (2)");
+    assert_eq!(new_my_tag_name(&names(&["My Comment", "My Comment (2)"])), "My Comment (1)");
+    // Compared exactly, as juce::String::compare does.
+    assert_eq!(new_my_tag_name(&names(&["my comment"])), "My Comment");
+}
+
+#[test]
+fn adding_my_tag_writes_the_row_rekordbox_writes() {
+    use rbl_db::fixture::{MY_TAG_CATEGORY, MY_TAG_WARM_UP};
+    let mut f = fixture();
+    let before_usn: i64 = f.count("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'");
+    let made = f.writer.create_my_tag(MY_TAG_CATEGORY).unwrap();
+    assert_eq!(made.name, "My Comment");
+    let id: u64 = made.id.parse().expect("a decimal id");
+    assert!((5..u64::from(u32::MAX)).contains(&id), "a 32-bit id past the categories' 1 to 4");
+
+    let (seq, name, attribute, parent, uuid, usn, local_usn, created, updated): (
+        i64, String, i64, String, String, Option<i64>, i64, String, String,
+    ) = f.conn().query_row(
+        "SELECT Seq, Name, Attribute, ParentID, UUID, usn, rb_local_usn, created_at, updated_at
+         FROM djmdMyTag WHERE ID = ?1",
+        params![made.id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
+    ).unwrap();
+    assert_eq!(seq, 3, "after Peak (1) and Warm-up (2)");
+    assert_eq!(name, "My Comment");
+    assert_eq!(attribute, 0);
+    assert_eq!(parent, MY_TAG_CATEGORY);
+    assert_eq!(uuid.len(), 36);
+    assert_eq!(uuid.as_bytes()[14], b'4', "a version 4 UUID");
+    assert_eq!(usn, None);
+    assert!(local_usn > before_usn);
+    assert_eq!(created, updated);
+    let counter: i64 = f.count("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'");
+    assert_eq!(counter, local_usn);
+
+    // The next one in the same category takes the next free name and Seq.
+    let second = f.writer.create_my_tag(MY_TAG_CATEGORY).unwrap();
+    assert_eq!(second.name, "My Comment (1)");
+    let seq: i64 = f.one("SELECT Seq FROM djmdMyTag WHERE ID = ?1", &[&second.id]);
+    assert_eq!(seq, 4);
+
+    // Only under a live category.
+    assert!(matches!(f.writer.create_my_tag(MY_TAG_WARM_UP), Err(DbError::WriteRefused(_))));
+    assert!(matches!(f.writer.create_my_tag("no-such-category"), Err(DbError::WriteRefused(_))));
+}
+
+#[test]
+fn a_my_tag_category_takes_at_most_fifty_tags() {
+    use rbl_db::fixture::MY_TAG_CATEGORY;
+    use rbl_db::write::MY_TAG_LIMIT;
+    let mut f = fixture();
+    // The fixture's category already holds two.
+    for _ in 2..MY_TAG_LIMIT {
+        f.writer.create_my_tag(MY_TAG_CATEGORY).unwrap();
+    }
+    assert_eq!(
+        f.one::<i64>("SELECT COUNT(*) FROM djmdMyTag WHERE ParentID = ?1 AND rb_local_deleted = 0", &[&MY_TAG_CATEGORY]),
+        50
+    );
+    assert!(matches!(f.writer.create_my_tag(MY_TAG_CATEGORY), Err(DbError::WriteRefused(_))));
+}
+
+#[test]
+fn renaming_a_my_tag_refuses_a_name_its_category_already_has() {
+    use rbl_db::fixture::{MY_TAG_CATEGORY, MY_TAG_PEAK, MY_TAG_WARM_UP};
+    use rbl_db::write::MY_TAG_NAME_TAKEN;
+    let mut f = fixture();
+    let changed = f.writer.rename_my_tag(MY_TAG_PEAK, "Peak Time").unwrap();
+    assert_eq!(changed.rows, 1);
+    let name: String = f.one("SELECT Name FROM djmdMyTag WHERE ID = ?1", &[&MY_TAG_PEAK]);
+    assert_eq!(name, "Peak Time");
+    let local: i64 = f.one("SELECT rb_local_usn FROM djmdMyTag WHERE ID = ?1", &[&MY_TAG_PEAK]);
+    assert_eq!(local, changed.usn);
+
+    match f.writer.rename_my_tag(MY_TAG_WARM_UP, "Peak Time") {
+        Err(DbError::WriteRefused(message)) => assert_eq!(message, MY_TAG_NAME_TAKEN),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    // Exact match only, and its own name again is no change at all.
+    f.writer.rename_my_tag(MY_TAG_WARM_UP, "peak time").unwrap();
+    assert_eq!(f.writer.rename_my_tag(MY_TAG_WARM_UP, "peak time").unwrap().rows, 0);
+    // A category renames too; an empty name or an unknown id does not.
+    f.writer.rename_my_tag(MY_TAG_CATEGORY, "When").unwrap();
+    let category: String = f.one("SELECT Name FROM djmdMyTag WHERE ID = ?1", &[&MY_TAG_CATEGORY]);
+    assert_eq!(category, "When");
+    assert!(matches!(f.writer.rename_my_tag(MY_TAG_PEAK, ""), Err(DbError::WriteRefused(_))));
+    assert!(matches!(f.writer.rename_my_tag("no-such-tag", "X"), Err(DbError::WriteRefused(_))));
+}
+
+#[test]
+fn deleting_a_my_tag_marks_it_and_its_tracks_deleted_and_closes_the_gap() {
+    use rbl_db::fixture::{MY_TAG_CATEGORY, MY_TAG_PEAK, MY_TAG_WARM_UP};
+    let mut f = fixture();
+    let third = f.writer.create_my_tag(MY_TAG_CATEGORY).unwrap();
+    f.writer.set_my_tags(&track_id(1), &[MY_TAG_PEAK.to_owned(), MY_TAG_WARM_UP.to_owned()]).unwrap();
+    f.writer.set_my_tags(&track_id(2), &[MY_TAG_PEAK.to_owned()]).unwrap();
+    let third_usn: i64 = f.one("SELECT rb_local_usn FROM djmdMyTag WHERE ID = ?1", &[&third.id]);
+
+    let changed = f.writer.delete_my_tag(MY_TAG_PEAK).unwrap();
+    // The tag, the two siblings renumbered, the two memberships.
+    assert_eq!(changed.rows, 5);
+    assert_eq!(f.one::<i64>("SELECT rb_local_deleted FROM djmdMyTag WHERE ID = ?1", &[&MY_TAG_PEAK]), 1);
+    assert_eq!(
+        f.count("SELECT COUNT(*) FROM djmdSongMyTag WHERE MyTagID = '700002' AND rb_local_deleted = 0"),
+        0
+    );
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdSongMyTag WHERE MyTagID = '700002' AND rb_local_deleted = 1"), 2);
+    let seqs: Vec<(String, i64, i64)> = {
+        let mut s = f.conn().prepare(
+            "SELECT ID, Seq, rb_local_usn FROM djmdMyTag WHERE ParentID = ?1 AND rb_local_deleted = 0 ORDER BY Seq",
+        ).unwrap();
+        s.query_map(params![MY_TAG_CATEGORY], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect()
+    };
+    assert_eq!(seqs.iter().map(|(id, seq, _)| (id.as_str(), *seq)).collect::<Vec<_>>(), vec![(MY_TAG_WARM_UP, 1), (third.id.as_str(), 2)]);
+    // Both moved rows share one update number, past the third tag's own.
+    assert_eq!(seqs[0].2, seqs[1].2);
+    assert!(seqs[0].2 > third_usn);
+    // Warm-up stays on track 1.
+    let read = rbl_db::details::track_details(f.conn(), &track_id(1)).unwrap().unwrap();
+    assert_eq!(read.my_tags, vec![MY_TAG_WARM_UP.to_owned()]);
+
+    assert!(matches!(f.writer.delete_my_tag(MY_TAG_CATEGORY), Err(DbError::WriteRefused(_))));
+    assert!(matches!(f.writer.delete_my_tag(MY_TAG_PEAK), Err(DbError::WriteRefused(_))));
+}
+
+#[test]
+fn a_my_tag_tick_puts_one_tag_on_or_off_and_keeps_the_rest() {
+    use rbl_db::fixture::{MY_TAG_PEAK, MY_TAG_WARM_UP};
+    let mut f = fixture();
+    let id = track_id(4);
+    f.writer.set_my_tags(&id, &[MY_TAG_WARM_UP.to_owned()]).unwrap();
+    let (_, edit) = f.writer.put_my_tag_with_undo(&id, MY_TAG_PEAK, true).unwrap();
+    assert!(!edit.is_empty());
+    let read = rbl_db::details::track_details(f.conn(), &id).unwrap().unwrap();
+    let mut tags = read.my_tags.clone();
+    tags.sort();
+    assert_eq!(tags, vec![MY_TAG_PEAK.to_owned(), MY_TAG_WARM_UP.to_owned()]);
+    // Already on: nothing written.
+    let (changed, again) = f.writer.put_my_tag_with_undo(&id, MY_TAG_PEAK, true).unwrap();
+    assert_eq!(changed.rows, 0);
+    assert!(again.is_empty());
+    // Undo goes back to the set before.
+    f.writer.undo_tag_edit(&edit).unwrap();
+    let read = rbl_db::details::track_details(f.conn(), &id).unwrap().unwrap();
+    assert_eq!(read.my_tags, vec![MY_TAG_WARM_UP.to_owned()]);
+    f.writer.put_my_tag_with_undo(&id, MY_TAG_WARM_UP, false).unwrap();
+    let read = rbl_db::details::track_details(f.conn(), &id).unwrap().unwrap();
+    assert!(read.my_tags.is_empty());
+}
+
+#[test]
+fn a_selection_shows_the_my_tags_all_its_tracks_share() {
+    use rbl_db::details::shared_my_tags;
+    use rbl_db::fixture::{MY_TAG_PEAK, MY_TAG_WARM_UP};
+    let mut f = fixture();
+    f.writer.set_my_tags(&track_id(1), &[MY_TAG_PEAK.to_owned(), MY_TAG_WARM_UP.to_owned()]).unwrap();
+    f.writer.set_my_tags(&track_id(2), &[MY_TAG_PEAK.to_owned()]).unwrap();
+    let ids = |list: &[usize]| list.iter().map(|&i| track_id(i)).collect::<Vec<_>>();
+    let mut one = shared_my_tags(f.conn(), &ids(&[1]));
+    one.sort();
+    assert_eq!(one, vec![MY_TAG_PEAK.to_owned(), MY_TAG_WARM_UP.to_owned()]);
+    assert_eq!(shared_my_tags(f.conn(), &ids(&[1, 2])), vec![MY_TAG_PEAK.to_owned()]);
+    assert!(shared_my_tags(f.conn(), &ids(&[1, 2, 3])).is_empty());
+    assert!(shared_my_tags(f.conn(), &[]).is_empty());
+}
+
+#[test]
+fn my_tag_deltas_preserve_other_assignments_and_are_retry_safe() {
+    use rbl_db::fixture::{MY_TAG_PEAK, MY_TAG_WARM_UP};
+    use rbl_db::write::MyTagOperation::{Add, Remove};
+    let mut f = fixture();
+    let id = track_id(2);
+    let warm = MY_TAG_WARM_UP.to_owned();
+    let peak = MY_TAG_PEAK.to_owned();
+    f.writer.set_my_tags(&id, std::slice::from_ref(&warm)).unwrap();
+    let row_before: Vec<rusqlite::types::Value> = {
+        let mut statement = f.conn().prepare("SELECT * FROM djmdContent WHERE ID = ?1").unwrap();
+        let columns = statement.column_count();
+        statement.query_row([&id], |row| (0..columns).map(|column| row.get(column)).collect()).unwrap()
+    };
+    let (changed, edit) = f.writer.update_my_tags_with_undo(&id, &[peak.clone(), peak.clone()], Add).unwrap();
+    assert_eq!(changed.rows, 1);
+    assert!(!edit.is_empty());
+    let tags = |f: &Fixture| rbl_db::details::track_details(f.conn(), &id).unwrap().unwrap().my_tags;
+    assert_eq!(tags(&f), vec![peak.clone(), warm.clone()]);
+    let counter: i64 = f.one("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'", &[]);
+    let (changed, retry) = f.writer.update_my_tags_with_undo(&id, std::slice::from_ref(&peak), Add).unwrap();
+    assert_eq!(changed.rows, 0);
+    assert!(retry.is_empty());
+    assert_eq!(counter, f.one::<i64>("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'", &[]));
+    f.writer.undo_tag_edit(&edit).unwrap();
+    assert_eq!(tags(&f), vec![warm.clone()]);
+    f.writer.redo_tag_edit(&edit).unwrap();
+    assert_eq!(tags(&f), vec![peak.clone(), warm.clone()]);
+    let (changed, removed) = f.writer.update_my_tags_with_undo(&id, std::slice::from_ref(&peak), Remove).unwrap();
+    assert_eq!(changed.rows, 1);
+    assert_eq!(tags(&f), vec![warm.clone()]);
+    assert!(f.writer.update_my_tags_with_undo(&id, &[peak.clone(), peak], Remove).unwrap().1.is_empty());
+    assert!(f.writer.update_my_tags_with_undo(&id, &[], Add).unwrap().1.is_empty());
+    assert!(f.writer.update_my_tags_with_undo(&id, &[], Remove).unwrap().1.is_empty());
+    f.writer.undo_tag_edit(&removed).unwrap();
+    let mut statement = f.conn().prepare("SELECT * FROM djmdContent WHERE ID = ?1").unwrap();
+    let columns = statement.column_count();
+    let row_after: Vec<rusqlite::types::Value> = statement.query_row([&id], |row| (0..columns).map(|column| row.get(column)).collect()).unwrap();
+    assert_eq!(row_before, row_after, "tag editing must not alter any track metadata column");
+}
+
+#[test]
+fn my_tag_deltas_validate_every_id_before_writing() {
+    use rbl_db::fixture::{MY_TAG_PEAK, MY_TAG_WARM_UP};
+    use rbl_db::write::MyTagOperation::{Add, Remove};
+    let mut f = fixture();
+    let id = track_id(2);
+    f.writer.set_my_tags(&id, &[MY_TAG_WARM_UP.to_owned()]).unwrap();
+    for operation in [Add, Remove] {
+        assert!(f.writer.update_my_tags_with_undo(&id, &[MY_TAG_PEAK.to_owned(), "unknown".into()], operation).is_err());
+        assert!(f.writer.update_my_tags_with_undo("missing", &[], operation).is_err());
+        let read = rbl_db::details::track_details(f.conn(), &id).unwrap().unwrap();
+        assert_eq!(read.my_tags, vec![MY_TAG_WARM_UP.to_owned()]);
+    }
+    let category: String = f.one("SELECT ID FROM djmdMyTag WHERE Attribute = 1 LIMIT 1", &[]);
+    assert!(f.writer.update_my_tags_with_undo(&id, &[category], Add).is_err());
+    f.conn().execute("UPDATE djmdMyTag SET rb_local_deleted = 1 WHERE ID = ?1", [MY_TAG_PEAK]).unwrap();
+    assert!(f.writer.update_my_tags_with_undo(&id, &[MY_TAG_PEAK.to_owned()], Add).is_err());
+}
+
+#[test]
+fn my_tag_delta_rolls_back_when_a_later_insert_fails() {
+    use rbl_db::fixture::{MY_TAG_PEAK, MY_TAG_WARM_UP};
+    use rbl_db::write::MyTagOperation::Add;
+    let mut f = fixture();
+    let id = track_id(2);
+    f.conn().execute_batch(&format!(
+        "CREATE TRIGGER fail_second_tag BEFORE INSERT ON djmdSongMyTag WHEN NEW.MyTagID = '{MY_TAG_WARM_UP}' BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;"
+    )).unwrap();
+    let counter: i64 = f.one("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'", &[]);
+    assert!(f.writer.update_my_tags_with_undo(&id, &[MY_TAG_PEAK.to_owned(), MY_TAG_WARM_UP.to_owned()], Add).is_err());
+    assert!(rbl_db::details::track_details(f.conn(), &id).unwrap().unwrap().my_tags.is_empty());
+    assert_eq!(counter, f.one::<i64>("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'", &[]));
+}
+
+fn comment_of(f: &Fixture, id: &str) -> Option<String> {
+    f.one("SELECT Commnt FROM djmdContent WHERE ID = ?1", &[&id])
+}
+
+fn local_usn_of(f: &Fixture, id: &str) -> i64 {
+    f.one("SELECT rb_local_usn FROM djmdContent WHERE ID = ?1", &[&id])
+}
+
+/// Add "My Tag" to the "Comments" after a tick (#605): the comment up to
+/// its first ` /* `, then the track's tags in the order they were put on it.
+#[test]
+fn a_my_tag_edit_writes_the_tags_after_the_comment_in_the_order_they_were_put_on() {
+    use rbl_db::fixture::{MY_TAG_PEAK, MY_TAG_WARM_UP};
+    let mut f = fixture();
+    let id = track_id(2);
+    f.writer.set_comment(&id, "Visit https://example.bandcamp.com").unwrap();
+
+    // Warm-up first, then Peak: the block keeps that order, not the panel's.
+    f.writer.put_my_tag_with_undo(&id, MY_TAG_WARM_UP, true).unwrap();
+    let (_, first) = f.writer.refresh_my_tag_comment_with_undo(&id).unwrap();
+    assert!(!first.is_empty());
+    assert_eq!(comment_of(&f, &id).as_deref(), Some("Visit https://example.bandcamp.com /* Warm-up */"));
+    f.writer.put_my_tag_with_undo(&id, MY_TAG_PEAK, true).unwrap();
+    f.writer.refresh_my_tag_comment_with_undo(&id).unwrap();
+    assert_eq!(comment_of(&f, &id).as_deref(), Some("Visit https://example.bandcamp.com /* Warm-up / Peak */"));
+
+    // A comment that already reads so is not written again.
+    let usn = local_usn_of(&f, &id);
+    let (changed, same) = f.writer.refresh_my_tag_comment_with_undo(&id).unwrap();
+    assert_eq!(changed.rows, 0);
+    assert!(same.is_empty());
+    assert_eq!(local_usn_of(&f, &id), usn);
+
+    // Text typed after the block goes with it; text before it stays.
+    f.writer.set_comment(&id, "Keep /* stale */ typed after").unwrap();
+    f.writer.refresh_my_tag_comment_with_undo(&id).unwrap();
+    assert_eq!(comment_of(&f, &id).as_deref(), Some("Keep /* Warm-up / Peak */"));
+
+    // A rename shows on the next refresh.
+    f.writer.rename_my_tag(MY_TAG_PEAK, "Peak Time").unwrap();
+    f.writer.refresh_my_tag_comment_with_undo(&id).unwrap();
+    assert_eq!(comment_of(&f, &id).as_deref(), Some("Keep /* Warm-up / Peak Time */"));
+
+    // Taking a tag off, or deleting it, takes it out; the last one gone
+    // takes the whole block off.
+    f.writer.put_my_tag_with_undo(&id, MY_TAG_WARM_UP, false).unwrap();
+    f.writer.refresh_my_tag_comment_with_undo(&id).unwrap();
+    assert_eq!(comment_of(&f, &id).as_deref(), Some("Keep /* Peak Time */"));
+    f.writer.delete_my_tag(MY_TAG_PEAK).unwrap();
+    let (_, last) = f.writer.refresh_my_tag_comment_with_undo(&id).unwrap();
+    assert_eq!(comment_of(&f, &id).as_deref(), Some("Keep"));
+
+    // The edit undoes to the exact comment, and is refused once the
+    // comment changed since.
+    f.writer.undo_track_edit(&last).unwrap();
+    assert_eq!(comment_of(&f, &id).as_deref(), Some("Keep /* Peak Time */"));
+    f.writer.set_comment(&id, "typed since").unwrap();
+    assert!(matches!(f.writer.redo_track_edit(&last), Err(DbError::Conflict(_))));
+
+    assert!(matches!(f.writer.refresh_my_tag_comment_with_undo("no-such-track"), Err(DbError::WriteRefused(_))));
+}
+
+/// A track with no My Tag and no block is not written at all, and a NULL
+/// comment stays NULL.
+#[test]
+fn a_my_tag_refresh_leaves_a_track_without_tags_alone() {
+    let mut f = fixture();
+    let id = track_id(3);
+    f.conn().execute("UPDATE djmdContent SET Commnt = NULL WHERE ID = ?1", [&id]).unwrap();
+    let usn = local_usn_of(&f, &id);
+    let (changed, edit) = f.writer.refresh_my_tag_comment_with_undo(&id).unwrap();
+    assert_eq!(changed.rows, 0);
+    assert!(edit.is_empty());
+    assert_eq!(comment_of(&f, &id), None);
+    assert_eq!(local_usn_of(&f, &id), usn);
+}
+
+/// Turning the setting on and off (#605, `WriteOrEraseMyTagWindow::run`):
+/// every track with a My Tag, its tags in the panel's order; one Undo.
+#[test]
+fn turning_my_tag_comments_on_and_off_rewrites_every_tagged_track_and_undoes_at_once() {
+    use rbl_db::fixture::{MY_TAG_PEAK, MY_TAG_WARM_UP};
+    let mut f = fixture();
+    my_tag_taxonomy(&f);
+    // Put on in the opposite order to the panel's: Situation (Peak,
+    // Warm-up) comes before Genre (House, Techno).
+    f.writer.set_my_tags(&track_id(1), &ids(&["800003"])).unwrap();
+    f.writer.put_my_tag_with_undo(&track_id(1), MY_TAG_WARM_UP, true).unwrap();
+    f.writer.put_my_tag_with_undo(&track_id(1), MY_TAG_PEAK, true).unwrap();
+    f.writer.set_comment(&track_id(1), "Bandcamp").unwrap();
+    f.writer.set_my_tags(&track_id(2), &ids(&["800002"])).unwrap();
+    f.writer.set_comment(&track_id(2), &"x".repeat(249)).unwrap();
+    // No My Tag: left alone, stale block and all.
+    f.writer.set_comment(&track_id(3), "Untagged /* Old */").unwrap();
+    let untagged_usn = local_usn_of(&f, &track_id(3));
+    let before = counter(&f);
+
+    let (changed, edits) = f.writer.write_my_tag_comments_with_undo(true).unwrap();
+    assert_eq!(comment_of(&f, &track_id(1)).as_deref(), Some("Bandcamp /* Peak / Warm-up / Techno */"));
+    // Past 248 characters: no block.
+    assert_eq!(comment_of(&f, &track_id(2)).as_deref(), Some("x".repeat(249).as_str()));
+    assert_eq!(comment_of(&f, &track_id(3)).as_deref(), Some("Untagged /* Old */"));
+    assert_eq!(local_usn_of(&f, &track_id(3)), untagged_usn);
+    assert_eq!(changed.rows, 1);
+    assert_eq!(edits.len(), 1);
+    assert_eq!(counter(&f), changed.usn);
+    assert!(changed.usn > before);
+
+    // Again: nothing left to write.
+    let (again, none) = f.writer.write_my_tag_comments_with_undo(true).unwrap();
+    assert_eq!(again.rows, 0);
+    assert!(none.is_empty());
+
+    // Off takes the block off the tagged tracks only.
+    let (_, erased) = f.writer.write_my_tag_comments_with_undo(false).unwrap();
+    assert_eq!(comment_of(&f, &track_id(1)).as_deref(), Some("Bandcamp"));
+    assert_eq!(comment_of(&f, &track_id(3)).as_deref(), Some("Untagged /* Old */"));
+    assert_eq!(erased.len(), 1);
+
+    // Undo and Redo of a run, in one transaction each.
+    f.writer.step_track_edits_at_once(&erased, true).unwrap();
+    assert_eq!(comment_of(&f, &track_id(1)).as_deref(), Some("Bandcamp /* Peak / Warm-up / Techno */"));
+    f.writer.step_track_edits_at_once(&erased, false).unwrap();
+    assert_eq!(comment_of(&f, &track_id(1)).as_deref(), Some("Bandcamp"));
+    f.writer.step_track_edits_at_once(&erased, true).unwrap();
+    f.writer.step_track_edits_at_once(&edits, true).unwrap();
+    assert_eq!(comment_of(&f, &track_id(1)).as_deref(), Some("Bandcamp"));
+}
+
+#[test]
+fn undo_of_a_my_tag_comment_run_writes_nothing_when_one_track_changed_since() {
+    use rbl_db::fixture::{MY_TAG_PEAK, MY_TAG_WARM_UP};
+    let mut f = fixture();
+    f.writer.set_my_tags(&track_id(1), &[MY_TAG_PEAK.to_owned()]).unwrap();
+    f.writer.set_my_tags(&track_id(2), &[MY_TAG_WARM_UP.to_owned()]).unwrap();
+    f.writer.set_comment(&track_id(1), "one").unwrap();
+    f.writer.set_comment(&track_id(2), "two").unwrap();
+    let (_, edits) = f.writer.write_my_tag_comments_with_undo(true).unwrap();
+    assert_eq!(edits.len(), 2);
+    f.writer.set_comment(&track_id(2), "typed since").unwrap();
+    let usn = counter(&f);
+    assert!(matches!(f.writer.step_track_edits_at_once(&edits, true), Err(DbError::Conflict(_))));
+    assert_eq!(comment_of(&f, &track_id(1)).as_deref(), Some("one /* Peak */"));
+    assert_eq!(comment_of(&f, &track_id(2)).as_deref(), Some("typed since"));
+    assert_eq!(counter(&f), usn);
+}
+
+/// A second category ("Genre", Seq 2) with three tags, and a third
+/// ("Mood", Seq 3) with none, beside the fixture's "Situation" (#584).
+fn my_tag_taxonomy(f: &Fixture) {
+    for (id, seq, name, attribute, parent) in [
+        ("800001", 2, "Genre", 1, "root"),
+        ("800002", 1, "House", 0, "800001"),
+        ("800003", 2, "Techno", 0, "800001"),
+        ("800004", 5, "Disco", 0, "800001"),
+        ("800005", 3, "Mood", 1, "root"),
+        // A deleted tag keeps its place out of every run.
+        ("800006", 3, "Gone", 0, "800001"),
+    ] {
+        f.conn().execute(
+            "INSERT INTO djmdMyTag
+                (ID, Seq, Name, Attribute, ParentID, UUID,
+                 rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced,
+                 usn, rb_local_usn, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, 0, NULL, 1, '2026-01-01', '2026-01-01')",
+            params![id, seq, name, attribute, parent, format!("uuid-{id}")],
+        ).unwrap();
+    }
+    f.conn().execute("UPDATE djmdMyTag SET rb_local_deleted = 1 WHERE ID = '800006'", []).unwrap();
+}
+
+/// Every `djmdMyTag` row, whole, so a refused or empty reorder can be shown
+/// to have written nothing.
+fn my_tag_rows(f: &Fixture) -> Vec<Vec<rusqlite::types::Value>> {
+    let mut statement = f.conn().prepare("SELECT * FROM djmdMyTag ORDER BY ID").unwrap();
+    let columns = statement.column_count();
+    statement.query_map([], |row| (0..columns).map(|column| row.get(column)).collect()).unwrap()
+        .map(Result::unwrap).collect()
+}
+
+/// `(ID, Seq)` of one run as rekordbox reads it.
+fn my_tag_run(f: &Fixture, parent: &str) -> Vec<(String, i64)> {
+    let mut statement = f.conn().prepare(
+        "SELECT ID, Seq FROM djmdMyTag WHERE ParentID = ?1 AND rb_local_deleted = 0 ORDER BY Seq, ID",
+    ).unwrap();
+    statement.query_map([parent], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
+}
+
+fn ids(list: &[&str]) -> Vec<String> {
+    list.iter().map(|&id| id.to_owned()).collect()
+}
+
+#[test]
+fn reordering_my_tags_renumbers_one_run_and_keeps_ids_names_parents_and_memberships() {
+    use rbl_db::fixture::{MY_TAG_CATEGORY, MY_TAG_PEAK};
+    let mut f = fixture();
+    my_tag_taxonomy(&f);
+    f.writer.set_my_tags(&track_id(1), &ids(&[MY_TAG_PEAK, "800003"])).unwrap();
+    let members = |f: &Fixture| -> Vec<(String, String, i64)> {
+        let mut s = f.conn().prepare(
+            "SELECT ContentID, MyTagID, rb_local_deleted FROM djmdSongMyTag ORDER BY ContentID, MyTagID",
+        ).unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect()
+    };
+    let members_before = members(&f);
+    let names_before: Vec<(String, String, String, i64)> = {
+        let mut s = f.conn().prepare("SELECT ID, Name, ParentID, Attribute FROM djmdMyTag ORDER BY ID").unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().map(Result::unwrap).collect()
+    };
+    let counter: i64 = f.one("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'", &[]);
+    let situation_before = my_tag_run(&f, MY_TAG_CATEGORY);
+
+    let (changed, edit) = f.writer.reorder_my_tags_with_undo(&ids(&["800004", "800002", "800003"])).unwrap();
+    assert!(!edit.is_empty());
+    assert_eq!(edit.parent(), "800001");
+    // Disco 5 -> 1, House 1 -> 2, Techno 2 -> 3: all three moved.
+    assert_eq!(changed.rows, 3);
+    assert_eq!(my_tag_run(&f, "800001"), vec![
+        ("800004".to_owned(), 1), ("800002".to_owned(), 2), ("800003".to_owned(), 3),
+    ]);
+    // Each renumbered row its own update number, as rekordbox's Move gives.
+    let usns: Vec<i64> = {
+        let mut s = f.conn().prepare(
+            "SELECT rb_local_usn FROM djmdMyTag WHERE ParentID = '800001' AND rb_local_deleted = 0 ORDER BY Seq",
+        ).unwrap();
+        s.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    };
+    assert_eq!(usns, vec![counter + 1, counter + 2, counter + 3]);
+    assert_eq!(counter + 3, f.one::<i64>("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'", &[]));
+    // Nothing outside the run moved; no id, name, parent or kind changed;
+    // no membership touched; the deleted tag kept its number.
+    assert_eq!(my_tag_run(&f, MY_TAG_CATEGORY), situation_before);
+    assert_eq!(f.one::<i64>("SELECT Seq FROM djmdMyTag WHERE ID = '800006'", &[]), 3);
+    let names_after: Vec<(String, String, String, i64)> = {
+        let mut s = f.conn().prepare("SELECT ID, Name, ParentID, Attribute FROM djmdMyTag ORDER BY ID").unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().map(Result::unwrap).collect()
+    };
+    assert_eq!(names_before, names_after);
+    assert_eq!(members_before, members(&f));
+
+    // The catalog reads the new order back.
+    let genre: Vec<String> = rbl_db::export_info::my_tags(f.conn()).unwrap().into_iter()
+        .filter(|row| row.parent == "800001").map(|row| row.name).collect();
+    assert_eq!(genre, vec!["Disco", "House", "Techno"]);
+
+    // The same order again writes nothing.
+    let rows = my_tag_rows(&f);
+    let (changed, again) = f.writer.reorder_my_tags_with_undo(&ids(&["800004", "800002", "800003"])).unwrap();
+    assert_eq!(changed.rows, 0);
+    assert!(again.is_empty());
+    assert_eq!(rows, my_tag_rows(&f));
+
+    // Moving one tag writes only the rows whose number changes.
+    let (changed, _) = f.writer.reorder_my_tags_with_undo(&ids(&["800004", "800003", "800002"])).unwrap();
+    assert_eq!(changed.rows, 2);
+}
+
+#[test]
+fn reordering_my_tag_categories_moves_the_categories_and_not_their_tags() {
+    use rbl_db::fixture::MY_TAG_CATEGORY;
+    let mut f = fixture();
+    my_tag_taxonomy(&f);
+    let genre_tags = my_tag_run(&f, "800001");
+    let (changed, edit) = f.writer.reorder_my_tags_with_undo(&ids(&["800005", MY_TAG_CATEGORY, "800001"])).unwrap();
+    assert_eq!(edit.parent(), "root");
+    assert_eq!(changed.rows, 3);
+    let categories: Vec<(String, i64)> = {
+        let mut s = f.conn().prepare(
+            "SELECT ID, Seq FROM djmdMyTag WHERE Attribute = 1 AND rb_local_deleted = 0 ORDER BY Seq",
+        ).unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
+    };
+    assert_eq!(categories, vec![
+        ("800005".to_owned(), 1), (MY_TAG_CATEGORY.to_owned(), 2), ("800001".to_owned(), 3),
+    ]);
+    assert_eq!(my_tag_run(&f, "800001"), genre_tags);
+    let names: Vec<String> = rbl_db::export_info::my_tags(f.conn()).unwrap().into_iter()
+        .filter(|row| row.attribute == 1).map(|row| row.name).collect();
+    assert_eq!(names, vec!["Mood", "Situation", "Genre"]);
+}
+
+#[test]
+fn an_invalid_my_tag_order_writes_nothing() {
+    use rbl_db::fixture::{MY_TAG_CATEGORY, MY_TAG_PEAK, MY_TAG_WARM_UP};
+    let mut f = fixture();
+    my_tag_taxonomy(&f);
+    let rows = my_tag_rows(&f);
+    let counter: i64 = f.one("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'", &[]);
+    for order in [
+        vec![],
+        // Unknown and deleted ids.
+        ids(&["800004", "800002", "no-such-tag"]),
+        ids(&["800004", "800002", "800003", "800006"]),
+        // Named twice, or one left out.
+        ids(&["800004", "800002", "800003", "800002"]),
+        ids(&["800004", "800002"]),
+        // A tag of another category: no tag changes category.
+        ids(&["800004", "800002", "800003", MY_TAG_PEAK]),
+        ids(&[MY_TAG_PEAK, MY_TAG_WARM_UP, "800002"]),
+        // Categories and tags in one list.
+        ids(&[MY_TAG_CATEGORY, "800001", "800005", "800002"]),
+        ids(&["800002", "800003", "800004", "800001"]),
+    ] {
+        let result = f.writer.reorder_my_tags_with_undo(&order);
+        assert!(matches!(result, Err(DbError::WriteRefused(_))), "{order:?} must be refused, got {result:?}");
+        assert_eq!(rows, my_tag_rows(&f), "{order:?} must write nothing");
+    }
+    assert_eq!(counter, f.one::<i64>("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'", &[]));
+}
+
+#[test]
+fn a_my_tag_reorder_undoes_and_redoes_exactly_and_refuses_a_changed_run() {
+    use rbl_db::fixture::MY_TAG_CATEGORY;
+    let mut f = fixture();
+    my_tag_taxonomy(&f);
+    let before = my_tag_run(&f, "800001");
+    let (_, edit) = f.writer.reorder_my_tags_with_undo(&ids(&["800003", "800004", "800002"])).unwrap();
+    let after = my_tag_run(&f, "800001");
+
+    // Undo puts back the numbers that were there, the gap (5) included.
+    f.writer.undo_my_tag_order(&edit).unwrap();
+    assert_eq!(my_tag_run(&f, "800001"), before);
+    assert!(matches!(f.writer.undo_my_tag_order(&edit), Err(DbError::Conflict(_))));
+    f.writer.redo_my_tag_order(&edit).unwrap();
+    assert_eq!(my_tag_run(&f, "800001"), after);
+    assert!(matches!(f.writer.redo_my_tag_order(&edit), Err(DbError::Conflict(_))));
+
+    // A tag added to the run since: Undo refuses and writes nothing.
+    let made = f.writer.create_my_tag("800001").unwrap();
+    let rows = my_tag_rows(&f);
+    assert!(matches!(f.writer.undo_my_tag_order(&edit), Err(DbError::Conflict(_))));
+    assert_eq!(rows, my_tag_rows(&f));
+
+    // A category order, undone after another run changed, still undoes.
+    let (_, categories) = f.writer.reorder_my_tags_with_undo(&ids(&["800001", MY_TAG_CATEGORY, "800005"])).unwrap();
+    f.writer.reorder_my_tags_with_undo(&ids(&["800002", "800003", "800004", &made.id])).unwrap();
+    f.writer.undo_my_tag_order(&categories).unwrap();
+    let names: Vec<String> = {
+        let mut s = f.conn().prepare(
+            "SELECT Name FROM djmdMyTag WHERE Attribute = 1 AND rb_local_deleted = 0 ORDER BY Seq",
+        ).unwrap();
+        s.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    };
+    assert_eq!(names, vec!["Situation", "Genre", "Mood"]);
+}
+
+#[test]
 fn the_tag_list_takes_tracks_on_the_end_and_closes_up_when_one_comes_off() {
     let mut f = fixture();
     let changed = f.writer.tag_list_add(&[track_id(3), track_id(1), track_id(3)]).unwrap();
@@ -2506,6 +3482,177 @@ fn the_tag_list_takes_tracks_on_the_end_and_closes_up_when_one_comes_off() {
     f.writer.tag_list_clear().unwrap();
     assert!(order(&mut f).is_empty());
     assert!(matches!(f.writer.tag_list_add(&["no-such-track".to_owned()]), Err(DbError::WriteRefused(_))));
+}
+
+/// Every row of the Tag List (live or not) as `(ID, ContentID, TrackNo,
+/// deleted)`, by `ID`: Undo must bring back these rows themselves.
+fn tag_list_rows(f: &Fixture) -> Vec<(String, String, i64, i64)> {
+    let mut stmt = f
+        .conn()
+        .prepare("SELECT ID, ContentID, TrackNo, rb_local_deleted FROM djmdSongTagList ORDER BY ID")
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().map(|r| r.unwrap()).collect()
+}
+
+/// The live Tag List as `(ID, ContentID)` in `TrackNo` order, with the numbers.
+fn tag_list_order(f: &Fixture) -> Vec<(String, String, i64)> {
+    let mut stmt = f
+        .conn()
+        .prepare("SELECT ID, ContentID, TrackNo FROM djmdSongTagList WHERE rb_local_deleted = 0 ORDER BY TrackNo, ID")
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(|r| r.unwrap()).collect()
+}
+
+fn counter(f: &Fixture) -> i64 {
+    f.one("SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'", &[])
+}
+
+#[test]
+fn a_tag_list_removal_undoes_to_the_same_rows_in_their_order_and_redoes() {
+    let mut f = fixture();
+    f.writer.tag_list_add(&[track_id(3), track_id(1), track_id(4), track_id(2)]).unwrap();
+    let before_rows = tag_list_rows(&f);
+    let before = tag_list_order(&f);
+    let usn = counter(&f);
+
+    // Two of the selection are on the list, one is not: one removal.
+    let (changed, removal) = f.writer.tag_list_remove_with_undo(&[track_id(1), track_id(2), track_id(9)]).unwrap();
+    assert_eq!(changed.rows, 2);
+    let gone: Vec<String> = before.iter().filter(|(_, c, _)| *c == track_id(1) || *c == track_id(2)).map(|(id, _, _)| id.clone()).collect();
+    assert_eq!(removal.removed(), gone.as_slice(), "the exact rows, in list order");
+    let after = tag_list_order(&f);
+    assert_eq!(after.iter().map(|(_, c, n)| (c.clone(), *n)).collect::<Vec<_>>(), vec![(track_id(3), 1), (track_id(4), 2)]);
+
+    f.writer.undo_list_removal(&removal).unwrap();
+    assert_eq!(tag_list_order(&f), before, "the same rows back, at the numbers they had");
+    assert_eq!(tag_list_rows(&f).iter().map(|r| (&r.0, &r.1, r.2, r.3)).collect::<Vec<_>>(),
+        before_rows.iter().map(|r| (&r.0, &r.1, r.2, r.3)).collect::<Vec<_>>(), "no row made or lost");
+
+    f.writer.redo_list_removal(&removal).unwrap();
+    assert_eq!(tag_list_order(&f), after);
+    assert_eq!(tag_list_rows(&f).len(), before_rows.len(), "Redo soft-deletes the same rows again");
+    assert_eq!(counter(&f), usn, "the Tag List never moves the update counter");
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdSongTagList WHERE usn IS NOT NULL OR rb_local_usn IS NOT NULL"), 0);
+
+    // Nothing selected on the list is nothing to undo.
+    let (_, none) = f.writer.tag_list_remove_with_undo(&[track_id(9)]).unwrap();
+    assert!(none.is_empty());
+}
+
+#[test]
+fn a_tag_list_clear_undoes_whole_and_redoes() {
+    let mut f = fixture();
+    f.writer.tag_list_add(&[track_id(5), track_id(2), track_id(7)]).unwrap();
+    f.writer.tag_list_remove(&[track_id(2)]).unwrap();
+    f.writer.tag_list_add(&[track_id(2)]).unwrap();
+    let before = tag_list_order(&f);
+    assert_eq!(before.len(), 3);
+
+    let (changed, clear) = f.writer.tag_list_clear_with_undo().unwrap();
+    assert_eq!(changed.rows, 3);
+    assert_eq!(clear.removed().len(), 3);
+    assert!(tag_list_order(&f).is_empty());
+
+    f.writer.undo_list_removal(&clear).unwrap();
+    assert_eq!(tag_list_order(&f), before, "the earlier removed copy of track 2 stays removed");
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdSongTagList WHERE rb_local_deleted = 1"), 1);
+    f.writer.redo_list_removal(&clear).unwrap();
+    assert!(tag_list_order(&f).is_empty());
+}
+
+#[test]
+fn undo_of_a_tag_list_removal_refuses_a_list_changed_since_and_writes_nothing() {
+    let mut f = fixture();
+    f.writer.tag_list_add(&[track_id(1), track_id(2), track_id(3)]).unwrap();
+    let (_, removal) = f.writer.tag_list_remove_with_undo(&[track_id(2)]).unwrap();
+
+    // A player tags a track over LINK, outside the history.
+    f.writer.tag_list_add(&[track_id(6)]).unwrap();
+    let newer = tag_list_rows(&f);
+    let error = f.writer.undo_list_removal(&removal).unwrap_err();
+    assert!(matches!(&error, DbError::Conflict(reason) if reason == "the Tag List has changed since"), "{error:?}");
+    assert_eq!(tag_list_rows(&f), newer, "nothing written; the newer tag stays");
+
+    // The same for a Redo after the list was changed back by hand.
+    let mut g = fixture();
+    g.writer.tag_list_add(&[track_id(1), track_id(2)]).unwrap();
+    let (_, clear) = g.writer.tag_list_clear_with_undo().unwrap();
+    g.writer.undo_list_removal(&clear).unwrap();
+    g.writer.tag_list_remove(&[track_id(1)]).unwrap();
+    let newer = tag_list_rows(&g);
+    assert!(matches!(g.writer.redo_list_removal(&clear), Err(DbError::Conflict(_))));
+    assert_eq!(tag_list_rows(&g), newer);
+}
+
+/// A history session's plays, `(ID, ContentID, TrackNo)` in order.
+fn plays(f: &Fixture, history: &str) -> Vec<(String, String, i64)> {
+    let mut stmt = f
+        .conn()
+        .prepare("SELECT ID, ContentID, TrackNo FROM djmdSongHistory WHERE HistoryID = ?1 AND rb_local_deleted = 0 ORDER BY TrackNo, ID")
+        .unwrap();
+    stmt.query_map([history], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(|r| r.unwrap()).collect()
+}
+
+fn play_counts(f: &Fixture) -> Vec<(String, Option<i64>)> {
+    let mut stmt = f.conn().prepare("SELECT ID, DJPlayCount FROM djmdContent ORDER BY ID").unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect()
+}
+
+#[test]
+fn a_history_removal_undoes_to_the_same_plays_in_order_and_leaves_play_counts() {
+    let mut f = fixture();
+    let session = fixture::history_id(0);
+    // Track 1 played twice in the session: both plays leave, both come back.
+    f.writer.add_to_history(&session, &track_id(1)).unwrap();
+    let before = plays(&f, &session);
+    assert_eq!(before.iter().filter(|(_, c, _)| *c == track_id(1)).count(), 2);
+    let counts = play_counts(&f);
+
+    let (changed, removal) = f.writer.remove_from_history_with_undo(&session, &[track_id(1), track_id(3)]).unwrap();
+    assert_eq!(changed.rows, 3);
+    assert_eq!(removal.removed().len(), 3);
+    let after = plays(&f, &session);
+    assert_eq!(after.iter().map(|(_, c, n)| (c.clone(), *n)).collect::<Vec<_>>(),
+        vec![(track_id(0), 1), (track_id(2), 2), (track_id(4), 3)]);
+    assert_eq!(play_counts(&f), counts, "Remove from History leaves DJ Play Count");
+
+    let usn = counter(&f);
+    f.writer.undo_list_removal(&removal).unwrap();
+    assert_eq!(plays(&f, &session), before, "the same plays, at the numbers they had");
+    assert_eq!(play_counts(&f), counts, "Undo leaves DJ Play Count");
+    let highest: i64 = f.one("SELECT MAX(rb_local_usn) FROM djmdSongHistory", &[]);
+    assert!(counter(&f) > usn && counter(&f) >= highest, "restored rows take update numbers the counter covers");
+
+    f.writer.redo_list_removal(&removal).unwrap();
+    assert_eq!(plays(&f, &session), after);
+    assert_eq!(play_counts(&f), counts, "Redo leaves DJ Play Count");
+    let highest: i64 = f.one("SELECT MAX(rb_local_usn) FROM djmdSongHistory", &[]);
+    assert!(counter(&f) >= highest);
+    // The other session is untouched throughout.
+    assert_eq!(plays(&f, &fixture::history_id(1)).len(), 5);
+}
+
+#[test]
+fn undo_of_a_history_removal_refuses_a_session_changed_or_deleted_since() {
+    let mut f = fixture();
+    let session = fixture::history_id(0);
+    let (_, removal) = f.writer.remove_from_history_with_undo(&session, &[track_id(2)]).unwrap();
+    // A player adds a play to the session over LINK.
+    f.writer.add_to_history(&session, &track_id(9)).unwrap();
+    let newer = plays(&f, &session);
+    let counts = play_counts(&f);
+    let error = f.writer.undo_list_removal(&removal).unwrap_err();
+    assert!(matches!(&error, DbError::Conflict(reason) if reason == "the history has changed since"), "{error:?}");
+    assert_eq!(plays(&f, &session), newer);
+    assert_eq!(play_counts(&f), counts);
+
+    // A session rekordbox deleted is not brought back through its plays.
+    let mut g = fixture();
+    let (_, removal) = g.writer.remove_from_history_with_undo(&session, &[track_id(2)]).unwrap();
+    g.conn().execute("UPDATE djmdHistory SET rb_local_deleted = 1 WHERE ID = ?1", [&session]).unwrap();
+    let error = g.writer.undo_list_removal(&removal).unwrap_err();
+    assert!(matches!(&error, DbError::Conflict(reason) if reason == "the history has been deleted since"), "{error:?}");
+    assert_eq!(plays(&g, &session).len(), 4);
 }
 
 #[test]
@@ -2703,6 +3850,21 @@ fn usb_cues_replace_old_cues_and_preserve_loop_details() {
     let values: (i64, i64, String) = f.conn().query_row("SELECT Kind, OutMsec, Comment FROM djmdCue WHERE rb_local_deleted=0", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
     assert_eq!(values, (5, 5000, "USB loop".into()));
     assert_eq!(f.one::<i64>("SELECT BPM FROM djmdContent WHERE ID=?1", &[&track]), 12800);
+}
+
+/// #617: a memory cue imported from a stick takes its colour row back as
+/// `Color`, one down (Pink is row 1), as rekordbox 7.2.19 reads it
+/// (`get_pmai_ext_specified_memcue_ext` @0x100f23590); row 0 is none.
+#[test]
+fn usb_cues_keep_a_memory_cues_colour() {
+    let mut f = fixture();
+    let track = track_id(0).to_string();
+    let memory = |time_ms: u32, color_id: u8| rbl_anlz::CueEntry { hot_cue: 0, kind: 1, time_ms, loop_time_ms: 0, color_id, comment: None, color_code: Some(0), rgb: None };
+    let cues = [memory(1000, 6), memory(2000, 0), rbl_anlz::CueEntry { color_code: None, ..memory(3000, 2) }];
+    f.writer.import_usb_cues(&track, &cues, 12800).unwrap();
+    let mut q = f.conn().prepare("SELECT InMsec, Kind, Color, ColorTableIndex FROM djmdCue WHERE rb_local_deleted=0 ORDER BY InMsec").unwrap();
+    let rows: Vec<(i64, i64, i64, i64)> = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().map(Result::unwrap).collect();
+    assert_eq!(rows, [(1000, 0, 5, 0), (2000, 0, 255, 0), (3000, 0, 1, 0)], "Aqua, none, Red; never a ColorTableIndex");
 }
 
 #[test]
@@ -3559,7 +4721,7 @@ fn a_players_hot_cue_replaces_the_one_in_its_slot_only() {
     f.writer.save_player_cue(&track, &d).unwrap();
     assert_eq!(
         live_cues(&f, &track),
-        vec![(1, 1_000, -1, -1, 21, String::new(), None), (5, 4_000, -1, -1, 5, String::new(), None)]
+        vec![(1, 1_000, -1, -1, 0, String::new(), None), (5, 4_000, -1, -1, 5, String::new(), None)]
     );
     let deleted: i64 = f.one("SELECT rb_local_deleted FROM djmdCue WHERE ID = ?1", &[&old]);
     assert_eq!(deleted, 1, "soft-deleted, as rekordbox's own deletes are");
@@ -3631,6 +4793,54 @@ fn an_active_loop_takes_a_memory_cue_colour() {
     assert!(f.writer.set_cue_colour(&id, Some(8)).is_err(), "a memory cue has eight colours");
     let colours = rbl_db::details::memory_cue_colours(f.writer.library().connection(), &track).unwrap();
     assert_eq!(colours.get(&id), Some(&5));
+}
+
+/// The MEMORY panel's loop button (#577): rekordbox's `MstSetActiveLoop`
+/// makes the loop `Kind` 4 and puts the track's previous Active Loop back
+/// to 0; `MstResetActiveLoop` writes 0. `ActiveLoop` is not the mark.
+#[test]
+fn a_memory_loop_becomes_the_tracks_one_active_loop() {
+    let mut f = fixture();
+    let track = track_id(0);
+    let other = track_id(1);
+    let first = f.writer.save_player_cue(&track, &player_cue(0, 5_000, Some(6_875))).unwrap();
+    let second = f.writer.save_player_cue(&track, &player_cue(0, 20_000, Some(21_875))).unwrap();
+    let elsewhere = f.writer.save_player_cue(&other, &player_cue(4, 1_000, Some(2_000))).unwrap();
+    let state = |f: &Fixture, id: &str| -> (i64, i64) {
+        f.conn()
+            .query_row("SELECT Kind, COALESCE(ActiveLoop, 0) FROM djmdCue WHERE ID = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+    };
+
+    let set = f.writer.set_active_loop(&first, true).unwrap();
+    assert_eq!(set.rows, 1);
+    assert_eq!(state(&f, &first), (4, 0), "Kind 4, ActiveLoop left at 0");
+    let usn: i64 = f.one("SELECT rb_local_usn FROM djmdCue WHERE ID = ?1", &[&first]);
+    assert_eq!(usn, set.usn);
+
+    let moved = f.writer.set_active_loop(&second, true).unwrap();
+    assert_eq!(moved.rows, 2, "the old Active Loop is reset in the same write");
+    assert_eq!((state(&f, &first), state(&f, &second)), ((0, 0), (4, 0)));
+    assert_eq!(state(&f, &elsewhere), (4, 0), "another track keeps its own");
+
+    assert_eq!(f.writer.set_active_loop(&second, true).unwrap().rows, 0, "already set: nothing written");
+    assert_eq!(f.writer.set_active_loop(&first, false).unwrap().rows, 0, "not set: nothing written");
+    assert_eq!(f.writer.set_active_loop(&second, false).unwrap().rows, 1);
+    assert_eq!(state(&f, &second), (0, 0));
+}
+
+#[test]
+fn only_a_memory_loop_can_be_the_active_loop() {
+    let mut f = fixture();
+    let track = track_id(0);
+    let point = f.writer.save_player_cue(&track, &player_cue(0, 5_000, None)).unwrap();
+    let hot_loop = f.writer.save_player_cue(&track, &player_cue(1, 8_000, Some(9_000))).unwrap();
+    for cue in [point.as_str(), hot_loop.as_str(), "no-such-cue"] {
+        assert!(matches!(f.writer.set_active_loop(cue, true), Err(DbError::WriteRefused(_))), "{cue}");
+    }
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdCue WHERE Kind = 4"), 0);
 }
 
 // ------------------------------------- the information panel, several tracks
@@ -3920,21 +5130,21 @@ fn a_replacement_refuses_undo_and_redo_after_the_lists_changed() {
     let replacement = outcome.replacement.clone().unwrap();
     let made = outcome.playlist.unwrap();
     let refused = |result: Result<Changed, DbError>, what: &str| match result {
-        Err(DbError::WriteRefused(message)) => assert!(message.contains(what), "{message}"),
-        other => panic!("expected a refusal, got {other:?}"),
+        Err(DbError::Conflict(message)) => assert!(message.contains(what), "{message}"),
+        other => panic!("expected a conflict, got {other:?}"),
     };
 
     // A track added to the new playlist.
     f.writer.add_tracks(&made, &[track_id(5)]).unwrap();
     let changed = tree_rows(&f);
-    refused(f.writer.undo_replacement(&replacement), "can no longer be undone");
+    refused(f.writer.undo_replacement(&replacement), "changed since");
     assert_eq!(tree_rows(&f), changed, "nothing written");
     f.writer.remove_tracks(&made, &[track_id(5)]).unwrap();
 
     // The new playlist moved out of the folder.
     f.writer.move_to(&made, ROOT, None).unwrap();
     let changed = tree_rows(&f);
-    refused(f.writer.undo_replacement(&replacement), "can no longer be undone");
+    refused(f.writer.undo_replacement(&replacement), "changed since");
     assert_eq!(tree_rows(&f), changed, "nothing written");
     f.writer.move_to(&made, &crate_folder, Some(0)).unwrap();
 
@@ -3943,7 +5153,7 @@ fn a_replacement_refuses_undo_and_redo_after_the_lists_changed() {
     f.writer.undo_replacement(&replacement).unwrap();
     f.writer.add_tracks(&inner, &[track_id(6)]).unwrap();
     let changed = tree_rows(&f);
-    refused(f.writer.redo_replacement(&replacement), "can no longer be redone");
+    refused(f.writer.redo_replacement(&replacement), "changed since");
     assert_eq!(tree_rows(&f), changed, "nothing written");
 }
 
@@ -4056,4 +5266,268 @@ fn a_replacement_undoes_after_siblings_were_added_and_removed() {
     f.writer.redo_replacement(&replacement).unwrap();
     assert_eq!(f.children(&crate_folder), [three, made, later]);
     assert_consistent(&f);
+}
+
+#[test]
+fn checked_collection_removal_rejects_stale_identity_paths_and_shared_files() {
+    let mut f = fixture();
+    let id = track_id(0);
+    let library_id = rbl_db::export_info::db_id(f.conn()).unwrap().to_string();
+    let path: String = f.conn().query_row("SELECT FolderPath FROM djmdContent WHERE ID=?1", [&id], |r| r.get(0)).unwrap();
+    assert!(f.writer.delete_tracks_checked("wrong", &[(id.clone(), path.clone())]).is_err());
+    assert!(f.writer.delete_tracks_checked(&library_id, &[(id.clone(), "/changed".into())]).is_err());
+    f.conn().execute("UPDATE djmdContent SET FolderPath=?1 WHERE ID=?2", params![path, track_id(1)]).unwrap();
+    assert!(f.writer.delete_tracks_checked(&library_id, &[(id.clone(), path.clone())]).is_err());
+    assert_eq!(f.conn().query_row("SELECT rb_local_deleted FROM djmdContent WHERE ID=?1", [&id], |r| r.get::<_, i32>(0)).unwrap(), 0);
+    let tracks = vec![(id.clone(), path.clone()), (track_id(1), path)];
+    f.writer.delete_tracks_checked(&library_id, &tracks).unwrap();
+    assert_eq!(f.conn().query_row("SELECT COUNT(*) FROM djmdSongPlaylist WHERE ContentID=?1 AND rb_local_deleted=0", [&id], |r| r.get::<_, i32>(0)).unwrap(), 0);
+    f.writer.delete_tracks_checked(&library_id, &tracks).unwrap();
+    assert_eq!(f.conn().query_row("SELECT rb_local_deleted FROM djmdContent WHERE ID=?1", [&id], |r| r.get::<_, i32>(0)).unwrap(), 1);
+}
+
+// ------------------------------------------------------- history conflicts
+
+/// The `Rating` a track has now.
+fn rating(f: &Fixture, track: &str) -> i64 {
+    f.one("SELECT Rating FROM djmdContent WHERE ID = ?1", &[&track])
+}
+
+/// #506: Undo of a track edit puts the old value back only over the value
+/// the edit left. A rating written since by something the history does not
+/// record (a player over LINK, a USB import, rekordbox) is kept, and the
+/// Undo is a conflict that wrote nothing.
+#[test]
+fn undo_and_redo_of_a_track_edit_refuse_a_value_changed_since() {
+    let mut f = fixture();
+    let t = track_id(0);
+    f.writer.set_rating(&t, 1).unwrap();
+    let (_, edit) = f.writer.set_rating_with_undo(&t, 4).unwrap();
+
+    // A player sets 5 over LINK.
+    f.writer.set_rating(&t, 5).unwrap();
+    let usn: i64 = f.one("SELECT rb_local_usn FROM djmdContent WHERE ID = ?1", &[&t]);
+    match f.writer.undo_track_edit(&edit) {
+        Err(DbError::Conflict(reason)) => assert_eq!(reason, "the track has changed since"),
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+    assert_eq!(rating(&f, &t), 5, "the newer rating is kept");
+    let after: i64 = f.one("SELECT rb_local_usn FROM djmdContent WHERE ID = ?1", &[&t]);
+    assert_eq!(after, usn, "nothing written");
+
+    // Back to what the edit left: Undo runs. Then a change before Redo
+    // stops Redo the same way.
+    f.writer.set_rating(&t, 4).unwrap();
+    f.writer.undo_track_edit(&edit).unwrap();
+    assert_eq!(rating(&f, &t), 1);
+    f.writer.set_rating(&t, 2).unwrap();
+    assert!(matches!(f.writer.redo_track_edit(&edit), Err(DbError::Conflict(_))));
+    assert_eq!(rating(&f, &t), 2);
+    f.writer.set_rating(&t, 1).unwrap();
+    f.writer.redo_track_edit(&edit).unwrap();
+    assert_eq!(rating(&f, &t), 4);
+}
+
+/// #506: a text field compares as stored, NULL included: Undo of a comment
+/// set on a track that had none runs while the comment is the one written.
+#[test]
+fn a_track_edit_over_an_empty_value_undoes_while_unchanged() {
+    let mut f = fixture();
+    let t = track_id(1);
+    let (_, edit) = f.writer.set_field_with_undo(&t, TrackField::Title, "Changed").unwrap();
+    f.writer.check_track_edit(&edit, true).unwrap();
+    assert!(matches!(f.writer.check_track_edit(&edit, false), Err(DbError::Conflict(_))));
+    f.writer.undo_track_edit(&edit).unwrap();
+    f.writer.check_track_edit(&edit, false).unwrap();
+}
+
+/// #506: Undo and Redo of a rename or a move refuse once the playlist was
+/// renamed or moved since, writing nothing.
+#[test]
+fn undo_of_a_rename_or_move_refuses_a_playlist_changed_since() {
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Friday", ROOT).unwrap();
+    let (_, rename) = f.writer.rename_with_undo(&list, "Saturday").unwrap();
+    f.writer.rename(&list, "Sunday").unwrap();
+    assert!(matches!(f.writer.undo_rename(&rename), Err(DbError::Conflict(_))));
+    let name: String = f.one("SELECT Name FROM djmdPlaylist WHERE ID = ?1", &[&list]);
+    assert_eq!(name, "Sunday");
+
+    let folder = f.writer.create_folder("Sets", ROOT).unwrap();
+    let (_, moved) = f.writer.move_with_undo(&list, &folder, None).unwrap();
+    f.writer.move_to(&list, ROOT, None).unwrap();
+    let tree = f.children(ROOT);
+    assert!(matches!(f.writer.undo_move(&moved), Err(DbError::Conflict(_))));
+    assert_eq!(f.children(ROOT), tree, "nothing written");
+    f.writer.move_to(&list, &folder, None).unwrap();
+    f.writer.undo_move(&moved).unwrap();
+    assert!(!f.children(&folder).contains(&list));
+}
+
+/// #506: Undo of a track removal refuses once the playlist's tracks changed
+/// since: a track added there would be left out of the order put back.
+#[test]
+fn undo_of_a_track_removal_refuses_a_playlist_changed_since() {
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    f.writer.add_tracks(&list, &[track_id(0), track_id(1), track_id(2)]).unwrap();
+    let (_, removal) = f.writer.remove_tracks_with_undo(&list, &[track_id(1)]).unwrap();
+    f.writer.add_tracks(&list, &[track_id(3)]).unwrap();
+    let numbers = f.track_numbers(&list);
+    assert!(matches!(f.writer.undo_track_removal(&removal), Err(DbError::Conflict(_))));
+    assert_eq!(f.track_numbers(&list), numbers, "nothing written");
+    f.writer.remove_tracks(&list, &[track_id(3)]).unwrap();
+    f.writer.undo_track_removal(&removal).unwrap();
+    assert_eq!(f.track_numbers(&list), [1, 2, 3]);
+}
+
+/// A playlist's live membership rows as (row id, track id, `TrackNo`), in order.
+fn members_of(f: &Fixture, playlist: &str) -> Vec<(String, String, i64)> {
+    let mut stmt = f.conn().prepare(
+        "SELECT ID, ContentID, TrackNo FROM djmdSongPlaylist
+         WHERE PlaylistID = ?1 AND rb_local_deleted = 0 ORDER BY TrackNo, ID",
+    ).unwrap();
+    stmt.query_map(params![playlist], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect()
+}
+
+/// #499: Undo of an add takes out exactly the rows it made and Redo puts
+/// the same rows back, at the same numbers.
+#[test]
+fn an_add_undoes_and_redoes_the_exact_rows_it_made() {
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    f.writer.add_tracks(&list, &[track_id(0), track_id(1)]).unwrap();
+    let before = members_of(&f, &list);
+    let (_, addition) = f.writer.add_tracks_with_undo(&list, &[track_id(2), track_id(3)], false).unwrap();
+    let after = members_of(&f, &list);
+    assert_eq!(addition.added(), [after[2].0.clone(), after[3].0.clone()]);
+
+    f.writer.undo_track_addition(&addition).unwrap();
+    assert_eq!(members_of(&f, &list), before);
+    let gone: i64 = f.one("SELECT rb_local_deleted FROM djmdSongPlaylist WHERE ID = ?1", &[&after[2].0]);
+    assert_eq!(gone, 1, "soft-deleted, kept for Redo");
+
+    f.writer.redo_track_addition(&addition).unwrap();
+    assert_eq!(members_of(&f, &list), after, "the same rows, ids and numbers");
+}
+
+/// #499: an add with duplicates allowed undoes only the copies it made;
+/// the track's earlier membership stays.
+#[test]
+fn undo_of_an_add_with_duplicates_keeps_the_earlier_copy() {
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    f.writer.add_tracks(&list, &[track_id(0), track_id(1)]).unwrap();
+    let before = members_of(&f, &list);
+    let (_, addition) = f.writer.add_tracks_with_undo(&list, &[track_id(1), track_id(0)], true).unwrap();
+    assert_eq!(members_of(&f, &list).len(), 4);
+    assert_eq!(addition.added().len(), 2);
+    assert!(before.iter().all(|(id, ..)| !addition.added().contains(id)));
+    f.writer.undo_track_addition(&addition).unwrap();
+    assert_eq!(members_of(&f, &list), before);
+    f.writer.redo_track_addition(&addition).unwrap();
+    let ids: Vec<String> = members_of(&f, &list).into_iter().map(|(_, content, _)| content).collect();
+    assert_eq!(ids, [track_id(0), track_id(1), track_id(1), track_id(0)]);
+}
+
+/// #499, #506: Undo or Redo of an add refuses, writing nothing, once the
+/// playlist's tracks changed since.
+#[test]
+fn undo_and_redo_of_an_add_refuse_a_playlist_changed_since() {
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    f.writer.add_tracks(&list, &[track_id(0)]).unwrap();
+    let (_, addition) = f.writer.add_tracks_with_undo(&list, &[track_id(1)], false).unwrap();
+    f.writer.add_tracks(&list, &[track_id(2)]).unwrap();
+    let now = members_of(&f, &list);
+    assert!(matches!(f.writer.undo_track_addition(&addition), Err(DbError::Conflict(_))));
+    assert_eq!(members_of(&f, &list), now, "nothing written");
+
+    f.writer.remove_tracks(&list, &[track_id(2)]).unwrap();
+    f.writer.undo_track_addition(&addition).unwrap();
+    f.writer.reorder(&list, &[track_id(0)]).unwrap();
+    f.writer.add_tracks(&list, &[track_id(3)]).unwrap();
+    let now = members_of(&f, &list);
+    assert!(matches!(f.writer.redo_track_addition(&addition), Err(DbError::Conflict(_))));
+    assert_eq!(members_of(&f, &list), now, "nothing written");
+}
+
+/// #499: the slices of one large add join one entry while each carries on
+/// from the last; a slice after another change does not.
+#[test]
+fn the_slices_of_one_add_join_one_undo() {
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    let (_, mut first) = f.writer.add_tracks_with_undo(&list, &[track_id(0), track_id(1)], false).unwrap();
+    let (_, second) = f.writer.add_tracks_with_undo(&list, &[track_id(2)], false).unwrap();
+    assert!(first.absorb(&second));
+    assert_eq!(first.added().len(), 3);
+    f.writer.add_tracks(&list, &[track_id(3)]).unwrap();
+    let (_, third) = f.writer.add_tracks_with_undo(&list, &[track_id(4)], false).unwrap();
+    assert!(!first.absorb(&third), "something else changed the playlist in between");
+    assert_eq!(first.added().len(), 3);
+}
+
+/// #499: Undo of a reorder puts back every row's number; Redo the new ones.
+#[test]
+fn a_reorder_undoes_and_redoes_every_number() {
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    f.writer.add_tracks(&list, &[track_id(0), track_id(1), track_id(2)]).unwrap();
+    let before = members_of(&f, &list);
+    let (_, reorder) = f.writer.reorder_with_undo(&list, &[track_id(2), track_id(0), track_id(1)]).unwrap();
+    assert!(!reorder.is_empty());
+    let after = members_of(&f, &list);
+    assert_eq!(after.iter().map(|(_, c, _)| c.clone()).collect::<Vec<_>>(), [track_id(2), track_id(0), track_id(1)]);
+    f.writer.undo_reorder(&reorder).unwrap();
+    assert_eq!(members_of(&f, &list), before);
+    f.writer.redo_reorder(&reorder).unwrap();
+    assert_eq!(members_of(&f, &list), after);
+}
+
+/// #499, #506: Undo of a reorder refuses once the playlist changed since.
+#[test]
+fn undo_of_a_reorder_refuses_a_playlist_changed_since() {
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    f.writer.add_tracks(&list, &[track_id(0), track_id(1)]).unwrap();
+    let (_, reorder) = f.writer.reorder_with_undo(&list, &[track_id(1), track_id(0)]).unwrap();
+    f.writer.add_tracks(&list, &[track_id(2)]).unwrap();
+    let now = members_of(&f, &list);
+    assert!(matches!(f.writer.undo_reorder(&reorder), Err(DbError::Conflict(_))));
+    assert_eq!(members_of(&f, &list), now, "nothing written");
+}
+
+/// #499, #506: Redo of a reorder refuses once the playlist changed after
+/// its Undo; nothing is written.
+#[test]
+fn redo_of_a_reorder_refuses_a_playlist_changed_since() {
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    f.writer.add_tracks(&list, &[track_id(0), track_id(1)]).unwrap();
+    let (_, reorder) = f.writer.reorder_with_undo(&list, &[track_id(1), track_id(0)]).unwrap();
+    f.writer.undo_reorder(&reorder).unwrap();
+    f.writer.add_tracks(&list, &[track_id(2)]).unwrap();
+    let now = members_of(&f, &list);
+    assert!(matches!(f.writer.redo_reorder(&reorder), Err(DbError::Conflict(_))));
+    assert_eq!(members_of(&f, &list), now, "nothing written");
+}
+
+/// #499, #506: Redo of an add refuses once the rows before it were
+/// renumbered, even in the same order: the rows it brings back would
+/// share numbers with them.
+#[test]
+fn redo_of_an_add_refuses_a_playlist_renumbered_since() {
+    let mut f = fixture();
+    let list = f.writer.create_playlist("Set", ROOT).unwrap();
+    f.writer.add_tracks(&list, &[track_id(0)]).unwrap();
+    let (_, addition) = f.writer.add_tracks_with_undo(&list, &[track_id(1)], false).unwrap();
+    f.writer.undo_track_addition(&addition).unwrap();
+    f.conn().execute("UPDATE djmdSongPlaylist SET TrackNo = 2 WHERE PlaylistID = ?1 AND rb_local_deleted = 0", params![list]).unwrap();
+    let now = members_of(&f, &list);
+    assert!(matches!(f.writer.redo_track_addition(&addition), Err(DbError::Conflict(_))));
+    assert_eq!(members_of(&f, &list), now, "nothing written");
 }

@@ -12,12 +12,27 @@ test("documentation-only changes require no expensive validation lane", () => {
   assert.deepEqual(enabled("README.md", "docs/testing.md", ".github/workflows/README.md"), []);
 });
 
-test("a Rust library change stays in the focused Rust lane", () => {
+test("a database library change uses focused Rust checks", () => {
   assert.deepEqual(enabled("crates/rbl-db/src/export.rs"), ["rust"]);
 });
 
-test("desktop shell changes use focused Rust checks before deploy", () => {
+test("desktop shell changes use focused Rust checks", () => {
   assert.deepEqual(enabled("src-tauri/src/lib.rs"), ["rust"]);
+});
+
+test("desktop-related PR changes leave native regressions to deployment", () => {
+  for (const path of [
+    "src-tauri/src/cues.rs",
+    "crates/rbl-db/src/locate.rs",
+    "src/views/player/useCueWriter.ts",
+    "src/ipc/client.ts",
+    "src/app/App.tsx",
+    "src/views/settings/BackupsPane.tsx",
+    "crates/rbl-export/src/lib.rs",
+  ]) {
+    assert.ok(!enabled(path).includes("macos_intel"), path);
+  }
+  assert.deepEqual(enabled("scripts/desktop/run.mjs"), ["scripts"]);
 });
 
 test("Windows installer resources add the Windows-native check", () => {
@@ -94,6 +109,41 @@ test("packaging action changes defer expensive runtime checks to deploy", () => 
 
 test("the AppImage GTK plugin runs the Node script suite that tests its hook", () => {
   assert.deepEqual(enabled("packaging/appimage/linuxdeploy-plugin-gtk.sh"), ["scripts"]);
+});
+
+test("Nix packaging changes run the source build lane", () => {
+  assert.deepEqual(enabled("flake.nix"), ["nix_source"]);
+  assert.deepEqual(enabled("flake.lock"), ["nix_source"]);
+  assert.deepEqual(enabled("packaging/nix/pin.json"), ["nix_source"]);
+  assert.deepEqual(enabled("packaging/nix/source.nix"), ["nix_source"]);
+  assert.deepEqual(enabled(".github/workflows/validate-nix.yml"), ["scripts", "nix_source"]);
+  assert.deepEqual(enabled(".github/workflows/nix.yml"), ["scripts", "nix_source"]);
+  assert.deepEqual(enabled(".github/workflows/nix-update.yml"), ["scripts", "nix_source"]);
+  assert.deepEqual(enabled(".github/actions/nix-smoke/action.yml"), ["scripts", "nix_source"]);
+});
+
+test("source and dependency changes leave the source smoke to release", () => {
+  assert.deepEqual(enabled("Cargo.lock"), ["rust"]);
+  assert.deepEqual(enabled("pnpm-lock.yaml"), [
+    "frontend_lint",
+    "frontend_typecheck",
+    "frontend_build",
+    "frontend_unit",
+    "scripts",
+  ]);
+  assert.deepEqual(enabled("package.json"), [
+    "frontend_lint",
+    "frontend_typecheck",
+    "frontend_build",
+    "frontend_unit",
+    "scripts",
+  ]);
+  assert.deepEqual(enabled("src/lib/cues.ts"), [
+    "frontend_lint",
+    "frontend_typecheck",
+    "frontend_unit",
+  ]);
+  assert.deepEqual(enabled("public/icon.png"), ["frontend_build"]);
 });
 
 test("a lane workflow change exercises only that lane on the PR", () => {

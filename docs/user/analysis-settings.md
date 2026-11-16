@@ -37,6 +37,17 @@ The app's local analysis lock and the library analysis-lock flag both prevent
 analysis. Locks are checked before decoding and before writing. A refused
 track contributes to the queue's failure count without stopping other tracks.
 
+## Keep keys from another program
+
+Preferences > Analysis > **Key Analysis** > **Analyze key** is on by default.
+Turn it off to keep keys that come from another source, such as Mixed In Key,
+so RBXport never overwrites them:
+
+- Automatic analysis and queued analysis skip the key and leave each track's
+  existing key as it is.
+- The Analysis Setting window starts with KEY unticked, whatever it was last
+  confirmed with. Tick it to analyse the key for that batch only.
+
 ## Write the key into the audio file
 
 Preferences > Analysis > **Key Analysis** > **Write the value to the ID3 tag**
@@ -78,6 +89,18 @@ why:
 - a file owned by another user that rbx could not hand back to them.
 
 The evidence is in `crates/rbl-db/src/key_tag.rs`.
+
+Edit > Undo of a key edited in the information panel puts the files' keys
+back too: each file the edit wrote gets the key it had before (a file that
+had none has the key taken out again), and Redo writes the edited key again.
+rekordbox has no Undo for this; it is rbx's own. If the file's key or the
+track's key has changed since (another app retagged the file, say), or the
+file is gone, the Undo is refused, nothing is written and the newer key
+stays. If a file cannot be written back (it has been made read-only), nothing
+is changed, and the Undo can be tried again once it can be written. Undo of
+a key edit that wrote no file (the setting off, or a WAV or M4A) changes the
+library only. Analysis is not undone. Details:
+[Library Undo coverage](../reference/library-undo.md#key-tag-undo-507).
 
 ## Queued settings
 

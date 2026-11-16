@@ -7,7 +7,7 @@
 import { detectPlatform } from "@/lib/shortcuts";
 import { confirmHandler } from "./confirmHost";
 import type {
-  AnalysisResult, AudioDevices, Backend, Backup, BackupProgress, BackupSizes, ConfirmReplace, Cue, SyncEstimate, DeckEvent, Device, DeviceLibrary,
+  AnalysisStageDescriptor, AnalysisResult, AudioDevices, Backend, Backup, BackupProgress, BackupSizes, ConfirmReplace, Cue, SyncEstimate, DeckEvent, Device, DeviceLibrary,
   DevicePlaylistEditResult, DevicePlaylistImportPlan, DevicePlaylistImportResult, DeviceSettings, DeviceSyncState,
   Diagnostics, Duplicates, LogPage, GridState, Limiter, PreferencesRequest, SmartRule, SyncDeviceReport, SyncProgress, UpdateCheck,
   UpdateProgress, UpdateReady, XmlImportReport,
@@ -15,7 +15,7 @@ import type {
   DatabaseDrive, EditHistoryState, ItunesLibrary, LibraryProblem, LibrarySummary, LinkPeerSeen, Meters,
   LinkStatus, MissingExportFile, MissingTrack, MissingTracks, PreviewState, UnanalysedTracks, ReferenceStickSettings, RelocateReport, RowDto, ScriptRequest, Tick,
   TreeNode, ViewHandle, NextBuild, NextResult, GridAbApplied, GridAbRow, GridAbStatus,
-  SelectionDetails, TrackDetails, TrackLookups,
+  SelectionDetails, TrackDetails, TrackLookups, RelatedPlaylist,
 } from "./types";
 import { tauriInvoke } from "./invoke";
 
@@ -209,6 +209,7 @@ async function realBackend(): Promise<Backend> {
       if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
       return bytes instanceof Uint8Array ? bytes : Uint8Array.from(bytes);
     },
+    analysisStages: () => invoke<AnalysisStageDescriptor[]>("analysis_stages"),
     analyseTrack: (trackId, mode = "rbxport", settings, keyTag, drawing) =>
       invoke<AnalysisResult>("analyse_track", { trackId, mode, settings, keyTag: keyTag ?? null, drawing: drawing ?? false }),
     trackBeats: async (trackId) => {
@@ -505,7 +506,12 @@ async function realBackend(): Promise<Backend> {
     nudgeLinkMaster: (deltaBpm) => invoke<LinkStatus>("link_nudge_master", { deltaBpm }),
     takeLinkMasterTempo: () => invoke<LinkStatus>("link_take_master_tempo"),
     onLinkStatus: (listener) => subscribe<LinkStatus>("link:status", listener),
-    missingTracks: (offset, limit, rescan) => invoke<MissingTracks>("missing_tracks", { offset, limit, rescan }),
+    playedTracks: () => invoke<string[]>("played_tracks"),
+    resetPlayedTracks: () => invoke<void>("reset_played_tracks"),
+    onPlayedChanged: (listener) => subscribe("played:changed", () => listener()),
+    missingTracks: (offset, limit, rescan, keepOrder) => invoke<MissingTracks>("missing_tracks", { offset, limit, rescan, keepOrder }),
+    trackMissing: (trackId) => invoke<boolean | null>("track_missing", { track: trackId }),
+    sortMissingTracks: (column, forwards) => invoke<void>("sort_missing_tracks", { column, forwards }),
     removeMissingTracks: (tracks) => invoke<number>("remove_missing_tracks", { tracks }),
     unanalysedTracks: (from, limit) => invoke<UnanalysedTracks>("unanalysed_tracks", { from, limit }),
     findDuplicates: (limit) => invoke<Duplicates>("find_duplicates", { limit }),
@@ -614,14 +620,16 @@ async function realBackend(): Promise<Backend> {
     explorerRoots: () => invoke<ExplorerRoot[]>("explorer_roots"),
     explorerChildren: (path) => invoke<ExplorerChildren>("explorer_children", { path }),
     deviceLibraries: (path) => invoke<DeviceLibrary[]>("device_libraries", { path }),
+    devicePlaylistCollectionTracks: (path, format, tracks) =>
+      invoke<(string | null)[]>("device_playlist_collection_tracks", { path, format, tracks }),
     devicePlaylistEdit: (path, format, edit) =>
       invoke<DevicePlaylistEditResult>("device_playlist_edit", { path, format, edit }),
     devicePlaylistDuplicates: (path, format, playlist, tracks) =>
       invoke<string[]>("device_playlist_duplicates", { path, format, playlist, tracks }),
-    devicePlaylistImport: (path, format, id, missing) =>
-      invoke<DevicePlaylistImportResult>("device_playlist_import", { path, format, id, missing }),
-    devicePlaylistImportPlan: (path, format, id) =>
-      invoke<DevicePlaylistImportPlan>("device_playlist_import_plan", { path, format, id }),
+    devicePlaylistImport: (path, format, id, missing, destination) =>
+      invoke<DevicePlaylistImportResult>("device_playlist_import", { path, format, id, missing, destination: destination ?? null }),
+    devicePlaylistImportPlan: (path, format, id, destination) =>
+      invoke<DevicePlaylistImportPlan>("device_playlist_import_plan", { path, format, id, destination: destination ?? null }),
     onLibraryChanged: (listener) => {
       // Tauri's listen resolves asynchronously; unsubscribing before it does
       // has to still work, so the flag is checked when it lands.
@@ -646,12 +654,13 @@ async function realBackend(): Promise<Backend> {
       createFolder: (name, parent) => invoke<number>("create_folder", { name, parent }),
       renamePlaylist: (id, name) => invoke<EditHistoryState>("rename_playlist", { id, name }),
       movePlaylist: (id, parent, index) => invoke<EditHistoryState>("move_playlist", { id, parent, index }),
+      sortItems: (folder, language) => invoke<EditHistoryState>("sort_playlist_items", { folder, language }),
       deletePlaylist: (id) => invoke<EditHistoryState>("delete_playlist", { id }),
       undoEdit: () => invoke<EditHistoryState>("undo_edit"),
       redoEdit: () => invoke<EditHistoryState>("redo_edit"),
       createPlaylistWithTracks: (name, tracks) => invoke<number>("create_playlist_with_tracks", { name, tracks }),
-      addTracksToPlaylist: (playlist, tracks, allowDuplicates) =>
-        invoke<number>("add_tracks_to_playlist", { playlist, tracks, allowDuplicates }),
+      addTracksToPlaylist: (playlist, tracks, allowDuplicates, transaction) =>
+        invoke<number>("add_tracks_to_playlist", { playlist, tracks, allowDuplicates, transaction }),
       playlistDuplicates: (playlist, tracks) =>
         invoke<string[]>("playlist_duplicates", { playlist, tracks }),
       reloadTags: (tracks) => invoke<number>("reload_tags", { tracks }),
@@ -676,6 +685,7 @@ async function realBackend(): Promise<Backend> {
       moveHotCue: (cue, letter) => invoke<void>("move_hot_cue", { cue, kind: { hot: letter } }),
       setCueColour: (cue, colour) => invoke<void>("set_cue_colour", { cue, colour }),
       setCueComment: (cue, comment) => invoke<void>("set_cue_comment", { cue, comment }),
+      setActiveLoop: (cue, on) => invoke<void>("set_active_loop", { cue, on }),
       deleteCue: (cue) => invoke<void>("delete_cue", { cue }),
       gridEdit: (track, edit, options) =>
         invoke<GridState>("grid_edit", {
@@ -689,13 +699,21 @@ async function realBackend(): Promise<Backend> {
         invoke<EditHistoryState>("set_track_field", { tracks, field, value, writeKeyTag: options?.writeKeyTag ?? false }),
       addArtwork: (tracks, image) => invoke<EditHistoryState>("add_artwork", { tracks, image }),
       addPlaylistArtwork: (playlist, image) => invoke<number>("add_playlist_artwork", { playlist, image }),
-      setMyTags: (track, tags) => invoke<EditHistoryState>("set_my_tags", { track, tags }),
+      setMyTags: (track, tags, comments) => invoke<EditHistoryState>("set_my_tags", { track, tags, comments: comments ?? false }),
+      putMyTag: (tracks, tag, on, comments) =>
+        invoke<EditHistoryState>("put_my_tag", { tracks, tag, on, comments: comments ?? false }),
+      writeMyTagComments: (on) => invoke<EditHistoryState>("write_my_tag_comments", { on }),
+      createMyTag: (category) => invoke<{ id: string; name: string }>("create_my_tag", { category }),
+      renameMyTag: (id, name, comments) => invoke<number>("rename_my_tag", { id, name, comments: comments ?? null }),
+      deleteMyTag: (id, comments) => invoke<number>("delete_my_tag", { id, comments: comments ?? null }),
       clearArtwork: (tracks) => invoke<EditHistoryState>("clear_artwork", { tracks }),
     },
     filterValues: (spec) => invoke<FilterValues>("filter_values", { spec }),
     trackDetails: (trackId) => invoke<TrackDetails>("track_details", { track: trackId }),
+    trackPlaylists: (trackId) => invoke<RelatedPlaylist[]>("track_playlists", { track: trackId }),
     selectionDetails: (trackIds) => invoke<SelectionDetails>("selection_details", { tracks: trackIds }),
     trackLookups: () => invoke<TrackLookups>("track_lookups"),
+    selectionMyTags: (trackIds) => invoke<string[]>("selection_my_tags", { tracks: trackIds }),
   };
 }
 

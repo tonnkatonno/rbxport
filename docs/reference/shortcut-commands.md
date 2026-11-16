@@ -11,7 +11,7 @@ behavior could only be reached by pressing their key.
 | --- | --- |
 | The key map, as rows | `src/lib/shortcuts.ts` (`BINDINGS`), `src/lib/keyPresets.ts` |
 | The command registry | `src/lib/commands.ts`, `src/store/useCommands.ts` |
-| Shell commands (search, master volume, Analyze Track) | `src/app/App.tsx` |
+| Shell commands (search, master volume, Analyze Track, Sort Items) | `src/app/App.tsx` |
 | Track list commands (selection, cursor, Renumber Track Order) | `src/views/browser/TrackTable.tsx` |
 | Locate track loaded on deck | `src/lib/locateLoaded.ts`, `src/views/browser/TrackTable.tsx` |
 | Deck commands | `src/views/player/Player.tsx` |
@@ -91,11 +91,13 @@ The shell keeps the states (`set_menu_enabled`).
 | Select All (`selectAll`) | command + A | none (list built-in) | no | key | TrackTable, `main`/`sub` |
 | Cursor Up, Down, Page Up, Page Down, to Top, to Bottom | cursor keys, page up/down, home, end, command + cursor up/down | none (list built-in) | no | key | TrackTable, `main`/`sub` |
 | Extend Selection Up/Down (`extendUp`, `extendDown`) | shift + cursor up/down | none (list built-in: `CustomListBox::keyPressed`, #514) | no | key | TrackTable, `main`/`sub` |
-| Load on Player 1 (`loadPlayer1`) | enter, shift + enter | none | no | key; double-click a row; drag to the deck | Player, `a` |
+| Load on Player 1 (`loadPlayer1`) | enter | none | no | key; double-click a row; drag to the deck | Player, `a` |
+| Load on Player 2 (`loadPlayer2`) | shift + enter (RBXport's own) | none | no | key; list context menu; drag to the deck | Player, `b` (2 PLAYER layout only) |
 | Locate track loaded on deck (`locateLoaded`) | command + L | b139 | no | key; Track › Locate track loaded on deck (#430) | TrackTable (main browser), none |
 | Renumber Track Order (`renumberTrackOrder`) | unbound | 500e | Playlist › Renumber Track Order | key once bound; column header menu; Playlist › Renumber Track Order (#513) | TrackTable, `main`/`sub` |
 | Import To Collection, Analysis Lock On/Off, Reload Tag, Remove from Collection, Show in Finder, Auto Relocate, Relocate (`importToCollection`, `analysisLockOn`, `analysisLockOff`, `reloadTag`, `removeFromCollection`, `showInFinder`, `autoRelocate`, `relocate`) | unbound, not in the Keyboard pane | 400f, 4012, 4013, 4003, 400b, 400d, 4014, 400e | Track › the same names | list context menu; Track menu (#513) | TrackTable, `main`/`sub` |
 | Create New Playlist / Intelligent Playlist / Folder, Delete Playlist, Export a playlist to a file (*.txt / *.m3u8) (`createPlaylist`, `createIntelligentPlaylist`, `createFolder`, `deletePlaylist`, `exportPlaylistTxt`, `exportPlaylistM3u8`) | unbound, not in the Keyboard pane | 500a-500c, 5004, 5005, 5006 | Playlist › the same names | Playlist menu (#513), on the selected node; the tree menu calls the same handlers on the node it opened on | TreeView, `main`/`sub` |
+| Sort Items (`sortItems`) | unbound | 500d | Playlist › Sort Items | key once bound; tree context menu on a folder or the Playlists heading (#443) | App (the folder selected in the tree), none |
 | Volume, Volume Down (`volumeUp`, `volumeDown`) | command + F12, command + F11 | 3003, 3004 | no | key; the master knob sets the level directly | App, none |
 | Mute (`mute`) | command + F10 | 3005 | no | key | App, none |
 
@@ -127,7 +129,7 @@ The shell keeps the states (`set_menu_enabled`).
 Every deck command is registered by `Player` for its deck, and its key
 handler only checks the deck and calls `runCommand`. A command on the
 deck's track does not apply while the deck is empty (`playback.idle`), as
-before. Jump, Load on Player 1, the panel tabs and the metronome sound
+before. Jump, Load on Player 1 and 2, the panel tabs and the metronome sound
 apply to an empty deck too.
 
 ### Keys that are not in the key map

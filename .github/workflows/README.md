@@ -12,6 +12,13 @@ workspace test gates before deployment.
 
 - `ci.yml` uses `scripts/ci/validation-plan.mjs` to classify changed files,
   applies deterministic fixes, and requests only the relevant validation lanes.
+  After successful validation, ready same-repository PRs targeting `dev` are
+  automatically fast-forwarded into `dev`. The PR head must still equal the validated SHA,
+  and the current `dev` must be an ancestor of that head. Conflicts, changed heads,
+  and divergent bases require a rebase and fresh checks. This also permits stacked
+  PRs whose tested head includes earlier PRs. Concurrent divergent pushes are
+  refused atomically. Drafts, fork PRs, manual
+  validation runs, and PRs targeting `main` are excluded.
 - `release.yml` resolves and records a version, validates it, promotes `main`,
   builds installers, publishes them, and requests Store submission.
 - `label-issue-platform.yml` labels incoming issues independently of delivery.
@@ -24,7 +31,12 @@ workspace test gates before deployment.
 - `validate-rust.yml` runs current-toolchain tests and the MSRV check.
 - `validate-windows.yml` checks Windows-native compilation and file paths.
 - `validate-linux.yml` proves the Tauri shell opens a native Linux window.
-- `validate-macos.yml` proves the Intel build launches through Rosetta.
+- `validate-macos.yml` proves the Intel build launches through Rosetta and runs
+  31 real Apple Silicon desktop scenarios, including native Finder drag/drop,
+  against a disposable SQLCipher fixture (`pnpm desktop:test`). The desktop
+  scenarios run only when the release workflow explicitly enables
+  `validate_desktop`, before packaging and publication; PR checks and manual
+  validation do not run them.
 - `validate-frontend.yml` independently selects lint, build, unit, browser, and
   bundle-budget checks.
 - `validate-scripts.yml` runs the dependency-free Node script tests.

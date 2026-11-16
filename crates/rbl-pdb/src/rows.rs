@@ -16,11 +16,18 @@ pub const TRACK_STRINGS: usize = 21;
 pub mod slot {
     pub const ISRC: usize = 0;
     pub const HOT_CUE_AUTO_LOAD: usize = 7;
-    pub const DATE_ADDED: usize = 10;
+    /// The file's creation date (rekordbox's `DateCreated`).
+    pub const DATE_CREATED: usize = 10;
     pub const RELEASE_DATE: usize = 11;
     pub const MIX_NAME: usize = 12;
     pub const ANALYZE_PATH: usize = 14;
-    pub const ANALYZE_DATE: usize = 15;
+    /// The date the track was added to the collection (rekordbox's
+    /// `StockDate`, "Date Added"). Players sort and show DATE ADDED from
+    /// this slot, not slot 10 [OBS XDJ-1000 with a rekordbox 7 export: a
+    /// track with `DateCreated` 2025-08-07 and `StockDate` 2025-08-12 shows
+    /// 2025-08-12; with this slot empty the column shows only its icon and
+    /// the list is not sorted by date].
+    pub const DATE_ADDED: usize = 15;
     pub const COMMENT: usize = 16;
     pub const TITLE: usize = 17;
     pub const FILENAME: usize = 19;
@@ -56,6 +63,11 @@ pub struct TrackInput {
     /// `exportLibrary.db`'s `content.masterContentId`: the track's id in that
     /// library. Written at `0x14`; see [`track_row`].
     pub master_content_id: u32,
+    /// `exportLibrary.db`'s `content.contentLink`, written at `0x04`, which
+    /// rekordbox fills with the same value [OBS: a rekordbox 7 stick,
+    /// `0xc0700` in both on all but one of 1563 tracks]. See
+    /// `rbl_core::device_content_link`.
+    pub content_link: u32,
     pub title: String,
     pub filename: String,
     /// Media-relative, e.g. `/Contents/Artist/Album/Track.mp3`.
@@ -63,7 +75,10 @@ pub struct TrackInput {
     /// Media-relative, e.g. `/PIONEER/USBANLZ/P001/00000001/ANLZ0000.DAT`.
     pub analyze_path: String,
     pub comment: String,
+    /// Collection date: what a player shows as DATE ADDED.
     pub date_added: String,
+    /// The file's creation date.
+    pub date_created: String,
     pub release_date: String,
     pub mix_name: String,
     pub isrc: String,
@@ -112,11 +127,11 @@ pub fn track_row(input: &TrackInput) -> Vec<u8> {
     };
     set(&mut strings, slot::ISRC, &input.isrc);
     set(&mut strings, slot::HOT_CUE_AUTO_LOAD, if input.hot_cue_auto_load { "ON" } else { "" });
-    set(&mut strings, slot::DATE_ADDED, &input.date_added);
+    set(&mut strings, slot::DATE_CREATED, &input.date_created);
     set(&mut strings, slot::RELEASE_DATE, &input.release_date);
     set(&mut strings, slot::MIX_NAME, &input.mix_name);
     set(&mut strings, slot::ANALYZE_PATH, &input.analyze_path);
-    set(&mut strings, slot::ANALYZE_DATE, "");
+    set(&mut strings, slot::DATE_ADDED, &input.date_added);
     set(&mut strings, slot::COMMENT, &input.comment);
     set(&mut strings, slot::TITLE, &input.title);
     set(&mut strings, slot::FILENAME, &input.filename);
@@ -131,7 +146,7 @@ pub fn track_row(input: &TrackInput) -> Vec<u8> {
     // CDJ-3000 firmware browse/load tests (../rbxport-private/docs/audits/usb-track-records.md).
     put_u2(&mut row, 0x00, 0x24); // track record with 16-bit string offsets
     put_u2(&mut row, 0x02, 0); // index_shift: the row's slot, see `set_index_shift`
-    put_u4(&mut row, 0x04, 0); // bitmask
+    put_u4(&mut row, 0x04, input.content_link); // CONTENTLINK, see `TrackInput::content_link`
     put_u4(&mut row, 0x08, input.sample_rate);
     put_u4(&mut row, 0x0c, 0); // composer_id
     put_u4(&mut row, 0x10, input.file_size);
@@ -233,6 +248,54 @@ pub fn color_row(id: u16, name: &str) -> Vec<u8> {
     row[4] = u8::try_from(id).unwrap_or(0);
     put_u2(&mut row, 5, id);
     row.extend_from_slice(&device_sql_string(name));
+    row
+}
+
+/// `categories` (type 17), one browse category: the menu item, the row's
+/// `category.category_id`, a byte fixed per menu item, flags (bit 0 hidden),
+/// then the position among the shown categories, 0 for a hidden one.
+///
+/// ```text
+///   01 00  01 00  63  01  00 00   GENRE, hidden
+///   05 00  06 00  05  00  0b 00   BPM, shown eleventh
+/// ```
+///
+/// What the per-item byte and the upper flag bits mean is [UNKNOWN].
+/// rekordbox wrote the same values whether the category was shown or not
+/// [OBS rekordbox 7 export with BPM shown, #619], so they come from
+/// [`crate::reference::CATEGORIES`]; an item missing there gets 99, the value
+/// rekordbox gives most items.
+pub fn category_row(menu_item: u16, id: u16, visible: bool, seq: u16) -> Vec<u8> {
+    let reference = crate::reference::CATEGORIES.iter().find(|row| row.get(..2) == Some(&menu_item.to_le_bytes()[..]));
+    let fixed = reference.and_then(|row| row.get(4)).copied().unwrap_or(0x63);
+    let flags = reference.and_then(|row| row.get(5)).copied().unwrap_or(0) & !1;
+    let mut row = vec![0_u8; 8];
+    put_u2(&mut row, 0, menu_item);
+    put_u2(&mut row, 2, id);
+    row[4] = fixed;
+    row[5] = flags | u8::from(!visible);
+    put_u2(&mut row, 6, if visible { seq } else { 0 });
+    row
+}
+
+/// `sorts` (type 18), one sort option: the menu item, the row's
+/// `sort.sort_id`, flags (bit 0 off, bit 1 the column shown beside the track
+/// name), the position among the active options (0 when off), then a zero
+/// word.
+///
+/// ```text
+///   15 00  07 00  03  00  00 00   COMMENTS, off, the right column
+///   05 00  04 00  02  01  00 00   BPM, first, the right column
+/// ```
+///
+/// [OBS 7.2.11 reference rows; rekordbox 7 export with the Sort and Column
+/// tabs changed, #619]
+pub fn sort_row(menu_item: u16, id: u16, visible: bool, seq: u8, sub_column: bool) -> Vec<u8> {
+    let mut row = vec![0_u8; 8];
+    put_u2(&mut row, 0, menu_item);
+    put_u2(&mut row, 2, id);
+    row[4] = u8::from(!visible) | u8::from(sub_column) << 1;
+    row[5] = if visible { seq } else { 0 };
     row
 }
 

@@ -210,3 +210,46 @@ describe("a click on a row's waveform", () => {
     expect(host.querySelector("button")).toBeNull();
   });
 });
+
+describe("the row preview's shape", () => {
+  afterEach(() => {
+    vi.doUnmock("@/canvas");
+  });
+
+  it("follows View › Full/Preview Waveform, as rekordbox's Preview column does", async () => {
+    const drawnHalf: boolean[] = [];
+    vi.resetModules();
+    vi.doMock("@/canvas", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("@/canvas")>()),
+      // A real rendering, so the first shape is cached: a cache key that left
+      // the shape out would hand the second setting the first one's bitmap.
+      renderPreview: (...[, width, height, , , half]: Parameters<typeof import("@/canvas").renderPreview>) => {
+        drawnHalf.push(half ?? true);
+        return Promise.resolve({ bitmap: document.createElement("canvas"), width, height });
+      },
+    }));
+    const { __setBackend } = await import("@/ipc/client");
+    __setBackend({
+      trackWaveform: () => Promise.resolve(new Uint8Array([60, 30, 10])),
+      onAnalysisChanged: () => () => undefined,
+    } as unknown as Backend);
+    const { WaveformPreview: Preview } = await import("./WaveformPreview");
+    const { PreferencesProvider } = await import("@/store/usePreferences");
+    const { DEFAULT_PREFERENCES } = await import("@/lib/preferences");
+
+    for (const overviewWaveform of ["half", "full"] as const) {
+      const preferences = { ...DEFAULT_PREFERENCES, view: { ...DEFAULT_PREFERENCES.view, overviewWaveform } };
+      act(() =>
+        root.render(
+          <PreferencesProvider value={{ preferences, update: vi.fn(), reset: vi.fn() }}>
+            <Preview trackId="7" width={120} height={20} hotCues={[]} durationSec={300} />
+          </PreferencesProvider>,
+        ),
+      );
+      await act(() => vi.advanceTimersByTimeAsync(200));
+      await settle();
+    }
+    // The same row, drawn again when the setting changes.
+    expect(drawnHalf).toEqual([true, false]);
+  });
+});

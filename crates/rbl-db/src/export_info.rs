@@ -72,6 +72,34 @@ pub fn db_id(conn: &Connection) -> Result<u64> {
     Ok(id.and_then(|id| id.parse().ok()).unwrap_or(0))
 }
 
+/// What rekordbox 7 calls the library's cloud database id: the `ID` of the
+/// live `djmdCloudProperty` row whose `Reserved1` is `SyncService`, or 0 when
+/// there is none.
+///
+/// [OBS static, rekordbox 7.2.19 arm64] `AppSyncDBController::getCloudDBID`
+/// (`0x100a4a040`) returns the id of the property
+/// `CloudPropertyRepository::SelectSyncServiceProperty` selects
+/// (`CloudPropertyDao::SelectBy(IDENTIFIER_SYNC_SERVICE)`), and 0 when there
+/// is none and it is not asked to create one. `CloudProperty::NewData`
+/// (`0x10132a464`) keeps the id at `+0x8` and `NewSyncServiceData` puts the
+/// identifier in `Reserved1` (`+0x18`). This machine's 7.2.19 library holds
+/// `3942139879 | SyncService | Dropbox` there. That the repository skips
+/// deleted rows is [ASSUME], as rekordbox's other repositories do.
+pub fn cloud_db_id(conn: &Connection) -> Result<u32> {
+    if !has_table(conn, "djmdCloudProperty") {
+        return Ok(0);
+    }
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT ID FROM djmdCloudProperty WHERE Reserved1 = 'SyncService' AND COALESCE(rb_local_deleted, 0) = 0 LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(id.and_then(|id| id.parse().ok()).unwrap_or(0))
+}
+
 /// When each of `ids`' entries last changed, as milliseconds since the
 /// epoch, keyed by `djmdPlaylist.ID`: the latest of its live entries'
 /// `created_at` and of every entry's `updated_at`, live or removed.
@@ -201,7 +229,7 @@ pub fn track_extras(conn: &Connection, ids: &[String]) -> Result<HashMap<String,
         let marks = vec!["?"; chunk.len()].join(",");
         let params = rusqlite::params_from_iter(chunk.iter());
         let mut stmt = conn.prepare(&format!(
-            "SELECT ID, rb_LocalFolderPath, OrgFolderPath, TrackNo, DiscNo, BitDepth, DJPlayCount, Analysed, HotCueAutoLoad, DateCreated, ISRC FROM djmdContent WHERE ID IN ({marks})"
+            "SELECT ID, rb_LocalFolderPath, OrgFolderPath, TrackNo, DiscNo, BitDepth, DJPlayCount, Analysed, HotCueAutoLoad, DateCreated, ISRC, ContentLink FROM djmdContent WHERE ID IN ({marks})"
         ))?;
         let rows = stmt.query_map(params, |r| {
             Ok((
@@ -217,6 +245,11 @@ pub fn track_extras(conn: &Connection, ids: &[String]) -> Result<HashMap<String,
                     hot_cue_auto_load: r.get::<_, Option<String>>(8)?.is_some_and(|v| v == "on"),
                     date_created: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
                     isrc: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                    // A NULL link exports as rekordbox exports an
+                    // in-memory 0 (#640).
+                    content_link: rbl_core::device_content_link(
+                        u32::try_from(whole(r.get_ref(11)?) & 0xffff_ffff).unwrap_or(0),
+                    ),
                 },
             ))
         })?;
@@ -264,11 +297,15 @@ pub fn track_extras(conn: &Connection, ids: &[String]) -> Result<HashMap<String,
             out.entry(id).or_default().analysis = Some(facts);
         }
         if has_table(conn, "djmdCue") {
+            // Kind 4 is the memory loop set as the track's Active Loop. It
+            // goes out in the memory list, flagged active, as rekordbox
+            // 7.2.19's `DatabaseMediator::getExportCue` @0x1009bc884 sends
+            // it: hot slot 0, the PCPT word at 0x10 set to 4 [OBS static].
             let mut stmt = conn.prepare(&format!(
                 "SELECT q.ContentID, q.Kind, q.InMsec, q.OutMsec, q.Color, q.ColorTableIndex,
                         q.Comment, q.ActiveLoop, q.BeatLoopSize, c.BPM
                  FROM djmdCue q JOIN djmdContent c ON c.ID = q.ContentID
-                 WHERE q.rb_local_deleted=0 AND q.Kind IN (0,1,2,3,5,6,7,8,9,10,11,12,13,14,15,16,17)
+                 WHERE q.rb_local_deleted=0 AND q.Kind IN (0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17)
                  AND q.ContentID IN ({marks}) ORDER BY q.rowid DESC"
             ))?;
             let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
@@ -284,14 +321,15 @@ pub fn track_extras(conn: &Connection, ids: &[String]) -> Result<HashMap<String,
                         kind,
                         time_ms,
                         loop_time_ms: loop_end(time_ms, end, beats, bpm_x100),
-                        color_id: if kind == 0 {
-                            u8::try_from(color).ok().filter(|c| *c != 255).unwrap_or(0)
+                        // One row up from `Color`, 0 for none (#617).
+                        color_id: if kind == 0 || kind == 4 {
+                            rbl_anlz::cues::memory_colour_row(color)
                         } else {
                             0
                         },
                         color_code: r.get::<_, Option<u8>>(5)?.unwrap_or(0),
                         comment: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                        active_loop: r.get::<_, Option<i64>>(7)?.unwrap_or(0) != 0,
+                        active_loop: kind == 4 || r.get::<_, Option<i64>>(7)?.unwrap_or(0) != 0,
                         loop_numerator: u16::try_from(beats >> 16).unwrap_or(0),
                         loop_denominator: u16::try_from(beats & 0xffff).unwrap_or(0),
                     },
@@ -356,7 +394,7 @@ fn loop_end(start_ms: u32, stored_end: i64, beat_loop_size: u32, bpm_x100: u32) 
 mod tests {
     use rusqlite::Connection;
 
-    use super::{playlist_entries_changed, track_extras, AnalysisFacts};
+    use super::{cloud_db_id, playlist_entries_changed, track_extras, AnalysisFacts};
 
     /// The times are #309's scratch library's: `P309`'s entries as
     /// rekordbox left them after three syncs (`updated_at` equal to
@@ -397,15 +435,15 @@ mod tests {
             "CREATE TABLE djmdContent (
                 ID TEXT PRIMARY KEY, rb_LocalFolderPath TEXT, OrgFolderPath TEXT,
                 TrackNo INTEGER, DiscNo INTEGER, BitDepth INTEGER, DJPlayCount INTEGER,
-                Analysed INTEGER, HotCueAutoLoad TEXT, DateCreated TEXT, ISRC TEXT, BPM,
+                Analysed INTEGER, HotCueAutoLoad TEXT, DateCreated TEXT, ISRC TEXT, ContentLink INTEGER, BPM,
                 AnalysisDataPath TEXT, Length INTEGER, KeyID TEXT, ImagePath TEXT
              );
              CREATE TABLE djmdKey (ID TEXT PRIMARY KEY, ScaleName TEXT);
              INSERT INTO djmdKey VALUES ('7', 'F#m');
-             INSERT INTO djmdContent (ID, BPM, AnalysisDataPath, Length, KeyID, ImagePath, Analysed)
-                VALUES ('1', 12800, '/PIONEER/USBANLZ/P001/0001/ANLZ0000.DAT', 301, '7', '/PIONEER/Artwork/a.jpg', 105),
-                       ('2', NULL, NULL, NULL, NULL, NULL, 0),
-                       ('3', '12450', '', 200, 'gone', '', 0);",
+             INSERT INTO djmdContent (ID, BPM, AnalysisDataPath, Length, KeyID, ImagePath, Analysed, ContentLink)
+                VALUES ('1', 12800, '/PIONEER/USBANLZ/P001/0001/ANLZ0000.DAT', 301, '7', '/PIONEER/Artwork/a.jpg', 105, 2885134),
+                       ('2', NULL, NULL, NULL, NULL, NULL, 0, NULL),
+                       ('3', '12450', '', 200, 'gone', '', 0, '787982');",
         )
         .unwrap();
 
@@ -441,6 +479,120 @@ mod tests {
             "a BPM stored as text, a key row that is gone"
         );
         assert!(!extras.contains_key("4"), "no row, no facts");
+        // The stick's contentLink, as rekordbox 7.2.19 exports these
+        // library values (0x2c060e and 0xc060e, rows of this machine's
+        // library) and a NULL (#640).
+        assert_eq!(extras["1"].metadata.content_link, 0x000c_0700);
+        assert_eq!(extras["2"].metadata.content_link, 0x100);
+        assert_eq!(extras["3"].metadata.content_link, 0x000c_0700, "a link stored as text");
+    }
+
+    /// The tags' master id is the Cloud Library Sync property's id when the
+    /// library has one, and otherwise its `DBID` plus one; `DBID` itself is
+    /// what rekordbox 6 wrote (#640).
+    #[test]
+    fn the_my_tag_master_id_follows_rekordbox_7() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE djmdProperty (DBID TEXT); INSERT INTO djmdProperty VALUES ('6230574');").unwrap();
+        assert_eq!(cloud_db_id(&conn).unwrap(), 0, "no djmdCloudProperty table");
+        conn.execute_batch(
+            "CREATE TABLE djmdCloudProperty (ID TEXT PRIMARY KEY, Reserved1 TEXT, Reserved2 TEXT, rb_local_deleted INTEGER DEFAULT 0);
+             INSERT INTO djmdCloudProperty (ID, Reserved1) VALUES ('264913098', 'CDPFilterVersion');",
+        )
+        .unwrap();
+        assert_eq!(cloud_db_id(&conn).unwrap(), 0, "a cloud property, but not the sync service");
+        conn.execute_batch("INSERT INTO djmdCloudProperty (ID, Reserved1, Reserved2, rb_local_deleted) VALUES ('1', 'SyncService', 'Dropbox', 1);").unwrap();
+        assert_eq!(cloud_db_id(&conn).unwrap(), 0, "a deleted row");
+        conn.execute_batch("INSERT INTO djmdCloudProperty (ID, Reserved1, Reserved2) VALUES ('3942139879', 'SyncService', 'Dropbox');").unwrap();
+        assert_eq!(cloud_db_id(&conn).unwrap(), 3_942_139_879);
+    }
+
+    /// rekordbox marks the Active Loop by `Kind` 4 and leaves `ActiveLoop`
+    /// at 0 (#345, #577). It used to be filtered out of the export, so the
+    /// stick lost the loop altogether; it goes out as a memory loop flagged
+    /// active, with its memory colour.
+    #[test]
+    fn a_kind_four_active_loop_is_exported_as_an_active_memory_loop() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE djmdContent (
+                ID TEXT PRIMARY KEY, rb_LocalFolderPath TEXT, OrgFolderPath TEXT,
+                TrackNo INTEGER, DiscNo INTEGER, BitDepth INTEGER, DJPlayCount INTEGER,
+                Analysed INTEGER, HotCueAutoLoad TEXT, DateCreated TEXT, ISRC TEXT, ContentLink INTEGER, BPM INTEGER,
+                AnalysisDataPath TEXT, Length INTEGER, KeyID TEXT, ImagePath TEXT
+             );
+             CREATE TABLE djmdCue (
+                ContentID TEXT, Kind INTEGER, InMsec INTEGER, OutMsec INTEGER,
+                Color INTEGER, ColorTableIndex INTEGER, Comment TEXT, ActiveLoop INTEGER,
+                BeatLoopSize INTEGER, rb_local_deleted INTEGER
+             );
+             INSERT INTO djmdContent (ID, BPM) VALUES ('7', 12800);
+             INSERT INTO djmdCue VALUES
+                ('7', 4, 300000, 301875, 2, 0, 'Safety', 0, 262145, 0),
+                ('7', 0, 60000, 61875, 255, 0, '', 0, 262145, 0),
+                ('7', 5, 90000, -1, -1, 21, '', 0, 0, 0);",
+        )
+        .unwrap();
+
+        let extras = track_extras(&conn, &["7".to_owned()]).unwrap();
+        let cues = &extras.get("7").unwrap().cues;
+        assert_eq!(cues.len(), 3, "the Active Loop is not dropped");
+        let active: Vec<_> = cues.iter().filter(|cue| cue.active_loop).collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(
+            (active[0].kind, active[0].time_ms, active[0].loop_time_ms, active[0].color_id),
+            (4, 300_000, Some(301_875), 3),
+            "Color 2 (Orange) is colour row 3"
+        );
+        let sections = rbl_anlz::cues::sections(cues, false);
+        assert_eq!(sections[1].payload.len(), 2 * 56, "both memory loops in the memory list");
+    }
+
+    /// #617: a memory cue goes to the stick one colour row up from its
+    /// `Color`, as rekordbox 7.2.19's `convert_cue_to_extPointdata`
+    /// @0x1009bd51c writes it: Pink (0) is row 1, Purple (7) row 8, and
+    /// none, 255 or rekordbox's -1, row 0. Pink went out as none and every
+    /// other colour as the one before it.
+    #[test]
+    fn a_memory_cue_goes_to_the_stick_one_colour_row_up() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE djmdContent (
+                ID TEXT PRIMARY KEY, rb_LocalFolderPath TEXT, OrgFolderPath TEXT,
+                TrackNo INTEGER, DiscNo INTEGER, BitDepth INTEGER, DJPlayCount INTEGER,
+                Analysed INTEGER, HotCueAutoLoad TEXT, DateCreated TEXT, ISRC TEXT, ContentLink INTEGER, BPM INTEGER,
+                AnalysisDataPath TEXT, Length INTEGER, KeyID TEXT, ImagePath TEXT
+             );
+             CREATE TABLE djmdCue (
+                ContentID TEXT, Kind INTEGER, InMsec INTEGER, OutMsec INTEGER,
+                Color INTEGER, ColorTableIndex INTEGER, Comment TEXT, ActiveLoop INTEGER,
+                BeatLoopSize INTEGER, rb_local_deleted INTEGER
+             );
+             INSERT INTO djmdContent (ID, BPM) VALUES ('7', 12800);
+             INSERT INTO djmdCue VALUES
+                ('7', 0, 1000, -1, 0, 0, '', 0, 0, 0),
+                ('7', 0, 2000, -1, 1, 0, '', 0, 0, 0),
+                ('7', 0, 3000, -1, 6, 0, '', 0, 0, 0),
+                ('7', 0, 4000, -1, 7, 0, '', 0, 0, 0),
+                ('7', 0, 5000, -1, 255, 0, '', 0, 0, 0),
+                ('7', 0, 6000, -1, -1, 0, '', 0, 0, 0),
+                ('7', 1, 7000, -1, -1, 21, '', 0, 0, 0);",
+        )
+        .unwrap();
+
+        let extras = track_extras(&conn, &["7".to_owned()]).unwrap();
+        let mut rows: Vec<(u32, u8)> =
+            extras["7"].cues.iter().map(|cue| (cue.time_ms, cue.color_id)).collect();
+        rows.sort_unstable();
+        assert_eq!(
+            rows,
+            [(1000, 1), (2000, 2), (3000, 7), (4000, 8), (5000, 0), (6000, 0), (7000, 0)]
+        );
+        let ext = rbl_anlz::cues::sections(&extras["7"].cues, true);
+        let memory = ext[3].as_cue_entries().unwrap();
+        let mut written: Vec<u8> = memory.iter().map(|cue| cue.color_id).collect();
+        written.sort_unstable();
+        assert_eq!(written, [0, 0, 1, 2, 7, 8], "PCP2's byte at 0x1c");
     }
 
     #[test]
@@ -450,7 +602,7 @@ mod tests {
             "CREATE TABLE djmdContent (
                 ID TEXT PRIMARY KEY, rb_LocalFolderPath TEXT, OrgFolderPath TEXT,
                 TrackNo INTEGER, DiscNo INTEGER, BitDepth INTEGER, DJPlayCount INTEGER,
-                Analysed INTEGER, HotCueAutoLoad TEXT, DateCreated TEXT, ISRC TEXT, BPM INTEGER,
+                Analysed INTEGER, HotCueAutoLoad TEXT, DateCreated TEXT, ISRC TEXT, ContentLink INTEGER, BPM INTEGER,
                 AnalysisDataPath TEXT, Length INTEGER, KeyID TEXT, ImagePath TEXT
              );
              CREATE TABLE djmdCue (

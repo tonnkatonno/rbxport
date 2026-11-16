@@ -287,7 +287,9 @@ pub fn cue_comments(
 }
 
 /// The `Color` value of each live memory cue. Rekordbox stores 0..7 for the
-/// named palette and 255 for no colour. Kind 4, the memory loop set as the
+/// named palette and 255 or -1 for no colour (rekordbox 7.2.14 writes -1 on a
+/// memory cue it creates [OBS chris-win11 test library, issue #533]); both
+/// read as 255 here. Kind 4, the memory loop set as the
 /// Active Loop, is a memory cue too.
 pub fn memory_cue_colours(
     conn: &Connection,
@@ -515,6 +517,27 @@ fn my_tags_of(conn: &Connection, id: &str) -> Vec<String> {
     stmt.query_map([id], |r| r.get::<_, Option<String>>(0))
         .map(|rows| rows.filter_map(std::result::Result::ok).flatten().collect())
         .unwrap_or_default()
+}
+
+/// The My Tags every one of `ids` carries: the ticks the My Tag panel
+/// shows for a selection. rekordbox keeps a tag ticked only when all the
+/// selected tracks have it (`AppSyncDBController::getMyTagOnTrack` and
+/// `getMyTagOnTrackFromCache` narrow the first track's tags with
+/// `Array::removeValuesNotIn` for each next one; 7.2.19 arm64 @0x100a62b08,
+/// static analysis). None for no tracks.
+#[must_use]
+pub fn shared_my_tags(conn: &Connection, ids: &[String]) -> Vec<String> {
+    let mut tracks = ids.iter();
+    let Some(first) = tracks.next() else { return Vec::new() };
+    let mut shared = my_tags_of(conn, first);
+    for id in tracks {
+        if shared.is_empty() {
+            break;
+        }
+        let these = my_tags_of(conn, id);
+        shared.retain(|tag| these.contains(tag));
+    }
+    shared
 }
 
 /// The browser's My Tag column uses names, not opaque tag ids.

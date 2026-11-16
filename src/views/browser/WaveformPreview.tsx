@@ -94,6 +94,7 @@ async function load(
   height: number,
   dpr: number,
   palette: WavePalette,
+  half: boolean,
 ): Promise<RenderedWaveform | null> {
   const existing = inFlight.get(key);
   if (existing) return existing;
@@ -104,7 +105,7 @@ async function load(
       const backend = await getBackend();
       const data = await backend.trackWaveform(trackId, waveformKindOf(palette, false));
       if (data.length === 0) return null;
-      const rendered = await renderPreview(data, width, height, dpr, palette);
+      const rendered = await renderPreview(data, width, height, dpr, palette, half);
       if (rendered) cache.set(key, rendered);
       return rendered;
     } catch {
@@ -133,6 +134,8 @@ export interface WaveformPreviewProps {
    */
   hotCues: readonly RowCue[];
   memoryCues?: readonly number[] | undefined;
+  /** Each memory cue's `djmdCue.Color`, in `memoryCues` order; 255 for none. */
+  memoryCueColours?: readonly number[] | undefined;
   durationSec: number;
   /** Separates cold-start placeholder media from the live library rendering. */
   startupCache?: boolean;
@@ -144,18 +147,22 @@ export const WaveformPreview = memo(function WaveformPreview({
   height,
   hotCues,
   memoryCues,
+  memoryCueColours,
   durationSec,
   startupCache = false,
 }: WaveformPreviewProps) {
   const ref = useRef<HTMLCanvasElement>(null);
   // View › Color › Waveform color: the row follows the deck's palette, and a
-  // bitmap rendered in one palette is not the row in another.
-  const { waveformColor: palette, hotCueColor } = usePreferences().view;
+  // bitmap rendered in one palette is not the row in another. View ›
+  // Full/Preview Waveform switches the row between half and full, as it does
+  // in rekordbox.
+  const { waveformColor: palette, hotCueColor, overviewWaveform } = usePreferences().view;
+  const half = overviewWaveform !== "full";
 
   useEffect(() => {
     let cancelled = false;
     const dpr = window.devicePixelRatio || 1;
-    const key = `${startupCache ? "startup" : "live"}:${palette}:${WaveformCache.key(trackId, width, dpr)}`;
+    const key = `${startupCache ? "startup" : "live"}:${palette}:${half ? "half" : "full"}:${WaveformCache.key(trackId, width, dpr)}`;
 
     const paint = (entry: { bitmap: CanvasImageSource }) => {
       const canvas = ref.current;
@@ -168,7 +175,7 @@ export const WaveformPreview = memo(function WaveformPreview({
       // default, as rekordbox's row preview does.
       const badges = hotCues.map(([letter, at, colour, loop]) =>
         [letter, at, hotCueColour(colour, letter, loop === true, hotCueColor)] as const);
-      drawPreviewMemoryCues(ctx, memoryCues ?? [], durationSec * 1000, canvas.width, dpr);
+      drawPreviewMemoryCues(ctx, memoryCues ?? [], durationSec * 1000, canvas.width, dpr, memoryCueColours);
       drawPreviewCues(ctx, badges, durationSec * 1000, canvas.width, dpr);
     };
 
@@ -181,7 +188,7 @@ export const WaveformPreview = memo(function WaveformPreview({
     // Nothing is asked for until the row has settled. A row a flick goes past
     // is unmounted before this fires, and the request is never made.
     const timer = window.setTimeout(() => {
-      void load(trackId, key, width, height, dpr, palette).then((rendered) => {
+      void load(trackId, key, width, height, dpr, palette, half).then((rendered) => {
         if (rendered) paint(rendered);
       });
     }, SETTLE_MS);
@@ -190,7 +197,7 @@ export const WaveformPreview = memo(function WaveformPreview({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [trackId, width, height, hotCues, memoryCues, durationSec, palette, hotCueColor, startupCache]);
+  }, [trackId, width, height, hotCues, memoryCues, memoryCueColours, durationSec, palette, half, hotCueColor, startupCache]);
 
   const dpr = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1;
   return (

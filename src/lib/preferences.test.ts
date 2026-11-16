@@ -73,6 +73,19 @@ describe("sanitisePreferences", () => {
     expect(sanitisePreferences({ analysis: { writeKeyTag: true } }).analysis.writeKeyTag).toBe(true);
   });
 
+  it("leaves Add My Tag to the Comments off until it is switched on", () => {
+    // rekordbox's `writeMytag` defaults to off (#605).
+    expect(DEFAULT_PREFERENCES.advanced.myTagComments).toBe(false);
+    expect(sanitisePreferences({ advanced: { myTagComments: "yes" } }).advanced.myTagComments).toBe(false);
+    expect(sanitisePreferences({ advanced: { myTagComments: true } }).advanced.myTagComments).toBe(true);
+  });
+
+  it("analyses the key unless Analyze key is switched off", () => {
+    expect(DEFAULT_PREFERENCES.analysis.detectKey).toBe(true);
+    expect(sanitisePreferences({ analysis: { detectKey: "no" } }).analysis.detectKey).toBe(true);
+    expect(sanitisePreferences({ analysis: { detectKey: false } }).analysis.detectKey).toBe(false);
+  });
+
   it("offers rekordbox's ten BPM ranges with 70-180 the default", () => {
     expect(BPM_RANGES).toEqual(["70-180", "48-95", "58-115", "68-135", "78-155", "88-175", "98-195", "108-215", "118-235", "128-255"]);
     expect(DEFAULT_PREFERENCES.analysis.bpmRange).toBe("70-180");
@@ -255,4 +268,17 @@ describe("browseListVars", () => {
     expect(vars["--s-row-height"]).toBe("25px");
     expect(vars["--browse-weight"]).toBe(400);
   });
+});
+
+// Issue 540: rekordbox 7.2.19 keeps the Playback time setting in 1–60
+// seconds, 60 by default, and reads anything else as the default
+// (`SettingIF::getCurrentPlayedTime` @0x1015d43f8).
+it("keeps the Playback time setting in rekordbox's 1 to 60 seconds, 60 by default", () => {
+  expect(DEFAULT_PREFERENCES.advanced.playbackTime).toBe(60);
+  expect(sanitisePreferences({}).advanced.playbackTime).toBe(60);
+  expect(sanitisePreferences({ advanced: { playbackTime: 1 } }).advanced.playbackTime).toBe(1);
+  expect(sanitisePreferences({ advanced: { playbackTime: 30 } }).advanced.playbackTime).toBe(30);
+  for (const stored of [0, 61, 12.5, "30", null]) {
+    expect(sanitisePreferences({ advanced: { playbackTime: stored } }).advanced.playbackTime).toBe(60);
+  }
 });

@@ -175,7 +175,8 @@ test("the control row loops the chosen number of beats, and the steps resize it"
 
   // AU: IN starts a two-beat loop from the head; the field and both ends light.
   await row.getByRole("button", { name: "Loop in" }).click();
-  const exit = row.getByRole("button", { name: "Exit loop" });
+  // The length field, by its place: lit it is "Exit loop", unlit "4 beat loop".
+  const exit = row.getByRole("group", { name: "Beat loop length" }).getByRole("button").nth(1);
   await expect(exit).toHaveAttribute("aria-pressed", "true");
   await expect(row.getByRole("button", { name: "Loop out" })).toBeEnabled();
 
@@ -221,7 +222,8 @@ test("a manual loop on the same beats as the last auto beat loop leaves the fiel
 
   // AU: four beats from the head, then OUT exits it.
   await row.getByRole("button", { name: "Loop in" }).click();
-  const exit = row.getByRole("button", { name: "Exit loop" });
+  // The length field, by its place: lit it is "Exit loop", unlit "4 beat loop".
+  const exit = row.getByRole("group", { name: "Beat loop length" }).getByRole("button").nth(1);
   await expect(exit).toHaveAttribute("aria-pressed", "true");
   await row.getByRole("button", { name: "Loop out" }).click();
   await expect(row.getByRole("button", { name: "4 beat loop" })).toHaveAttribute("aria-pressed", "false");
@@ -668,7 +670,9 @@ test("PLAY on a BPM SYNC deck with Q off starts on the master's beat", async ({ 
 });
 
 test("a new track on the master deck hands MASTER to the other deck", async ({ page }) => {
-  const { a, b, titles, bpms, first, toB } = await syncedPair(page);
+  const { a, b, titles, bpms, first, toB, play } = await syncedPair(page);
+  // A plays first, so A is the master [rekordbox 7.2.18 manual p.121].
+  await play.first().click();
   const bpmA = a.getByTestId("player-bpm");
   const bpmB = b.getByTestId("player-bpm");
   const master = Number(bpms[first]);
@@ -687,4 +691,59 @@ test("a new track on the master deck hands MASTER to the other deck", async ({ p
   await expect(a.getByRole("button", { name: "Sync master" })).toHaveAttribute("aria-pressed", "false");
   await expect.poll(async () => Number(await bpmA.innerText())).toBeCloseTo(Number(bpms[other]), 1);
   expect(Number(await bpmB.innerText())).toBeCloseTo(master, 1);
+});
+
+/** The zoom each deck was last given, in bars, as the session stores it. */
+const zoomOf = (page: Page) => page.evaluate(() => {
+  const raw = localStorage.getItem("rbl.session") ?? "{}";
+  return (JSON.parse(raw) as { waveformZoom?: { a?: number; b?: number } }).waveformZoom ?? {};
+});
+
+test("the wheel over either deck zooms both, and RST puts both back (#602)", async ({ page }) => {
+  // rekordbox 7.2.19: `PlayerWaveView::mouseWheelMove` @0x100c93584 hands a
+  // wheel step to `WaveViewArea::triggerZoomInOut` @0x100c936e0, which steps
+  // deck A and deck B, as + and − do; RST calls `PlayerWaveView::zoomReset`
+  // on both (`WaveViewArea::buttonClicked` @0x100c95708).
+  const { a, b } = await twoPlayer(page);
+  await expect.poll(() => zoomOf(page)).toEqual({ a: 12, b: 12 });
+
+  await b.getByTestId("player-detail").hover();
+  await page.mouse.wheel(0, -120);
+  await expect.poll(() => zoomOf(page)).toEqual({ a: 8, b: 8 });
+  // Out over deck A: however far the gesture goes, the two move together.
+  await a.getByTestId("player-detail").hover();
+  await page.mouse.wheel(0, 120);
+  await page.mouse.wheel(0, 120);
+  await expect.poll(async () => (await zoomOf(page)).a ?? 0).toBeGreaterThan(8);
+  const out = await zoomOf(page);
+  expect(out.b).toBe(out.a);
+  await page.getByRole("button", { name: "Reset zoom" }).click();
+  await expect.poll(() => zoomOf(page)).toEqual({ a: 12, b: 12 });
+
+  // 1 PLAYER zooms deck A alone; back in 2 PLAYER the pair steps from where
+  // each deck is, and RST brings both to the default.
+  await page.getByRole("button", { name: "Layout" }).click();
+  await page.getByRole("menuitemradio", { name: "1 PLAYER" }).click();
+  await page.getByRole("button", { name: "Zoom in", exact: true }).click();
+  await expect.poll(() => zoomOf(page)).toEqual({ a: 8, b: 12 });
+  await page.getByRole("button", { name: "Layout" }).click();
+  await page.getByRole("menuitemradio", { name: "2 PLAYER" }).click();
+  await page.getByRole("button", { name: "Zoom in", exact: true }).click();
+  await expect.poll(() => zoomOf(page)).toEqual({ a: 4, b: 8 });
+  await page.getByRole("button", { name: "Reset zoom" }).click();
+  await expect.poll(() => zoomOf(page)).toEqual({ a: 12, b: 12 });
+});
+
+test("an empty HOT CUE row beside either deck sets that hot cue (#602)", async ({ page }) => {
+  // The 2 PLAYER deck has no pads; the HOT CUE panel of the sub-information
+  // panel beside it is where rekordbox sets one with the mouse ("If it is
+  // empty, click it to save the Hot Cue point", rekordbox 7.2.18 manual p.73).
+  const { b } = await twoPlayer(page, "?writable=1");
+  const list = b.getByRole("complementary", { name: "Cue list" });
+  await list.getByRole("tab", { name: "HOT CUE" }).click();
+  const row = list.getByRole("button", { name: "Hot cue H", exact: true });
+  await expect(row).toHaveAttribute("data-empty", "");
+  await row.click();
+  await expect(row).not.toHaveAttribute("data-empty");
+  await expect(row).toContainText(/\d\d:\d\d/);
 });

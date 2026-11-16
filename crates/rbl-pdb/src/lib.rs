@@ -42,8 +42,10 @@ pub enum PageType {
     PlaylistEntries,
     Artwork,
     Columns,
-    HistoryPlaylists,
-    HistoryEntries,
+    /// Type 17: the browse categories a player shows. See [`rows::category_row`].
+    Categories,
+    /// Type 18: the sort options a player offers. See [`rows::sort_row`].
+    Sorts,
     /// Type 19: the device name, track count, date and Device Library
     /// background colour. See [`rows::PdbProperty`].
     Property,
@@ -64,8 +66,8 @@ impl PageType {
             8 => Self::PlaylistEntries,
             13 => Self::Artwork,
             16 => Self::Columns,
-            17 => Self::HistoryPlaylists,
-            18 => Self::HistoryEntries,
+            17 => Self::Categories,
+            18 => Self::Sorts,
             19 => Self::Property,
             other => Self::Other(other),
         }
@@ -84,8 +86,8 @@ impl PageType {
             Self::PlaylistEntries => "playlist_entries".into(),
             Self::Artwork => "artwork".into(),
             Self::Columns => "columns".into(),
-            Self::HistoryPlaylists => "history_playlists".into(),
-            Self::HistoryEntries => "history_entries".into(),
+            Self::Categories => "categories".into(),
+            Self::Sorts => "sorts".into(),
             Self::Property => "property".into(),
             Self::Other(v) => format!("unknown_{v}"),
         }
@@ -367,6 +369,9 @@ pub struct TrackRow {
     /// left them blank.
     pub master_content_id: u32,
     pub master_db_id: u32,
+    /// `CONTENTLINK` (0x04), the same value as `exportLibrary.db`'s
+    /// `content.contentLink` [OBS #640: `0xc0700` on a rekordbox 7 stick].
+    pub content_link: u32,
     pub track_number: u32,
     pub play_count: u16,
     pub title: String,
@@ -374,7 +379,9 @@ pub struct TrackRow {
     pub file_path: String,
     pub filename: String,
     pub analyze_path: String,
+    /// Slot 15, or slot 10 on a stick an older rbxport wrote.
     pub date_added: String,
+    pub date_created: String,
     pub release_date: String,
     pub comment: String,
 }
@@ -472,7 +479,8 @@ impl Pdb<'_> {
     /// Fixed fields occupy 0x00..0x5e; the 21 string offsets follow at 0x5e.
     pub fn track_rows(&self, table: &TableRef) -> Vec<TrackRow> {
         // Slot numbers from the spec's `ofs_strings` index.
-        const DATE_ADDED: usize = 10;
+        const DATE_ADDED: usize = rows::slot::DATE_ADDED;
+        const DATE_CREATED: usize = rows::slot::DATE_CREATED;
         const RELEASE_DATE: usize = 11;
         const ANALYZE_PATH: usize = 14;
         const COMMENT: usize = 16;
@@ -492,6 +500,7 @@ impl Pdb<'_> {
                     file_size: self.u4_at(row, 0x10),
                     master_content_id: self.u4_at(row, 0x14),
                     master_db_id: self.u4_at(row, 0x18),
+                    content_link: self.u4_at(row, 0x04),
                     artwork_id: self.u4_at(row, 0x1c),
                     key_id: self.u4_at(row, 0x20),
                     label_id: self.u4_at(row, 0x28),
@@ -507,7 +516,10 @@ impl Pdb<'_> {
                     duration_sec: self.u2_at(row, 0x54),
                     color_id: self.u1_at(row, 0x58),
                     rating: self.u1_at(row, 0x59),
-                    date_added: text(DATE_ADDED),
+                    // rbxport before #637 wrote the date added to slot 10 and
+                    // left slot 15 empty; rekordbox always fills slot 15.
+                    date_added: Some(text(DATE_ADDED)).filter(|d| !d.is_empty()).unwrap_or_else(|| text(DATE_CREATED)),
+                    date_created: text(DATE_CREATED),
                     release_date: text(RELEASE_DATE),
                     analyze_path: text(ANALYZE_PATH),
                     comment: text(COMMENT),

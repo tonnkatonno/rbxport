@@ -25,6 +25,9 @@
 #![cfg_attr(not(target_os = "macos"), allow(dead_code, reason = "the AppleScript bridge that uses it is macOS-only"))]
 
 pub mod model;
+mod my_tags;
+mod collection;
+mod waveform;
 
 #[cfg(target_os = "macos")]
 mod cocoa;

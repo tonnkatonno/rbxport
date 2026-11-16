@@ -55,11 +55,11 @@ is configured, publication checks the live feeds' versions and installer URLs.
 Only after publication succeeds does it prune old versioned artifacts, keeping
 the five newest versions, and announce the notes on Discord.
 
-When `PACKAGING_NIX` is set, the publish job also writes `packaging/nix/pin.json`
-(the published Linux AppImage's version and SRI hash) and pushes
-`chore(nix): seed <version>` to `dev`, so the Nix package ships that release.
-That pin is the only way a Nix install updates: the built-in updater is
-unavailable under Nix (#177).
+When the repository ships the Nix packaging, the publish job also writes
+`packaging/nix/pin.json` (the published Linux AppImage's version and SRI hash,
+preserving the source-build hashes) and pushes `chore(nix): seed <version>` to
+`dev`, so the Nix package ships that release. That pin is the only way a Nix
+install updates: the built-in updater is unavailable under Nix (#177).
 
 ## Linux AppImage GTK hook
 
@@ -101,3 +101,14 @@ published version and downloads before reporting completion.
 Production frontend builds obfuscate app JavaScript and omit source maps.
 Development builds remain readable. Obfuscation provides no protection for
 secrets; keep credentials out of the frontend.
+
+## Linux AppImage blank window
+
+The AppImage bundles the build host's `libwayland-client`. On rolling-release
+distributions the host's Mesa needs its own copy, and WebKitGTK shows a blank
+window with `Could not create default EGL display: EGL_BAD_PARAMETER` (#337).
+`src-tauri/src/appimage_wayland.rs` re-executes the app once with the host's
+`libwayland-client` in `LD_PRELOAD` on any AppImage launch (Wayland, KDE and
+Xorg/i3 all reported, #337) and sets `DESKTOPINTEGRATION=1` (a reporter found
+mouse and focus broken without it), keeping any value the user already set.
+Set `RBXPORT_WAYLAND_PRELOAD=1` to skip it.

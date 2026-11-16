@@ -5,6 +5,7 @@
 //! them against a mock app and a fixture library, the way the webview does
 //! against the real one.
 
+pub mod appimage_wayland;
 mod windowfit;
 mod file_drop;
 mod file_drag;
@@ -15,6 +16,8 @@ mod ssd_mirror;
 #[cfg(test)]
 mod test_stick;
 pub mod analysis;
+mod analysis_extensions;
+mod analysis_pipeline;
 pub mod commands;
 mod usb_import;
 pub mod cues;
@@ -396,6 +399,14 @@ pub fn run() {
     let _sentry = sentry::install();
 
     let mut context = tauri::generate_context!();
+    #[cfg(target_os = "macos")]
+    if crate::test_port::data_store().is_some() {
+        for window in &mut context.config_mut().app.windows {
+            // The installed runtime's From<WindowConfig> does not forward
+            // data_store_identifier. Build explicitly below with the setter.
+            window.create = false;
+        }
+    }
     if let Some(args) = browser_args() {
         tracing::debug!(port = %std::env::var(DEVTOOLS_PORT_ENV).unwrap_or_default(), "webview remote debugging on");
         for window in &mut context.config_mut().app.windows {
@@ -441,6 +452,21 @@ pub fn run() {
                 Err(e) => tracing::warn!(error = %e, "could not read the webview's version"),
             }
             screen_cache::initialize(app.handle());
+            // A write outside the library history (a player over LINK, a cue,
+            // analysis) that ends its Redo branch updates the Edit menu.
+            {
+                let handle = app.handle().clone();
+                app.state::<Arc<AppState>>().on_history_changed(move || {
+                    commands::announce_history(&handle, handle.state::<Arc<AppState>>().inner());
+                });
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(store) = crate::test_port::data_store() {
+                let config = app.config().app.windows.iter().find(|window| window.label == MAIN_WINDOW)
+                    .ok_or_else(|| std::io::Error::other("desktop test main window config is missing"))?;
+                tauri::WebviewWindowBuilder::from_config(app, config)?
+                    .incognito(false).data_store_identifier(store).build()?;
+            }
             // Listens only in a debug build asked to (`RBXPORT_TEST_PORT`).
             crate::test_port::start(app.handle());
             // This fork only: a local API for a companion app, off unless RBXPORT_API_PORT is set.
@@ -533,6 +559,7 @@ pub fn run() {
             commands::track_waveform,
             commands::track_pcm_waveform,
             analysis::analyse_track,
+            analysis::analysis_stages,
             analysis::edit_phrase,
             commands::reload_library,
             // Editing. Every one of these is refused while rekordbox is
@@ -611,6 +638,8 @@ pub fn run() {
             commands::track_phrases,
             commands::track_vocals,
             relocate::missing_tracks,
+            relocate::track_missing,
+            relocate::sort_missing_tracks,
             relocate::remove_missing_tracks,
             commands::unanalysed_tracks,
             commands::find_duplicates,
@@ -649,6 +678,7 @@ pub fn run() {
             commands::create_folder,
             commands::rename_playlist,
             commands::move_playlist,
+            commands::sort_playlist_items,
             commands::delete_playlist,
             commands::undo_edit,
             commands::redo_edit,
@@ -682,6 +712,8 @@ pub fn run() {
             commands::open_url,
             commands::reset_play_count,
             commands::record_play,
+            commands::played_tracks,
+            commands::reset_played_tracks,
             commands::remove_from_history,
             commands::remove_from_collection,
             commands::reorder_playlist,
@@ -694,6 +726,7 @@ pub fn run() {
             cues::move_hot_cue,
             cues::set_cue_colour,
             cues::set_cue_comment,
+            cues::set_active_loop,
             cues::delete_cue,
             cues::convert_memory_cues_to_hot,
             commands::filter_values,
@@ -705,6 +738,7 @@ pub fn run() {
             explorer::explorer_children,
             device_library::device_libraries,
             device_library::device_playlist_edit,
+            device_library::device_playlist_collection_tracks,
             device_library::device_playlist_duplicates,
             device_library::device_playlist_import,
             device_library::device_playlist_import_plan,
@@ -712,11 +746,18 @@ pub fn run() {
             // lists its dropdowns offer, and the fields it may write.
             details::track_details,
             details::selection_details,
+            details::track_playlists,
             details::track_lookups,
             details::set_track_field,
             details::add_artwork,
             details::add_playlist_artwork,
             details::set_my_tags,
+            details::selection_my_tags,
+            details::put_my_tag,
+            details::create_my_tag,
+            details::rename_my_tag,
+            details::delete_my_tag,
+            details::write_my_tag_comments,
             details::clear_artwork,
             // AppleScript's way into the window: it says it is listening,
             // answers what a script asked of it, and mirrors the

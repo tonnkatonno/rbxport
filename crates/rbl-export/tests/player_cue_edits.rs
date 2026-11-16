@@ -59,6 +59,7 @@ fn sync(root: &Path, tracks: &[SourceTrack], playlists: &[SourcePlaylist]) -> rb
             db_id: 123,
             tree: playlists.iter().map(|p| rbl_export::SyncNode { id: p.id, parent: p.parent_id, attribute: 0 }).collect(),
             automatic: false,
+            cloud_db_id: 0,
         }),
         &mut |_| {},
     )
@@ -286,6 +287,68 @@ fn a_sync_keeps_a_player_edited_analysis_when_the_library_has_none() {
     assert!(verify(usb.path()).unwrap().is_ok());
 }
 
+/// A retained manifest is device input. Its analysis directory must not be
+/// allowed to pull a parseable ANLZ file from beside the selected USB.
+#[test]
+fn a_sync_rejects_traversal_in_a_retained_analysis_directory() {
+    let src = tempfile::tempdir().unwrap();
+    let usb = common::stick();
+    let outside = tempfile::tempdir_in(usb.path().parent().unwrap()).unwrap();
+    let t = track_with_files(src.path(), 1, Some(library_cues()));
+    sync(usb.path(), std::slice::from_ref(&t), &[playlist(10, &[0])]).unwrap();
+    for extension in ["DAT", "EXT"] {
+        std::fs::copy(stick_anlz(usb.path(), 0, extension), outside.path().join(format!("ANLZ0000.{extension}"))).unwrap();
+    }
+    let mut manifest = Manifest::load(usb.path()).unwrap();
+    manifest.tracks[0].anlz_dir = format!("../{}", outside.path().file_name().unwrap().to_string_lossy());
+    manifest.generation = None;
+    manifest.save(usb.path()).unwrap();
+    lose_library_analysis(&t);
+    let before = rbl_export::snapshot::Snapshot::read(usb.path()).unwrap();
+
+    let result = sync(usb.path(), &[t], &[playlist(10, &[0])]);
+
+    assert!(matches!(&result, Err(rbl_export::ExportError::Conflict(_))), "{result:?}");
+    assert_eq!(rbl_export::snapshot::Snapshot::read(usb.path()).unwrap(), before);
+}
+
+/// DAT, EXT and 2EX are loaded by replacing the base extension. Each one
+/// needs its own boundary check, including optional companions.
+#[cfg(unix)]
+#[test]
+fn a_sync_rejects_an_outside_symlink_in_any_analysis_companion() {
+    use std::os::unix::fs::symlink;
+
+    for escaped_extension in ["DAT", "EXT", "2EX"] {
+        let src = tempfile::tempdir().unwrap();
+        let usb = common::stick();
+        let outside = tempfile::tempdir().unwrap();
+        let t = track_with_files(src.path(), 1, Some(library_cues()));
+        sync(usb.path(), std::slice::from_ref(&t), &[playlist(10, &[0])]).unwrap();
+        let alternate = usb.path().join("alternate-analysis");
+        std::fs::create_dir(&alternate).unwrap();
+        for extension in ["DAT", "EXT"] {
+            std::fs::copy(stick_anlz(usb.path(), 0, extension), alternate.join(format!("ANLZ0000.{extension}"))).unwrap();
+        }
+        let escaped = alternate.join(format!("ANLZ0000.{escaped_extension}"));
+        if escaped.exists() { std::fs::remove_file(&escaped).unwrap(); }
+        let external_file = outside.path().join(format!("ANLZ0000.{escaped_extension}"));
+        std::fs::copy(stick_anlz(usb.path(), 0, "DAT"), &external_file).unwrap();
+        symlink(&external_file, &escaped).unwrap();
+        let mut manifest = Manifest::load(usb.path()).unwrap();
+        manifest.tracks[0].anlz_dir = "/alternate-analysis".into();
+        manifest.generation = None;
+        manifest.save(usb.path()).unwrap();
+        lose_library_analysis(&t);
+        let before = rbl_export::snapshot::Snapshot::read(usb.path()).unwrap();
+
+        let result = sync(usb.path(), &[t], &[playlist(10, &[0])]);
+
+        assert!(matches!(&result, Err(rbl_export::ExportError::Conflict(_))), "{escaped_extension}: {result:?}");
+        assert_eq!(rbl_export::snapshot::Snapshot::read(usb.path()).unwrap(), before);
+    }
+}
+
 /// No library analysis and no library cues: the player's cues are all there
 /// is, and the sync leaves them.
 #[test]
@@ -337,7 +400,7 @@ fn the_removed_track_cue_refusal_names_the_track_and_can_be_cleared() {
     // Track 3 is new, so a late refusal would have copied it first.
     let mut stages = Vec::new();
     let result = export_full(usb.path(), &[tracks[0].clone(), tracks[2].clone()], &[playlist(10, &[0, 1])], &[], None,
-        Some(&SyncSource { db_id: 123, tree: vec![rbl_export::SyncNode { id: 10, parent: 0, attribute: 0 }], automatic: false }),
+        Some(&SyncSource { db_id: 123, tree: vec![rbl_export::SyncNode { id: 10, parent: 0, attribute: 0 }], automatic: false, cloud_db_id: 0 }),
         &mut |p| stages.push(p.stage));
     let Err(rbl_export::ExportError::Conflict(message)) = result else { panic!("{result:?}") };
     assert!(message.contains("'Track 2'"), "{message}");

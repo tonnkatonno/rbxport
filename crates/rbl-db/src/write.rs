@@ -26,8 +26,13 @@
 //! reference library's 1,040,598 cues settled all three:
 //!
 //! - **`ColorTableIndex` is not a per-slot palette.** Index 21 dominates every
-//!   hot-cue kind alike — 169,389 of kind 1, 171,149 of kind 2 — so it is the
-//!   default colour, not a slot's own. Memory cues carry 0 or NULL.
+//!   hot-cue kind alike — 169,389 of kind 1, 171,149 of kind 2. That is the
+//!   colour a CDJ's cue gets when it is saved over LINK
+//!   (`PSvDBMain::SavUsbCue` calls `hotCueDefaultColorIndex`, 21 for a cue
+//!   and 36 for a loop), not what rekordbox's own deck writes: a hot cue set
+//!   or reset there stores 0, "no colour", and is drawn in the HOT CUE color
+//!   table's default for its slot (issue #593; see [`Writer::add_cue`]).
+//!   Memory cues carry 0 or NULL.
 //! - **`Color`** is 255 on memory cues and -1 on hot ones.
 //! - **`BeatLoopSize`** is NULL or 0 on every one of the 1,040,176 cues that
 //!   is not a loop; only the 422 loops set it.
@@ -147,6 +152,53 @@ pub const ANALYSED_FULL: i64 = 105;
 /// Attempts before giving up on finding an unused id.
 const ID_ATTEMPTS: usize = 64;
 
+/// The most tags one My Tag category holds: rekordbox greys a category's
+/// `+` at this many (`BrowseMyTagView`'s constructor stores 50 at +0x100,
+/// which `MyTagItemComponent::isActiveButton` compares the category's count
+/// against; 7.2.19 arm64 @0x10066d5dc, static analysis).
+pub const MY_TAG_LIMIT: usize = 50;
+
+/// What rekordbox's My Tag panel says when a rename would give two rows
+/// under one parent the same name (the `Localize.cpp` string its
+/// `didChangeLabelText` shows, under the title "Cannot rename").
+pub const MY_TAG_NAME_TAKEN: &str = "An item with the same name already exists!";
+
+/// The name rekordbox's Adding My Tag gives a new tag: "My Comment", or
+/// "My Comment (n)" with the smallest n from 1 that no tag in the category
+/// is already called, compared exactly (`BrowseMyTagView::
+/// createNewItemName` @0x10066e770, 7.2.19 static analysis: the base
+/// literal and the wide format " (%d)" at 0x103770760).
+#[must_use]
+pub fn new_my_tag_name(existing: &[String]) -> String {
+    const BASE: &str = "My Comment";
+    let mut name = BASE.to_owned();
+    let mut n = 0_u32;
+    while existing.contains(&name) {
+        n += 1;
+        name = format!("{BASE} ({n})");
+    }
+    name
+}
+
+/// A tag Adding My Tag made: its id, and the name it was given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewMyTag {
+    pub id: String,
+    pub name: String,
+}
+
+/// The names of the live tags in a My Tag category, in their order.
+fn my_tag_names_under(conn: &Connection, category: &str) -> Result<Vec<String>> {
+    let mut statement = conn.prepare(
+        "SELECT COALESCE(Name, '') FROM djmdMyTag
+         WHERE ParentID = ?1 AND Attribute = 0 AND rb_local_deleted = 0 ORDER BY Seq, ID",
+    )?;
+    let names = statement
+        .query_map(params![category], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(names)
+}
+
 /// Columns [`Writer::touch`] will set. A column name is interpolated into SQL,
 /// so the set of legal names is spelled out rather than trusted.
 const WRITABLE_COLUMNS: &[&str] = &[
@@ -249,6 +301,21 @@ pub struct AnalysisRegistration<'a> {
     /// The `.DAT`'s path relative to the share root, from
     /// [`Writer::analysis_data_path_for`]. The files must already be there.
     pub analysis_data_path: &'a str,
+}
+
+/// What a device knows of a track Import Playlist copied from it, for
+/// [`Writer::import_device_analysis`].
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceAnalysis<'a> {
+    /// BPM x100 from the device's row; 0 for none.
+    pub bpm_x100: u32,
+    /// The key by rekordbox's name, or `None`.
+    pub key: Option<&'a str>,
+    /// The `.DAT`'s path relative to the share root, the files already
+    /// there; `None` when the device had no analysis files.
+    pub analysis_data_path: Option<&'a str>,
+    /// The device's cues.
+    pub cues: &'a [rbl_anlz::CueEntry],
 }
 
 /// [`Writer::analysis_data_path_for`] over any connection to the library,
@@ -457,6 +524,26 @@ pub struct ListReplacement {
     after: Vec<(String, Option<i64>)>,
 }
 
+/// One playlist's members as [`Writer::set_tracks_with_undo`] rewrote them,
+/// as exact rows (#501): the live membership rows it tombstoned and the rows
+/// it wrote in their place, each in `TrackNo` order. An XML or iTunes
+/// import's Replace existing keeps one per playlist whose members changed,
+/// and Undo and Redo swap the two sets back and forth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipReplacement {
+    playlist: String,
+    before: Vec<String>,
+    after: Vec<String>,
+}
+
+impl MembershipReplacement {
+    /// The playlist whose members were replaced.
+    #[must_use]
+    pub fn playlist(&self) -> &str {
+        &self.playlist
+    }
+}
+
 /// What [`Writer::import_folder_as_playlist`] does when the target already
 /// holds a playlist, folder or intelligent playlist with the folder's name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,12 +567,76 @@ pub struct PlaylistMove {
     after_index: usize,
 }
 
+/// One Sort Items: a folder's children in the order they had and the order
+/// the sort gave them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistSort {
+    parent: String,
+    before: Vec<String>,
+    after: Vec<String>,
+}
+
+impl PlaylistSort {
+    /// The sort found the folder already in order and wrote nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.before == self.after
+    }
+
+    /// The children's ids in the order the sort gave them.
+    #[must_use]
+    pub fn order(&self) -> &[String] {
+        &self.after
+    }
+}
+
 /// One playlist or folder rename.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaylistRename {
     id: String,
     before: String,
     after: String,
+}
+
+/// One playlist, folder or intelligent playlist made (#500): its row, the
+/// values it was made with, and its parent's live children as `(ID, Seq)`
+/// before and after, so Undo can give the run back its old numbering and
+/// Redo can put the row back in the place it had.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistCreation {
+    id: String,
+    parent: String,
+    attribute: i64,
+    name: String,
+    smart_list: Option<String>,
+    before: Vec<(String, Option<i64>)>,
+    after: Vec<(String, Option<i64>)>,
+}
+
+impl PlaylistCreation {
+    /// The row made.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// One value of one playlist's row changed (#500): an intelligent
+/// playlist's `SmartList`, or a playlist's or folder's `ImagePath`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaylistEdit {
+    id: String,
+    column: &'static str,
+    before: Value,
+    after: Value,
+}
+
+impl PlaylistEdit {
+    /// The edit wrote the value the row already held.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.before == self.after
+    }
 }
 
 /// The exact membership rows removed by one playlist edit, plus the complete
@@ -504,6 +655,118 @@ impl PlaylistTrackRemoval {
     }
 }
 
+/// The list a [`ListRemoval`] took rows off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemovalList {
+    /// The Tag List (`djmdSongTagList`).
+    TagList,
+    /// One history session (`djmdSongHistory` rows of this `HistoryID`).
+    History(String),
+}
+
+/// The exact rows one Remove from Tag List, Clear Tag List or Remove from
+/// History soft-deleted (#508), and the list's live rows with their
+/// `TrackNo` before and after it. Undo brings exactly `removed` back and
+/// gives every row the number it had; Redo takes them off again. Track
+/// rows, `DJPlayCount` among them, are never touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListRemoval {
+    list: RemovalList,
+    removed: Vec<String>,
+    before: Vec<(String, i64)>,
+    after: Vec<(String, i64)>,
+}
+
+impl ListRemoval {
+    fn between(list: RemovalList, before: Vec<(String, i64)>, after: Vec<(String, i64)>) -> Self {
+        let left: std::collections::HashSet<&String> = after.iter().map(|(id, _)| id).collect();
+        let removed = before.iter().filter(|(id, _)| !left.contains(id)).map(|(id, _)| id.clone()).collect();
+        Self { list, removed, before, after }
+    }
+
+    /// Nothing was taken off: no selected track was on the list.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.removed.is_empty()
+    }
+
+    #[must_use]
+    pub fn list(&self) -> &RemovalList {
+        &self.list
+    }
+
+    /// The rows taken off, in the order the list held them.
+    #[must_use]
+    pub fn removed(&self) -> &[String] {
+        &self.removed
+    }
+
+    fn changed_since(&self) -> &'static str {
+        match self.list {
+            RemovalList::TagList => "the Tag List has changed since",
+            RemovalList::History(_) => "the history has changed since",
+        }
+    }
+}
+
+/// The exact membership rows one Add Tracks to Playlist created (#499), and
+/// the playlist's live memberships, with their `TrackNo`, in order before
+/// and after it. Undo
+/// soft-deletes exactly `added`; rows the playlist already held, a track's
+/// earlier copy included, are never touched.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlaylistTrackAddition {
+    playlist: String,
+    added: Vec<String>,
+    before: Vec<(String, i64)>,
+    after: Vec<(String, i64)>,
+}
+
+impl PlaylistTrackAddition {
+    /// Nothing was added: every track was already there.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty()
+    }
+
+    /// The membership rows the add created, in the order they were added.
+    #[must_use]
+    pub fn added(&self) -> &[String] {
+        &self.added
+    }
+
+    /// Takes `next`, the next slice of the same add, into this one, so a
+    /// large drop sent a slice at a time stays one Undo. Only when `next`
+    /// is to the same playlist and started from exactly the order this one
+    /// left; otherwise nothing changes and false is returned.
+    pub fn absorb(&mut self, next: &Self) -> bool {
+        if next.playlist != self.playlist || next.before != self.after {
+            return false;
+        }
+        self.added.extend(next.added.iter().cloned());
+        self.after.clone_from(&next.after);
+        true
+    }
+}
+
+/// One reorder of a playlist's tracks (a drag, or Renumber Track Order;
+/// #499): every live membership row with its `TrackNo`, in order, before and
+/// after.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlaylistReorder {
+    playlist: String,
+    before: Vec<(String, i64)>,
+    after: Vec<(String, i64)>,
+}
+
+impl PlaylistReorder {
+    /// The reorder left every row where it was.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.before == self.after
+    }
+}
+
 /// The exact database value changed by one editable track field.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackEdit {
@@ -511,6 +774,39 @@ pub struct TrackEdit {
     column: &'static str,
     before: Value,
     after: Value,
+}
+
+/// How a caller changes a track's My Tag membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MyTagOperation {
+    Replace,
+    Add,
+    Remove,
+}
+
+/// One run of My Tag siblings put in a new order: the categories (`parent`
+/// is [`ROOT`]) or the tags of one category (`parent` is its id). Each side
+/// holds every live sibling's id and exact `Seq`, in the order read, so Undo
+/// puts back the numbers that were there, gaps and all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MyTagOrder {
+    parent: String,
+    before: Vec<(String, Option<i64>)>,
+    after: Vec<(String, Option<i64>)>,
+}
+
+impl MyTagOrder {
+    /// The reorder left every row's `Seq` as it was.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.before == self.after
+    }
+
+    /// [`ROOT`] for the categories, otherwise the category whose tags moved.
+    #[must_use]
+    pub fn parent(&self) -> &str {
+        &self.parent
+    }
 }
 
 /// The My Tag set before and after one information-panel edit.
@@ -532,6 +828,149 @@ impl TrackEdit {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.before == self.after
+    }
+
+    /// The track the edit changes.
+    #[must_use]
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+}
+
+/// The `djmdContent` columns a Relocate writes: where the track's file is,
+/// its name, and the file's number ([`crate::file_id`]).
+const LINK_COLUMNS: [&str; 3] = ["FolderPath", "FileNameL", "rb_file_id"];
+
+/// One track's link to its audio file before and after a relocation, the
+/// exact stored values of [`LINK_COLUMNS`].
+#[derive(Debug, Clone, PartialEq)]
+struct TrackLink {
+    content: String,
+    before: [Value; 3],
+    after: [Value; 3],
+}
+
+/// Every link one Relocate, Relocate by location or Auto Relocate run
+/// changed, in the order written (#502). Undo puts them all back in one
+/// transaction; the audio files are not touched either way.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TrackRelocation {
+    links: Vec<TrackLink>,
+}
+
+impl TrackRelocation {
+    /// The run wrote nothing, or wrote back the links the tracks had.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.links.iter().all(|link| link.before == link.after)
+    }
+
+    /// How many tracks the run pointed somewhere.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.links.len()
+    }
+
+    /// The tracks the run relocated, in the order written.
+    pub fn tracks(&self) -> impl Iterator<Item = &str> {
+        self.links.iter().map(|link| link.content.as_str())
+    }
+}
+
+/// The `djmdCue` columns a cue edit can change, kept whole so Undo puts back
+/// exactly what was there. `rb_local_deleted` is one of them: a cue's add is
+/// undone by deleting it, and its delete by bringing the same row back.
+const CUE_STATE: [&str; 19] = [
+    "ContentID", "InMsec", "InFrame", "InMpegFrame", "InMpegAbs",
+    "OutMsec", "OutFrame", "OutMpegFrame", "OutMpegAbs",
+    "Kind", "Color", "ColorTableIndex", "ActiveLoop", "Comment", "BeatLoopSize",
+    "CueMicrosec", "InPointSeekInfo", "OutPointSeekInfo", "rb_local_deleted",
+];
+
+/// The hot cue slots in pad order: A to C are `Kind` 1 to 3, D onward 5 to 17.
+const HOT_CUE_SLOTS: [i64; 16] = [1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+
+/// One `djmdCue` row's [`CUE_STATE`] at one moment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CueRow {
+    id: String,
+    values: Vec<Value>,
+}
+
+impl CueRow {
+    fn column(&self, name: &str) -> Option<&Value> {
+        CUE_STATE.iter().position(|c| *c == name).and_then(|i| self.values.get(i))
+    }
+
+    fn live(&self) -> bool {
+        !matches!(self.column("rb_local_deleted"), Some(Value::Integer(1)))
+    }
+
+    fn kind(&self) -> Option<i64> {
+        match self.column("Kind") {
+            Some(Value::Integer(kind)) => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// The same row, soft-deleted: what an added cue was before it was added.
+    fn deleted(&self) -> Self {
+        let mut row = self.clone();
+        if let Some(slot) = CUE_STATE.iter().position(|c| *c == "rb_local_deleted").and_then(|i| row.values.get_mut(i)) {
+            *slot = Value::Integer(1);
+        }
+        row
+    }
+}
+
+/// The cue rows one cue command changed, each before and after it (#504):
+/// what Undo and Redo put back. A command that rewrites several rows — a hot
+/// cue moved across slots, a new Active Loop clearing the old one, a whole
+/// Convert Memory Cues to Hot Cues — is one revision. Rows the command did
+/// not change are not in it, so Undo leaves them as they are.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CueRevision {
+    content: String,
+    steps: Vec<(CueRow, CueRow)>,
+}
+
+impl CueRevision {
+    /// What changed between two reads of one track's cues
+    /// ([`Writer::cue_rows`]) taken around a command under the edit gate.
+    /// A row only in `after` is one the command added.
+    #[must_use]
+    pub fn between(content: &str, before: &[CueRow], after: &[CueRow]) -> Self {
+        let steps = after
+            .iter()
+            .filter_map(|now| {
+                let was = before.iter().find(|row| row.id == now.id).cloned().unwrap_or_else(|| now.deleted());
+                (was != *now).then(|| (was, now.clone()))
+            })
+            .collect();
+        Self { content: content.to_owned(), steps }
+    }
+
+    /// Folds a later command on the same track into this one, as one entry:
+    /// a row both touched keeps its first "before" and takes the last "after".
+    pub fn extend(&mut self, later: Self) {
+        for (before, after) in later.steps {
+            match self.steps.iter_mut().find(|(_, row)| row.id == after.id) {
+                Some(step) => step.1 = after,
+                None => self.steps.push((before, after)),
+            }
+        }
+        self.steps.retain(|(before, after)| before != after);
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    /// The track whose cues the revision changes.
+    #[must_use]
+    pub fn content(&self) -> &str {
+        &self.content
     }
 }
 
@@ -679,6 +1118,243 @@ impl Writer {
         Ok(id)
     }
 
+    /// Creates a playlist (`ATTRIBUTE_PLAYLIST`) or folder
+    /// (`ATTRIBUTE_FOLDER`) under `parent`, at `index` among its children
+    /// when one is given (appended otherwise), and keeps what Undo needs
+    /// (#500). An intelligent playlist is
+    /// [`Self::create_smart_playlist_with_undo`].
+    pub fn create_with_undo(
+        &mut self,
+        name: &str,
+        parent: &str,
+        attribute: i64,
+        index: Option<usize>,
+    ) -> Result<(String, PlaylistCreation)> {
+        if attribute != ATTRIBUTE_PLAYLIST && attribute != ATTRIBUTE_FOLDER {
+            return Err(DbError::WriteRefused(format!("attribute {attribute} is not a playlist or folder")));
+        }
+        let before = children_with_seq(self.library.connection(), parent)?;
+        let id = self.create_node(name, parent, attribute)?;
+        if index.is_some() {
+            self.move_to(&id, parent, index)?;
+        }
+        self.creation(id, parent, before)
+    }
+
+    /// [`Self::create_smart_playlist`], keeping what Undo needs (#500).
+    pub fn create_smart_playlist_with_undo(
+        &mut self,
+        name: &str,
+        parent: &str,
+        smart_list: impl FnOnce(&str) -> String,
+    ) -> Result<(String, PlaylistCreation)> {
+        let before = children_with_seq(self.library.connection(), parent)?;
+        let id = self.create_smart_playlist(name, parent, smart_list)?;
+        self.creation(id, parent, before)
+    }
+
+    fn creation(
+        &self,
+        id: String,
+        parent: &str,
+        before: Vec<(String, Option<i64>)>,
+    ) -> Result<(String, PlaylistCreation)> {
+        let conn = self.library.connection();
+        let (attribute, name, smart_list) = conn.query_row(
+            "SELECT Attribute, COALESCE(Name, ''), SmartList FROM djmdPlaylist WHERE ID = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let after = children_with_seq(conn, parent)?;
+        let creation = PlaylistCreation {
+            id: id.clone(),
+            parent: parent.to_owned(),
+            attribute,
+            name,
+            smart_list,
+            before,
+            after,
+        };
+        Ok((id, creation))
+    }
+
+    /// Undoes a creation: the row made becomes a tombstone again, and its
+    /// parent's other children get back the `Seq` they had when they are
+    /// still exactly the ones they were.
+    ///
+    /// Refused as a [`DbError::Conflict`], writing nothing, unless the row is
+    /// still as it was made: there, under the same parent, with the same
+    /// name, rule and no artwork, and holding no tracks and no playlists.
+    /// Undo of a creation never takes anything added to it since (#500,
+    /// following #506): those stay, and so does the playlist.
+    pub fn undo_creation(&mut self, edit: &PlaylistCreation) -> Result<Changed> {
+        self.prepare()?;
+        let stamp = time::now();
+        let tx = self.library.connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(reason) = creation_conflict(&tx, edit)? {
+            return Err(DbError::Conflict(reason));
+        }
+        let mut usn = next_usn(&tx)?;
+        let mut rows = tx.execute(
+            "UPDATE djmdPlaylist SET rb_local_deleted = 1, rb_local_usn = ?1, updated_at = ?2
+             WHERE ID = ?3 AND rb_local_deleted = 0",
+            params![usn, stamp, edit.id],
+        )?;
+        // A creation at an index renumbered the whole run; with the run as
+        // it was, so are its numbers.
+        let staying = children_with_seq(&tx, &edit.parent)?;
+        if staying.iter().map(|(id, _)| id).eq(edit.before.iter().map(|(id, _)| id)) {
+            for ((id, seq), (_, was)) in staying.iter().zip(&edit.before) {
+                if seq == was {
+                    continue;
+                }
+                usn = next_usn(&tx)?;
+                rows += tx.execute(
+                    "UPDATE djmdPlaylist SET Seq = ?1, rb_local_usn = ?2, updated_at = ?3
+                     WHERE ID = ?4 AND rb_local_deleted = 0",
+                    params![was, usn, stamp, id],
+                )?;
+            }
+        }
+        set_counter(&tx, usn)?;
+        tx.commit()?;
+        Ok(Changed { rows, usn })
+    }
+
+    /// Makes the same row again after [`Self::undo_creation`], in its place
+    /// among the parent's children: with exactly the children it had, every
+    /// one gets back the `Seq` it had after the creation; otherwise it goes
+    /// after the nearest sibling it followed that is still there.
+    ///
+    /// Refused as a [`DbError::Conflict`] when the row is live again or gone,
+    /// or the folder it was made in is no longer there.
+    pub fn redo_creation(&mut self, edit: &PlaylistCreation) -> Result<Changed> {
+        self.prepare()?;
+        let stamp = time::now();
+        let tx = self.library.connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(reason) = recreation_conflict(&tx, edit)? {
+            return Err(DbError::Conflict(reason));
+        }
+        let current = children_with_seq(&tx, &edit.parent)?;
+        let order = place_among(current.into_iter().map(|(id, _)| id).collect(), &edit.id, &edit.after);
+        let target: Vec<(String, Option<i64>)> = if order.iter().eq(edit.after.iter().map(|(id, _)| id)) {
+            edit.after.clone()
+        } else {
+            order.into_iter().enumerate()
+                .map(|(seq, id)| (id, Some(i64::try_from(seq).unwrap_or(i64::MAX))))
+                .collect()
+        };
+        let mut usn = next_usn(&tx)?;
+        let mut rows = tx.execute(
+            "UPDATE djmdPlaylist SET rb_local_deleted = 0, rb_local_usn = ?1, updated_at = ?2
+             WHERE ID = ?3 AND rb_local_deleted = 1",
+            params![usn, stamp, edit.id],
+        )?;
+        let live: std::collections::HashMap<String, Option<i64>> =
+            children_with_seq(&tx, &edit.parent)?.into_iter().collect();
+        for (id, seq) in &target {
+            if live.get(id) == Some(seq) {
+                continue;
+            }
+            usn = next_usn(&tx)?;
+            rows += tx.execute(
+                "UPDATE djmdPlaylist SET Seq = ?1, rb_local_usn = ?2, updated_at = ?3
+                 WHERE ID = ?4 AND ParentID = ?5 AND rb_local_deleted = 0",
+                params![seq, usn, stamp, id, edit.parent],
+            )?;
+        }
+        set_counter(&tx, usn)?;
+        tx.commit()?;
+        Ok(Changed { rows, usn })
+    }
+
+    /// Whether Undo (`undo`) or Redo of `edit` would be refused, and why,
+    /// without writing: what [`Self::undo_creation`] and
+    /// [`Self::redo_creation`] check in their own transaction.
+    pub fn creation_conflict(&self, edit: &PlaylistCreation, undo: bool) -> Result<Option<String>> {
+        let conn = self.library.connection();
+        if undo { creation_conflict(conn, edit) } else { recreation_conflict(conn, edit) }
+    }
+
+    /// [`Self::set_smart_list`], keeping the rule it replaced for Undo
+    /// (#500).
+    pub fn set_smart_list_with_undo(&mut self, id: &str, smart_list: &str) -> Result<(Changed, PlaylistEdit)> {
+        self.playlist_edit(id, "SmartList", |writer| writer.set_smart_list(id, smart_list))
+    }
+
+    /// [`Self::set_playlist_artwork`], keeping the image reference it
+    /// replaced for Undo (#500). The copied image file stays on Undo, as a
+    /// track's artwork Undo leaves it.
+    pub fn set_playlist_artwork_with_undo(
+        &mut self,
+        playlist: &str,
+        image: Option<&Path>,
+    ) -> Result<(Changed, PlaylistEdit)> {
+        self.playlist_edit(playlist, "ImagePath", |writer| writer.set_playlist_artwork(playlist, image))
+    }
+
+    fn playlist_edit(
+        &mut self,
+        id: &str,
+        column: &'static str,
+        write: impl FnOnce(&mut Self) -> Result<Changed>,
+    ) -> Result<(Changed, PlaylistEdit)> {
+        let before = self.playlist_value(id, column)?;
+        let changed = write(self)?;
+        let after = self.playlist_value(id, column)?;
+        Ok((changed, PlaylistEdit { id: id.to_owned(), column, before, after }))
+    }
+
+    fn playlist_value(&self, id: &str, column: &'static str) -> Result<Value> {
+        if !WRITABLE_COLUMNS.contains(&column) {
+            return Err(DbError::WriteRefused(format!("{column} is not writable")));
+        }
+        self.library.connection().query_row(
+            &format!("SELECT `{column}` FROM djmdPlaylist WHERE ID = ?1 AND rb_local_deleted = 0"),
+            params![id],
+            |row| row.get(0),
+        ).optional()?
+            .ok_or_else(|| DbError::WriteRefused(format!("no playlist or folder {id}")))
+    }
+
+    /// Puts back the value a playlist had before `edit`. Refused with
+    /// [`DbError::Conflict`], writing nothing, unless the playlist still
+    /// holds the value the edit left (see [`Self::check_playlist_edit`]).
+    pub fn undo_playlist_edit(&mut self, edit: &PlaylistEdit) -> Result<Changed> {
+        self.check_playlist_edit(edit, true)?;
+        self.touch_playlist(&edit.id, edit.column, &edit.before)
+    }
+
+    /// Writes `edit`'s value again after it was undone.
+    pub fn redo_playlist_edit(&mut self, edit: &PlaylistEdit) -> Result<Changed> {
+        self.check_playlist_edit(edit, false)?;
+        self.touch_playlist(&edit.id, edit.column, &edit.after)
+    }
+
+    /// Whether the playlist holds what Undo (`undo`, the edit's `after`) or
+    /// Redo (its `before`) expects, compared by SQL `IS`; anything else was
+    /// written since outside the history and is kept, as a
+    /// [`DbError::Conflict`] (#506).
+    pub fn check_playlist_edit(&self, edit: &PlaylistEdit, undo: bool) -> Result<()> {
+        if !WRITABLE_COLUMNS.contains(&edit.column) {
+            return Err(DbError::WriteRefused(format!("{} is not writable", edit.column)));
+        }
+        let expected = if undo { &edit.after } else { &edit.before };
+        let same: Option<bool> = self.library.connection().query_row(
+            &format!("SELECT (`{}` IS ?2) FROM djmdPlaylist WHERE ID = ?1 AND rb_local_deleted = 0", edit.column),
+            params![edit.id, expected],
+            |row| row.get(0),
+        ).optional()?;
+        let what = if edit.column == "SmartList" { "rule" } else { "artwork" };
+        match same {
+            Some(true) => Ok(()),
+            Some(false) => Err(DbError::Conflict(format!("the playlist's {what} has changed since"))),
+            None => Err(DbError::Conflict("the playlist is no longer there".to_owned())),
+        }
+    }
+
     /// Renames a playlist or folder.
     pub fn rename(&mut self, id: &str, name: &str) -> Result<Changed> {
         self.touch_playlist(id, "Name", &Value::Text(name.to_owned()))
@@ -695,12 +1371,30 @@ impl Writer {
         Ok((changed, PlaylistRename { id: id.to_owned(), before, after: name.to_owned() }))
     }
 
+    /// Gives a playlist back its old name, refused as a
+    /// [`DbError::Conflict`] unless it still has the name the rename gave.
     pub fn undo_rename(&mut self, edit: &PlaylistRename) -> Result<Changed> {
+        self.check_rename(edit, true)?;
         self.rename(&edit.id, &edit.before)
     }
 
     pub fn redo_rename(&mut self, edit: &PlaylistRename) -> Result<Changed> {
+        self.check_rename(edit, false)?;
         self.rename(&edit.id, &edit.after)
+    }
+
+    fn check_rename(&self, edit: &PlaylistRename, undo: bool) -> Result<()> {
+        let expected = if undo { &edit.after } else { &edit.before };
+        let name: Option<Option<String>> = self.library.connection().query_row(
+            "SELECT Name FROM djmdPlaylist WHERE ID = ?1 AND rb_local_deleted = 0",
+            params![edit.id],
+            |row| row.get(0),
+        ).optional()?;
+        match name {
+            None => Err(DbError::Conflict("the playlist is no longer there".to_owned())),
+            Some(name) if name.as_deref().unwrap_or("") == expected => Ok(()),
+            Some(_) => Err(DbError::Conflict("the playlist has been renamed since".to_owned())),
+        }
     }
 
     /// Moves a playlist or folder under a new parent.
@@ -774,12 +1468,126 @@ impl Writer {
         }))
     }
 
+    /// Moves a playlist back where it was, refused as a
+    /// [`DbError::Conflict`] unless it is still where the move put it: a
+    /// move rewrites the order of its siblings, so one moved, made or
+    /// deleted there since would be put out of the place it has now.
     pub fn undo_move(&mut self, edit: &PlaylistMove) -> Result<Changed> {
+        self.check_move(edit, true)?;
         self.move_to(&edit.id, &edit.before_parent, Some(edit.before_index))
     }
 
     pub fn redo_move(&mut self, edit: &PlaylistMove) -> Result<Changed> {
+        self.check_move(edit, false)?;
         self.move_to(&edit.id, &edit.after_parent, Some(edit.after_index))
+    }
+
+    fn check_move(&self, edit: &PlaylistMove, undo: bool) -> Result<()> {
+        let expected = if undo {
+            (edit.after_parent.as_str(), edit.after_index)
+        } else {
+            (edit.before_parent.as_str(), edit.before_index)
+        };
+        if !node_exists(self.library.connection(), &edit.id)? {
+            return Err(DbError::Conflict("the playlist is no longer there".to_owned()));
+        }
+        let (parent, index) = self.playlist_position(&edit.id)?;
+        if parent != expected.0 {
+            Err(DbError::Conflict("the playlist has been moved since".to_owned()))
+        } else if index != expected.1 {
+            Err(DbError::Conflict("the playlists beside it have changed since".to_owned()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Sort Items: puts the direct children of a folder, or of the top of
+    /// the tree (`ROOT`), in the order `compare` gives their names, and keeps
+    /// both orders for undo.
+    ///
+    /// rekordbox sorts one level, playlists and folders together, and
+    /// writes the whole new order in one go [OBS static, rekordbox 7.2.19
+    /// macOS arm64: `browse::TreeViewer::treeMessageSortItem` @0x10156621c
+    /// sorts the folder item's sub-items with `PlaylistItemSorter`, which
+    /// compares names only, then hands every child's id in the new order to
+    /// `renumberListOrder`]. The comparison is the caller's, so the
+    /// collation stays with the index (`rbl_index::collate`). Names that
+    /// compare equal keep the order they had [ASSUME: rekordbox's
+    /// `std::sort` leaves them in no particular order].
+    ///
+    /// All of it is one transaction: a failure part way leaves the old order.
+    /// A folder already in order is not written, and its edit is empty.
+    pub fn sort_children_with_undo(
+        &mut self,
+        parent: &str,
+        mut compare: impl FnMut(&str, &str) -> std::cmp::Ordering,
+    ) -> Result<(Changed, PlaylistSort)> {
+        self.prepare()?;
+        let stamp = time::now();
+        let tx = self.library.connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        refuse_unless_folder(&tx, parent)?;
+        let mut stmt = tx.prepare(
+            "SELECT ID, COALESCE(Name, '') FROM djmdPlaylist
+             WHERE ParentID = ?1 AND rb_local_deleted = 0
+             ORDER BY Seq, ID",
+        )?;
+        let children: Vec<(String, String)> = stmt
+            .query_map(params![parent], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        let before: Vec<String> = children.iter().map(|(id, _)| id.clone()).collect();
+        let mut sorted = children;
+        // Stable: equal names keep their places.
+        sorted.sort_by(|(_, a), (_, b)| compare(a, b));
+        let after: Vec<String> = sorted.into_iter().map(|(id, _)| id).collect();
+        let edit = PlaylistSort { parent: parent.to_owned(), before, after };
+        if edit.is_empty() {
+            return Ok((Changed { rows: 0, usn: 0 }, edit));
+        }
+        let changed = write_child_order(&tx, parent, &edit.after, &stamp)?;
+        tx.commit()?;
+        Ok((changed, edit))
+    }
+
+    /// Puts a sorted folder back in the order it had.
+    pub fn undo_sort(&mut self, edit: &PlaylistSort) -> Result<Changed> {
+        self.set_child_order(&edit.parent, &edit.before)
+    }
+
+    /// Sorts the folder again, to the order the sort gave it.
+    pub fn redo_sort(&mut self, edit: &PlaylistSort) -> Result<Changed> {
+        self.set_child_order(&edit.parent, &edit.after)
+    }
+
+    /// Writes `order` as the order of `parent`'s children. Refused, with
+    /// nothing written, unless `order` is exactly the children `parent` has
+    /// now: a playlist made, moved or deleted since would otherwise be lost
+    /// from the tree or given a place it no longer has.
+    fn set_child_order(&mut self, parent: &str, order: &[String]) -> Result<Changed> {
+        self.prepare()?;
+        let stamp = time::now();
+        let tx = self.library.connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        refuse_unless_folder(&tx, parent)?;
+        let mut stmt = tx.prepare(
+            "SELECT ID FROM djmdPlaylist WHERE ParentID = ?1 AND rb_local_deleted = 0",
+        )?;
+        let mut live: Vec<String> = stmt
+            .query_map(params![parent], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        let mut wanted = order.to_vec();
+        live.sort();
+        wanted.sort();
+        if live != wanted {
+            return Err(DbError::Conflict(
+                "the folder's playlists have changed since it was sorted".to_owned(),
+            ));
+        }
+        let changed = write_child_order(&tx, parent, order, &stamp)?;
+        tx.commit()?;
+        Ok(changed)
     }
 
     /// The live children of `parent`, in tree order.
@@ -865,7 +1673,7 @@ impl Writer {
                     params![to, usn, stamp, id, from],
                 )?;
                 if changed != 1 {
-                    return Err(DbError::WriteRefused("that playlist deletion can no longer be redone".to_owned()));
+                    return Err(DbError::Conflict("the playlist has changed since".to_owned()));
                 }
                 rows += changed;
             }
@@ -877,7 +1685,7 @@ impl Writer {
                     params![to, usn, stamp, id, from],
                 )?;
                 if changed != 1 {
-                    return Err(DbError::WriteRefused("that playlist deletion can no longer be redone".to_owned()));
+                    return Err(DbError::Conflict("the playlist has changed since".to_owned()));
                 }
                 rows += changed;
             }
@@ -890,7 +1698,7 @@ impl Writer {
                     params![to, usn, stamp, id, from],
                 )?;
                 if changed != 1 {
-                    return Err(DbError::WriteRefused("that playlist deletion can no longer be undone".to_owned()));
+                    return Err(DbError::Conflict("the playlist has changed since".to_owned()));
                 }
                 rows += changed;
             }
@@ -902,7 +1710,7 @@ impl Writer {
                     params![to, usn, stamp, id, from],
                 )?;
                 if changed != 1 {
-                    return Err(DbError::WriteRefused("that playlist deletion can no longer be undone".to_owned()));
+                    return Err(DbError::Conflict("the playlist has changed since".to_owned()));
                 }
                 rows += changed;
             }
@@ -1240,11 +2048,7 @@ impl Writer {
     }
 
     fn set_replacement(&mut self, edit: &ListReplacement, undo: bool) -> Result<Changed> {
-        let refused = || DbError::WriteRefused(if undo {
-            "that replacement can no longer be undone".to_owned()
-        } else {
-            "that replacement can no longer be redone".to_owned()
-        });
+        let refused = || DbError::Conflict("the playlists have changed since".to_owned());
         let root = edit.replaced.playlist_ids.first().ok_or_else(refused)?;
         self.prepare()?;
         let stamp = time::now();
@@ -1352,6 +2156,16 @@ impl Writer {
     /// intelligent playlist, a folder, and a track not in the library.
     /// `rows` is the membership rows written for the new members.
     pub fn set_tracks(&mut self, playlist: &str, contents: &[String]) -> Result<Changed> {
+        self.set_tracks_with_undo(playlist, contents).map(|(changed, _)| changed)
+    }
+
+    /// [`Writer::set_tracks`], also answering the exact rows it tombstoned
+    /// and wrote, for Undo (#501). `None` when it wrote nothing.
+    pub fn set_tracks_with_undo(
+        &mut self,
+        playlist: &str,
+        contents: &[String],
+    ) -> Result<(Changed, Option<MembershipReplacement>)> {
         let mut seen = std::collections::HashSet::new();
         let wanted: Vec<&String> = contents.iter().filter(|c| seen.insert(c.as_str())).collect();
         self.prepare()?;
@@ -1388,7 +2202,7 @@ impl Writer {
         if current.len() == wanted.len()
             && current.iter().zip(&wanted).all(|((_, have), want)| have == *want)
         {
-            return Ok(Changed { rows: 0, usn: 0 });
+            return Ok((Changed { rows: 0, usn: 0 }, None));
         }
 
         let mut usn = 0;
@@ -1401,6 +2215,7 @@ impl Writer {
             )?;
         }
         let mut rows = 0;
+        let mut after = Vec::with_capacity(wanted.len());
         for ((track_no, content), (row_id, uuid)) in (1_i64..).zip(&wanted).zip(ids) {
             // Checked here, after the old rows are gone, so a refusal is the
             // transaction rolling back, never a half-replaced playlist.
@@ -1416,6 +2231,94 @@ impl Writer {
                  VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 0, 0, NULL, ?6, ?7, ?7)",
                 params![row_id, playlist, content, track_no, uuid, usn, stamp],
             )?;
+            after.push(row_id);
+        }
+        set_counter(&tx, usn)?;
+        tx.commit()?;
+        let replacement = MembershipReplacement {
+            playlist: playlist.to_owned(),
+            before: current.into_iter().map(|(row_id, _)| row_id).collect(),
+            after,
+        };
+        Ok((Changed { rows, usn }, Some(replacement)))
+    }
+
+    /// Undoes an XML or iTunes import's Replace existing (#501) in one
+    /// transaction: in every playlist named, the rows the import wrote become
+    /// tombstones again and the rows it tombstoned come back, numbered
+    /// `TrackNo` 1..N in their old order. Tracks the import added stay in the
+    /// collection, and lists it made stay where they are.
+    ///
+    /// Refuses with [`DbError::Conflict`], writing nothing, when any of those
+    /// playlists no longer holds exactly the rows the import left in it, in
+    /// that order, or a track a returning row names has left the collection.
+    pub fn undo_membership_replacements(&mut self, edits: &[MembershipReplacement]) -> Result<Changed> {
+        self.set_membership_replacements(edits, true)
+    }
+
+    /// Applies an import's replacements again after
+    /// [`Writer::undo_membership_replacements`], with the same rows, under the
+    /// same conditions.
+    pub fn redo_membership_replacements(&mut self, edits: &[MembershipReplacement]) -> Result<Changed> {
+        self.set_membership_replacements(edits, false)
+    }
+
+    fn set_membership_replacements(&mut self, edits: &[MembershipReplacement], undo: bool) -> Result<Changed> {
+        if edits.is_empty() {
+            return Err(DbError::WriteRefused("empty playlist replacement history".to_owned()));
+        }
+        let changed = || DbError::Conflict("the playlist's tracks have changed since".to_owned());
+        self.prepare()?;
+        let stamp = time::now();
+        let tx = self.library.connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Every playlist is checked before any is written.
+        for edit in edits {
+            let (leaving, entering) = if undo { (&edit.after, &edit.before) } else { (&edit.before, &edit.after) };
+            if !node_exists(&tx, &edit.playlist)? || live_members(&tx, &edit.playlist)? != *leaving {
+                return Err(changed());
+            }
+            for row in entering {
+                let content: Option<String> = tx
+                    .query_row(
+                        "SELECT ContentID FROM djmdSongPlaylist
+                         WHERE ID = ?1 AND PlaylistID = ?2 AND rb_local_deleted = 1",
+                        params![row, edit.playlist],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let Some(content) = content else {
+                    return Err(changed());
+                };
+                if !content_exists(&tx, &content)? {
+                    return Err(DbError::Conflict("a track it held is no longer in the collection".to_owned()));
+                }
+            }
+        }
+        let mut rows = 0;
+        let mut usn = 0;
+        for edit in edits {
+            let (leaving, entering) = if undo { (&edit.after, &edit.before) } else { (&edit.before, &edit.after) };
+            for row in leaving {
+                usn = next_usn(&tx)?;
+                rows += tx.execute(
+                    "UPDATE djmdSongPlaylist SET rb_local_deleted = 1, rb_local_usn = ?1, updated_at = ?2
+                     WHERE ID = ?3 AND rb_local_deleted = 0",
+                    params![usn, stamp, row],
+                )?;
+            }
+            for (track_no, row) in (1_i64..).zip(entering) {
+                usn = next_usn(&tx)?;
+                rows += tx.execute(
+                    "UPDATE djmdSongPlaylist SET rb_local_deleted = 0, TrackNo = ?1, rb_local_usn = ?2,
+                        updated_at = ?3
+                     WHERE ID = ?4 AND rb_local_deleted = 1",
+                    params![track_no, usn, stamp, row],
+                )?;
+            }
+            if live_members(&tx, &edit.playlist)? != *entering {
+                return Err(changed());
+            }
         }
         set_counter(&tx, usn)?;
         tx.commit()?;
@@ -1618,6 +2521,18 @@ impl Writer {
         let stamp = time::now();
         let tx = self.library.connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // The playlist must hold exactly what the history left in it, in
+        // that order: all of `order` after a Redo, all but `removed` after
+        // the removal. A track added, removed or moved there since would
+        // otherwise be lost from the order or numbered twice (#506).
+        let expected: Vec<&String> = if deleted {
+            edit.order.iter().collect()
+        } else {
+            edit.order.iter().filter(|id| !edit.removed.contains(id)).collect()
+        };
+        if !live_members(&tx, &edit.playlist)?.iter().eq(expected) {
+            return Err(DbError::Conflict("the playlist's tracks have changed since".to_owned()));
+        }
         let mut rows = 0;
         let mut usn = 0;
         for membership in &edit.removed {
@@ -1639,6 +2554,74 @@ impl Writer {
                     params![i64::try_from(index + 1).unwrap_or(i64::MAX), usn, stamp, membership],
                 )?;
             }
+        }
+        set_counter(&tx, usn)?;
+        tx.commit()?;
+        Ok(Changed { rows, usn })
+    }
+
+    /// [`Writer::add_tracks_allowing`], keeping the membership rows it
+    /// created and the playlist's order before and after, so the add can be
+    /// undone without touching any row that was there before it (#499).
+    pub fn add_tracks_with_undo(
+        &mut self,
+        playlist: &str,
+        contents: &[String],
+        allow_duplicates: bool,
+    ) -> Result<(Changed, PlaylistTrackAddition)> {
+        let before = numbered_members(self.library.connection(), playlist)?;
+        let changed = self.add_tracks_allowing(playlist, contents, allow_duplicates)?;
+        let after = numbered_members(self.library.connection(), playlist)?;
+        let held: std::collections::HashSet<&String> = before.iter().map(|(id, _)| id).collect();
+        let added = after.iter().filter(|(id, _)| !held.contains(id)).map(|(id, _)| id.clone()).collect();
+        let edit = PlaylistTrackAddition { playlist: playlist.to_owned(), added, before, after };
+        Ok((changed, edit))
+    }
+
+    /// Takes the rows an add created out of the playlist again.
+    pub fn undo_track_addition(&mut self, edit: &PlaylistTrackAddition) -> Result<Changed> {
+        self.set_track_addition(edit, true)
+    }
+
+    /// Puts the same rows an add created back, at the numbers they had.
+    pub fn redo_track_addition(&mut self, edit: &PlaylistTrackAddition) -> Result<Changed> {
+        self.set_track_addition(edit, false)
+    }
+
+    fn set_track_addition(&mut self, edit: &PlaylistTrackAddition, deleted: bool) -> Result<Changed> {
+        if edit.is_empty() {
+            return Err(DbError::WriteRefused("empty playlist track-addition history".to_owned()));
+        }
+        self.prepare()?;
+        let stamp = time::now();
+        let tx = self.library.connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // The playlist must hold exactly what the history left in it, at
+        // the same numbers: the add's result for an Undo, what it started
+        // from for a Redo. A track added, removed, moved or renumbered there
+        // since would otherwise be lost from the order or numbered twice
+        // (#506).
+        let (expected, result) = if deleted { (&edit.after, &edit.before) } else { (&edit.before, &edit.after) };
+        let changed = "the playlist's tracks have changed since";
+        if numbered_members(&tx, &edit.playlist)? != *expected {
+            return Err(DbError::Conflict(changed.to_owned()));
+        }
+        // `next_usn` scans every sync table, so it is read once and counted
+        // up from there, as the add itself does.
+        let mut usn = next_usn(&tx)? - 1;
+        let mut rows = 0;
+        for membership in &edit.added {
+            usn += 1;
+            rows += tx.execute(
+                "UPDATE djmdSongPlaylist SET rb_local_deleted = ?1, rb_local_usn = ?2, updated_at = ?3
+                 WHERE ID = ?4 AND PlaylistID = ?5 AND rb_local_deleted = ?6",
+                params![i64::from(deleted), usn, stamp, membership, edit.playlist, i64::from(!deleted)],
+            )?;
+        }
+        // A row gone for good, or numbered elsewhere since: the dropped
+        // transaction writes nothing.
+        if rows != edit.added.len() || numbered_members(&tx, &edit.playlist)? != *result {
+            return Err(DbError::Conflict(changed.to_owned()));
         }
         set_counter(&tx, usn)?;
         tx.commit()?;
@@ -1700,10 +2683,18 @@ impl Writer {
     /// Soft-deleted, as every other membership row is [ASSUME: no capture
     /// of rekordbox taking one off].
     pub fn tag_list_remove(&mut self, contents: &[String]) -> Result<Changed> {
+        self.tag_list_remove_with_undo(contents).map(|(changed, _)| changed)
+    }
+
+    /// [`Writer::tag_list_remove`], keeping the rows it took off and the
+    /// list's rows with their `TrackNo` before and after, read in the same
+    /// transaction, so the removal can be undone (#508).
+    pub fn tag_list_remove_with_undo(&mut self, contents: &[String]) -> Result<(Changed, ListRemoval)> {
         self.prepare()?;
         let stamp = time::now();
         let tx = self.library.connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let before = numbered_rows(&tx, &RemovalList::TagList)?;
         let mut rows = 0;
         for content in contents {
             rows += tx.execute(
@@ -1727,22 +2718,109 @@ impl Writer {
                 )?;
             }
         }
+        let removal = ListRemoval::between(RemovalList::TagList, before, numbered_rows(&tx, &RemovalList::TagList)?);
         tx.commit()?;
-        Ok(Changed { rows, usn: 0 })
+        Ok((Changed { rows, usn: 0 }, removal))
     }
 
     /// Empties the Tag List.
     pub fn tag_list_clear(&mut self) -> Result<Changed> {
+        self.tag_list_clear_with_undo().map(|(changed, _)| changed)
+    }
+
+    /// [`Writer::tag_list_clear`], keeping every row it took off and their
+    /// `TrackNo`, so the clear can be undone (#508).
+    pub fn tag_list_clear_with_undo(&mut self) -> Result<(Changed, ListRemoval)> {
         self.prepare()?;
         let stamp = time::now();
         let tx = self.library.connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let before = numbered_rows(&tx, &RemovalList::TagList)?;
         let rows = tx.execute(
             "UPDATE djmdSongTagList SET rb_local_deleted = 1, updated_at = ?1 WHERE rb_local_deleted = 0",
             params![stamp],
         )?;
+        let removal = ListRemoval::between(RemovalList::TagList, before, numbered_rows(&tx, &RemovalList::TagList)?);
         tx.commit()?;
-        Ok(Changed { rows, usn: 0 })
+        Ok((Changed { rows, usn: 0 }, removal))
+    }
+
+    /// Puts back the rows a Tag List or history removal took off, at the
+    /// numbers every row of the list had before it (#508).
+    pub fn undo_list_removal(&mut self, edit: &ListRemoval) -> Result<Changed> {
+        self.set_list_removal(edit, false)
+    }
+
+    /// Takes the same rows off again and gives the rest the numbers the
+    /// removal left them (#508).
+    pub fn redo_list_removal(&mut self, edit: &ListRemoval) -> Result<Changed> {
+        self.set_list_removal(edit, true)
+    }
+
+    fn set_list_removal(&mut self, edit: &ListRemoval, deleted: bool) -> Result<Changed> {
+        if edit.is_empty() {
+            return Err(DbError::WriteRefused("empty list-removal history".to_owned()));
+        }
+        self.prepare()?;
+        let stamp = time::now();
+        let tx = self.library.connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(reason) = list_removal_conflict(&tx, edit, deleted)? {
+            return Err(DbError::Conflict(reason));
+        }
+        let (table, result) = match &edit.list {
+            RemovalList::TagList => ("djmdSongTagList", if deleted { &edit.after } else { &edit.before }),
+            RemovalList::History(_) => ("djmdSongHistory", if deleted { &edit.after } else { &edit.before }),
+        };
+        // The Tag List's rows carry no update number, as rekordbox writes
+        // them; a history's rows take one each, as the removal gave them.
+        let counted = matches!(edit.list, RemovalList::History(_));
+        let mut usn = if counted { next_usn(&tx)? - 1 } else { 0 };
+        let mut rows = 0;
+        for id in &edit.removed {
+            let flipped = if counted {
+                usn += 1;
+                tx.execute(
+                    &format!("UPDATE {table} SET rb_local_deleted = ?1, rb_local_usn = ?2, updated_at = ?3
+                              WHERE ID = ?4 AND rb_local_deleted = ?5"),
+                    params![i64::from(deleted), usn, stamp, id, i64::from(!deleted)],
+                )?
+            } else {
+                tx.execute(
+                    &format!("UPDATE {table} SET rb_local_deleted = ?1, updated_at = ?2
+                              WHERE ID = ?3 AND rb_local_deleted = ?4"),
+                    params![i64::from(deleted), stamp, id, i64::from(!deleted)],
+                )?
+            };
+            rows += flipped;
+        }
+        // Only rows whose number moves are written, as the removal did.
+        for (id, track_no) in result {
+            let moved = if counted {
+                tx.execute(
+                    &format!("UPDATE {table} SET TrackNo = ?1, rb_local_usn = ?2, updated_at = ?3
+                              WHERE ID = ?4 AND TrackNo != ?1"),
+                    params![track_no, usn + 1, stamp, id],
+                )?
+            } else {
+                tx.execute(
+                    &format!("UPDATE {table} SET TrackNo = ?1, updated_at = ?2 WHERE ID = ?3 AND TrackNo != ?1"),
+                    params![track_no, stamp, id],
+                )?
+            };
+            if counted && moved > 0 {
+                usn += 1;
+            }
+        }
+        // A row gone for good since: the dropped transaction writes nothing.
+        if rows != edit.removed.len() || numbered_rows(&tx, &edit.list)? != *result {
+            return Err(DbError::Conflict(edit.changed_since().to_owned()));
+        }
+        if counted {
+            set_counter(&tx, usn)?;
+        }
+        tx.commit()?;
+        Ok(Changed { rows, usn })
     }
 
     /// Reorders a playlist to exactly this sequence of tracks.
@@ -1788,6 +2866,59 @@ impl Writer {
         }
         tx.commit()?;
         Ok(Changed { rows, usn })
+    }
+
+    /// [`Writer::reorder`], keeping every membership row's `TrackNo` before
+    /// and after so the reorder can be undone and redone exactly (#499).
+    pub fn reorder_with_undo(&mut self, playlist: &str, order: &[String]) -> Result<(Changed, PlaylistReorder)> {
+        let before = numbered_members(self.library.connection(), playlist)?;
+        let changed = self.reorder(playlist, order)?;
+        let after = numbered_members(self.library.connection(), playlist)?;
+        Ok((changed, PlaylistReorder { playlist: playlist.to_owned(), before, after }))
+    }
+
+    /// Puts a reordered playlist back in the order, and numbers, it had.
+    pub fn undo_reorder(&mut self, edit: &PlaylistReorder) -> Result<Changed> {
+        self.set_reorder(&edit.after, &edit.before, &edit.playlist)
+    }
+
+    /// Reorders the playlist again, to the order the reorder gave it.
+    pub fn redo_reorder(&mut self, edit: &PlaylistReorder) -> Result<Changed> {
+        self.set_reorder(&edit.before, &edit.after, &edit.playlist)
+    }
+
+    /// Writes `target`'s numbers, refused with nothing written unless the
+    /// playlist's live rows are exactly `expected`, numbers included: a track
+    /// added, removed or moved there since would otherwise be left out or
+    /// numbered twice (#506).
+    fn set_reorder(&mut self, expected: &[(String, i64)], target: &[(String, i64)], playlist: &str) -> Result<Changed> {
+        self.prepare()?;
+        let stamp = time::now();
+        let tx = self.library.connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if numbered_members(&tx, playlist)? != expected {
+            return Err(DbError::Conflict("the playlist's tracks have changed since".to_owned()));
+        }
+        let now: std::collections::HashMap<&str, i64> = expected.iter().map(|(id, no)| (id.as_str(), *no)).collect();
+        let mut usn = next_usn(&tx)? - 1;
+        let mut rows = 0;
+        for (id, number) in target {
+            // Only rows whose number moves get a new USN, as `renumber` does.
+            if now.get(id.as_str()) == Some(number) {
+                continue;
+            }
+            usn += 1;
+            rows += tx.execute(
+                "UPDATE djmdSongPlaylist SET TrackNo = ?1, rb_local_usn = ?2, updated_at = ?3
+                 WHERE ID = ?4 AND PlaylistID = ?5 AND rb_local_deleted = 0",
+                params![number, usn, stamp, id, playlist],
+            )?;
+        }
+        if rows > 0 {
+            set_counter(&tx, usn)?;
+        }
+        tx.commit()?;
+        Ok(Changed { rows, usn: if rows > 0 { usn } else { 0 } })
     }
 
     // ---------------------------------------------------------------- import
@@ -2018,8 +3149,20 @@ impl Writer {
     /// A to D, 6-9 for E to H, and 10-17 for I to P. Kind 4, the active memory
     /// loop, is refused: a plain cue cannot be one.
     ///
-    /// Every column is set to what the reference library shows for a plain,
-    /// default-coloured cue — see the module docs. Loops are refused.
+    /// Every column is set to what the reference library shows for a plain
+    /// cue — see the module docs. Loops are refused.
+    ///
+    /// A hot cue gets `ColorTableIndex` 0, no colour of its own, as one set
+    /// on rekordbox's deck does, so it is drawn in the View › Color › HOT
+    /// CUE color default for its slot (COLORFUL: A pink-red, B light blue, C
+    /// green, ...) rather than always green [OBS static, rekordbox 7.2.19
+    /// arm64: `UiPlayer::resetHotCueList` @0x101ba0bcc fills an empty slot's
+    /// `HotCueData` with colour byte `+0x34` = 0; `UiPlayer::onHotCueChanged`
+    /// sets a cue on that slot without touching it and passes it to
+    /// `DjplayDB::setHotCueData` @0x1001ff7f8, which copies `+0x34` into
+    /// `analyzer::Cue+0x4c`, the field `AppSyncDBController::set_cueInfo`
+    /// maps to `ColorTableIndex`]. Only a CDJ's cue saved over LINK gets an
+    /// explicit 21 ([`Writer::save_player_cue`]).
     pub fn add_cue(&mut self, content: &str, kind: u8, position_ms: u32) -> Result<String> {
         if kind == 4 || kind > 17 {
             return Err(DbError::WriteRefused(format!(
@@ -2070,9 +3213,9 @@ impl Writer {
                 i64::from(kind),
                 // 255 on a memory cue, -1 on a hot one.
                 if memory { 255 } else { -1 },
-                // 0 is "no colour"; 21 is the default rekordbox writes when
-                // the user has not chosen one.
-                if memory { 0 } else { 21 },
+                // 0 is "no colour" on both kinds: a hot cue takes its
+                // slot's default from the HOT CUE color table.
+                0,
                 content_uuid,
                 uuid,
                 usn,
@@ -2085,7 +3228,12 @@ impl Writer {
     }
 
     /// Changes a cue's colour. Memory cues use rekordbox's eight-value
-    /// `Color` field (255 means no colour); hot cues use `ColorTableIndex`.
+    /// `Color` field (255 means no colour); hot cues use `ColorTableIndex`,
+    /// where `None` — the colour menu's Reset — writes 0 and returns the cue
+    /// to its slot's default [OBS static, rekordbox 7.2.19 arm64:
+    /// `HotCueComp::changeCueColorMenu` @0x1006898f4 answers Reset with
+    /// `changePadColour(0)` @0x10068a268, which calls
+    /// `DatabaseIF::modifyCueColorTblIdx` with 0].
     pub fn set_cue_colour(&mut self, cue: &str, colour: Option<u8>) -> Result<Changed> {
         self.prepare()?;
         let tx = self.library.connection_mut().transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2104,7 +3252,7 @@ impl Writer {
             let value = colour.map_or(255, i64::from);
             tx.execute("UPDATE djmdCue SET Color=?2, rb_local_usn=?3, updated_at=?4 WHERE ID=?1 AND rb_local_deleted=0", params![cue, value, usn, stamp])?
         } else {
-            let value = colour.map_or(21, i64::from);
+            let value = colour.map_or(0, i64::from);
             tx.execute("UPDATE djmdCue SET ColorTableIndex=?2, rb_local_usn=?3, updated_at=?4 WHERE ID=?1 AND rb_local_deleted=0", params![cue, value, usn, stamp])?
         };
         set_counter(&tx, usn)?;
@@ -2306,6 +3454,122 @@ impl Writer {
              WHERE ID = ?3 AND rb_local_deleted = 0",
             params![usn, stamp, cue],
         )?;
+        set_counter(&tx, usn)?;
+        tx.commit()?;
+        Ok(Changed { rows, usn })
+    }
+
+    /// Sets or clears a memory loop as its track's Active Loop, the loop a
+    /// player engages by itself when playback reaches it.
+    ///
+    /// rekordbox keeps the mark in the cue's `Kind`: `MstSetActiveLoop`
+    /// writes `CUEKIND_ACTIVELOOP`, 4, into the loop and puts the track's
+    /// previous Active Loop back to 0, and `MstResetActiveLoop` writes 0
+    /// [OBS static, rekordbox 7.2.19 arm64: `_MAS_MODULE6_MSTSETACTIVELOOP`
+    /// @0x1018fb030 reads `_MAS_MODULE1_CUEKIND_ACTIVELOOP`; issue #345's
+    /// reporter saw Kind 4 with `ActiveLoop` left 0 in master.db]. The
+    /// `ActiveLoop` column is left as it is. Only a memory loop (Kind 0 or
+    /// 4 with an out point after its in point) can be one: the MEMORY
+    /// panel's loop button, the only control for it, is shown on loops
+    /// alone (`MemoryCueComp::addCue` @0x1006864e8). Setting the loop that
+    /// is already the Active Loop, or clearing one that is not, changes
+    /// nothing and writes no row.
+    pub fn set_active_loop(&mut self, cue: &str, on: bool) -> Result<Changed> {
+        const ACTIVE: i64 = 4;
+        self.prepare()?;
+        let stamp = time::now();
+        let tx = self.library.connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (content, kind, in_ms, out_ms): (Option<String>, i64, Option<i64>, Option<i64>) = tx
+            .query_row(
+                "SELECT ContentID, Kind, InMsec, OutMsec FROM djmdCue WHERE ID = ?1 AND rb_local_deleted = 0",
+                params![cue],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .map_err(|_| DbError::WriteRefused(format!("no cue {cue}")))?;
+        if kind != 0 && kind != ACTIVE {
+            return Err(DbError::WriteRefused("only a memory loop can be the Active Loop".to_owned()));
+        }
+        if out_ms.unwrap_or(-1) <= in_ms.unwrap_or(0) {
+            return Err(DbError::WriteRefused("only a memory loop can be the Active Loop".to_owned()));
+        }
+        if (kind == ACTIVE) == on {
+            return Ok(Changed { rows: 0, usn: 0 });
+        }
+        let usn = next_usn(&tx)?;
+        let mut rows = 0;
+        if on {
+            // One Active Loop a track: the one it had goes back to a plain
+            // memory loop in the same transaction.
+            rows += tx.execute(
+                "UPDATE djmdCue SET Kind = 0, rb_local_usn = ?1, updated_at = ?2
+                 WHERE ContentID IS ?3 AND Kind = 4 AND ID <> ?4 AND rb_local_deleted = 0",
+                params![usn, stamp, content, cue],
+            )?;
+        }
+        rows += tx.execute(
+            "UPDATE djmdCue SET Kind = ?1, rb_local_usn = ?2, updated_at = ?3 WHERE ID = ?4",
+            params![if on { ACTIVE } else { 0 }, usn, stamp, cue],
+        )?;
+        set_counter(&tx, usn)?;
+        tx.commit()?;
+        Ok(Changed { rows, usn })
+    }
+
+    /// Every cue row of a track, deleted ones included, for
+    /// [`CueRevision::between`]. Read through the writer's own connection so
+    /// a caller holding the edit gate sees exactly what it is about to change.
+    pub fn cue_rows(&self, content: &str) -> Result<Vec<CueRow>> {
+        cue_rows_where(self.library.connection(), "ContentID = ?1", content)
+    }
+
+    /// Why Undo (`undo`) or Redo of a cue revision would overwrite a change
+    /// made since, as a bare clause ("the track's cues have changed since"),
+    /// or `None` when it can go ahead (#504, #506's policy: refuse, keep the
+    /// newer change). Two things count: a row the revision names no longer
+    /// holds what the revision left there, or a hot cue slot (or the Active
+    /// Loop) it would fill is held by another cue now.
+    pub fn cue_revision_conflict(&self, revision: &CueRevision, undo: bool) -> Result<Option<String>> {
+        cue_conflict(self.library.connection(), revision, undo)
+    }
+
+    /// Puts a cue revision's rows back as they were before it.
+    pub fn undo_cue_revision(&mut self, revision: &CueRevision) -> Result<Changed> {
+        self.restore_cue_rows(revision, true)
+    }
+
+    /// Writes a cue revision's rows again after an Undo.
+    pub fn redo_cue_revision(&mut self, revision: &CueRevision) -> Result<Changed> {
+        self.restore_cue_rows(revision, false)
+    }
+
+    fn restore_cue_rows(&mut self, revision: &CueRevision, undo: bool) -> Result<Changed> {
+        self.prepare()?;
+        let stamp = time::now();
+        let tx = self.library.connection_mut().transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Checked again inside the transaction that writes, so nothing can
+        // land between the check and the write.
+        if let Some(conflict) = cue_conflict(&tx, revision, undo)? {
+            return Err(DbError::Conflict(conflict));
+        }
+        let usn = next_usn(&tx)?;
+        let assignments: Vec<String> = CUE_STATE.iter().enumerate().map(|(i, c)| format!("{c} = ?{}", i + 1)).collect();
+        let sql = format!(
+            "UPDATE djmdCue SET {}, rb_local_usn = ?{}, updated_at = ?{} WHERE ID = ?{}",
+            assignments.join(", "),
+            CUE_STATE.len() + 1,
+            CUE_STATE.len() + 2,
+            CUE_STATE.len() + 3,
+        );
+        let mut rows = 0;
+        let steps: Box<dyn Iterator<Item = &(CueRow, CueRow)>> =
+            if undo { Box::new(revision.steps.iter().rev()) } else { Box::new(revision.steps.iter()) };
+        for (before, after) in steps {
+            let target = if undo { before } else { after };
+            let mut values = target.values.clone();
+            values.extend([Value::Integer(usn), Value::Text(stamp.clone()), Value::Text(target.id.clone())]);
+            rows += tx.execute(&sql, rusqlite::params_from_iter(values))?;
+        }
         set_counter(&tx, usn)?;
         tx.commit()?;
         Ok(Changed { rows, usn })
@@ -2671,12 +3935,45 @@ impl Writer {
         content_exists(self.library.connection(), content)
     }
 
+    /// Puts back the value a track had before `edit`. Refused with
+    /// [`DbError::Conflict`], writing nothing, unless the track still holds
+    /// the value the edit left: see [`Self::check_track_edit`].
     pub fn undo_track_edit(&mut self, edit: &TrackEdit) -> Result<Changed> {
+        self.check_track_edit(edit, true)?;
         self.touch_content(&edit.content, edit.column, &edit.before)
     }
 
+    /// Writes `edit`'s value again after it was undone, under the same
+    /// condition as [`Self::undo_track_edit`] the other way round.
     pub fn redo_track_edit(&mut self, edit: &TrackEdit) -> Result<Changed> {
+        self.check_track_edit(edit, false)?;
         self.touch_content(&edit.content, edit.column, &edit.after)
+    }
+
+    /// Whether Undo (`undo`) or Redo of `edit` would overwrite only the
+    /// value the history knows the track holds: the edit's `after` for Undo,
+    /// its `before` for Redo. Anything else was written since by something
+    /// the history does not record (a player over LINK, a USB import,
+    /// rekordbox), and putting the old value back would lose it without a
+    /// word, so it is a [`DbError::Conflict`] instead (#506).
+    ///
+    /// Compared by `IS` in SQL, as the column's affinity compares: NULL
+    /// equals NULL, and 4 equals 4.0 in a numeric column.
+    pub fn check_track_edit(&self, edit: &TrackEdit, undo: bool) -> Result<()> {
+        if !WRITABLE_COLUMNS.contains(&edit.column) {
+            return Err(DbError::WriteRefused(format!("{} is not writable", edit.column)));
+        }
+        let expected = if undo { &edit.after } else { &edit.before };
+        let same: Option<bool> = self.library.connection().query_row(
+            &format!("SELECT (`{}` IS ?2) FROM djmdContent WHERE ID = ?1 AND rb_local_deleted = 0", edit.column),
+            params![edit.content, expected],
+            |row| row.get(0),
+        ).optional()?;
+        match same {
+            Some(true) => Ok(()),
+            Some(false) => Err(DbError::Conflict("the track has changed since".to_owned())),
+            None => Err(DbError::Conflict("the track is no longer in the collection".to_owned())),
+        }
     }
 
     fn track_edit(
@@ -2710,10 +4007,25 @@ impl Writer {
     /// [DOC; the reference library held none to transcribe]. A tag id the
     /// library does not hold is refused before anything is written.
     pub fn set_my_tags(&mut self, content: &str, tags: &[String]) -> Result<Changed> {
+        self.update_my_tags_with_undo(content, tags, MyTagOperation::Replace).map(|(changed, _)| changed)
+    }
+
+    /// Membership reads, validation and writes share one immediate transaction.
+    /// Add/remove preserve unrelated assignments, including changes made since
+    /// a companion last read the collection. Duplicate inputs are harmless.
+    pub fn update_my_tags_with_undo(
+        &mut self,
+        content: &str,
+        tags: &[String],
+        operation: MyTagOperation,
+    ) -> Result<(Changed, TrackTagEdit)> {
         self.prepare()?;
+        let mut tags = tags.to_vec();
+        tags.sort();
+        tags.dedup();
         let stamp = time::now();
         let mut ids: Vec<(String, String)> = Vec::with_capacity(tags.len());
-        for _ in tags {
+        for _ in &tags {
             ids.push((self.rng.uuid4(), self.rng.uuid4()));
         }
         let tx = self.library.connection_mut()
@@ -2721,7 +4033,7 @@ impl Writer {
         if !content_exists(&tx, content)? {
             return Err(DbError::WriteRefused(format!("no track {content}")));
         }
-        for tag in tags {
+        for tag in &tags {
             let known: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM djmdMyTag WHERE ID = ?1 AND Attribute = 0 AND rb_local_deleted = 0",
                 params![tag],
@@ -2732,15 +4044,22 @@ impl Writer {
             }
         }
         let mut stmt = tx.prepare(
-            "SELECT MyTagID FROM djmdSongMyTag WHERE ContentID = ?1 AND rb_local_deleted = 0",
+            "SELECT MyTagID FROM djmdSongMyTag WHERE ContentID = ?1 AND rb_local_deleted = 0 ORDER BY MyTagID",
         )?;
         let current: Vec<String> = stmt
             .query_map(params![content], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<_>>()?;
         drop(stmt);
+        let mut after = match operation {
+            MyTagOperation::Replace => tags.clone(),
+            MyTagOperation::Add => current.iter().chain(&tags).cloned().collect(),
+            MyTagOperation::Remove => current.iter().filter(|tag| !tags.contains(tag)).cloned().collect(),
+        };
+        after.sort();
+        after.dedup();
         let mut rows = 0;
         let mut usn = next_usn(&tx)?;
-        for gone in current.iter().filter(|t| !tags.contains(t)) {
+        for gone in current.iter().filter(|t| !after.contains(t)) {
             usn = next_usn(&tx)?;
             rows += tx.execute(
                 "UPDATE djmdSongMyTag SET rb_local_deleted = 1, rb_local_usn = ?1, updated_at = ?2
@@ -2749,7 +4068,7 @@ impl Writer {
             )?;
         }
         for (tag, (id, uuid)) in tags.iter().zip(&ids) {
-            if current.contains(tag) {
+            if current.contains(tag) || !after.contains(tag) {
                 continue;
             }
             let track_no: i64 = tx.query_row(
@@ -2767,9 +4086,11 @@ impl Writer {
                 params![id, tag, content, track_no, uuid, usn, stamp],
             )?;
         }
-        set_counter(&tx, usn)?;
+        if rows > 0 {
+            set_counter(&tx, usn)?;
+        }
         tx.commit()?;
-        Ok(Changed { rows, usn })
+        Ok((Changed { rows, usn }, TrackTagEdit { content: content.to_owned(), before: current, after }))
     }
 
     pub fn set_my_tags_with_undo(
@@ -2777,18 +4098,41 @@ impl Writer {
         content: &str,
         tags: &[String],
     ) -> Result<(Changed, TrackTagEdit)> {
-        let before = self.track_tags(content)?;
-        let changed = self.set_my_tags(content, tags)?;
-        let after = self.track_tags(content)?;
-        Ok((changed, TrackTagEdit { content: content.to_owned(), before, after }))
+        self.update_my_tags_with_undo(content, tags, MyTagOperation::Replace)
     }
 
+    /// Puts back a track's My Tags as they were before `edit`, refused as a
+    /// [`DbError::Conflict`] unless they are still the set it left.
     pub fn undo_tag_edit(&mut self, edit: &TrackTagEdit) -> Result<Changed> {
+        self.check_tag_edit(edit, true)?;
         self.set_my_tags(&edit.content, &edit.before)
     }
 
     pub fn redo_tag_edit(&mut self, edit: &TrackTagEdit) -> Result<Changed> {
+        self.check_tag_edit(edit, false)?;
         self.set_my_tags(&edit.content, &edit.after)
+    }
+
+    /// Whether the track still has exactly the My Tags Undo (`undo`) or
+    /// Redo of `edit` expects, as [`Self::check_track_edit`] does for a
+    /// column.
+    pub fn check_tag_edit(&self, edit: &TrackTagEdit, undo: bool) -> Result<()> {
+        if !content_exists(self.library.connection(), &edit.content)? {
+            return Err(DbError::Conflict("the track is no longer in the collection".to_owned()));
+        }
+        let mut expected = if undo { edit.after.clone() } else { edit.before.clone() };
+        let mut current = self.track_tags(&edit.content)?;
+        // As sets: a duplicate live row for one tag (possible in a library
+        // another program wrote) is still one tag.
+        expected.sort();
+        expected.dedup();
+        current.sort();
+        current.dedup();
+        if current == expected {
+            Ok(())
+        } else {
+            Err(DbError::Conflict("the track's My Tags have changed since".to_owned()))
+        }
     }
 
     fn track_tags(&self, content: &str) -> Result<Vec<String>> {
@@ -2799,6 +4143,499 @@ impl Writer {
         let tags: Vec<String> = statement.query_map(params![content], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         Ok(tags)
+    }
+
+    /// Puts one My Tag on a track or takes it off, leaving its others as
+    /// they are: a tick in the My Tag panel, which rekordbox applies to each
+    /// selected track (`BrowseMyTagView::onCheckButton` calls
+    /// `putMyTagOnTrack` or `removeMyTagFromTrack` with the selection,
+    /// 7.2.19 static analysis). A track that already has it, or lacks it,
+    /// is left alone and its edit comes back empty.
+    pub fn put_my_tag_with_undo(
+        &mut self,
+        content: &str,
+        tag: &str,
+        on: bool,
+    ) -> Result<(Changed, TrackTagEdit)> {
+        let before = self.track_tags(content)?;
+        let has = before.iter().any(|t| t == tag);
+        if has == on {
+            let edit = TrackTagEdit { content: content.to_owned(), before: before.clone(), after: before };
+            return Ok((Changed { rows: 0, usn: 0 }, edit));
+        }
+        let next: Vec<String> = if on {
+            before.iter().cloned().chain(std::iter::once(tag.to_owned())).collect()
+        } else {
+            before.iter().filter(|t| *t != tag).cloned().collect()
+        };
+        let changed = self.set_my_tags(content, &next)?;
+        let after = self.track_tags(content)?;
+        Ok((changed, TrackTagEdit { content: content.to_owned(), before, after }))
+    }
+
+    /// Writes a track's My Tags into its comment, as rekordbox does after a
+    /// My Tag edit while Add "My Tag" to the "Comments" is on (#605; see
+    /// [`crate::my_tag_comment`]): the comment up to its first ` /* `, then
+    /// the track's tags. A comment that already reads so is left alone and
+    /// its edit is empty.
+    ///
+    /// The tags are in the order they were put on the track: rekordbox
+    /// reads a track's `djmdSongMyTag` rows with no `ORDER BY`
+    /// (`AppSyncDBController::updateMyTagInfoOnTracks` @0x100a60530) and
+    /// adds a new tag to the end of that list [ASSUME: SQLite returns them
+    /// in rowid order]. A membership of a tag that is not in a live
+    /// category has no name and is passed over.
+    pub fn refresh_my_tag_comment_with_undo(&mut self, content: &str) -> Result<(Changed, TrackEdit)> {
+        let conn = self.library.connection();
+        let comment: Option<String> = conn.query_row(
+            "SELECT COALESCE(Commnt, '') FROM djmdContent WHERE ID = ?1 AND rb_local_deleted = 0",
+            params![content],
+            |r| r.get(0),
+        ).optional()?;
+        let Some(comment) = comment else {
+            return Err(DbError::WriteRefused(format!("no track {content}")));
+        };
+        let mut statement = conn.prepare(
+            "SELECT COALESCE(t.Name, '') FROM djmdSongMyTag s
+             LEFT JOIN djmdMyTag t ON t.ID = s.MyTagID AND t.rb_local_deleted = 0
+                 AND t.ParentID IN (SELECT ID FROM djmdMyTag WHERE ParentID = 'root' AND rb_local_deleted = 0)
+             WHERE s.ContentID = ?1 AND s.rb_local_deleted = 0
+             ORDER BY s.rowid",
+        )?;
+        let names: Vec<String> = statement.query_map(params![content], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(statement);
+        let next = crate::my_tag_comment::refreshed(&comment, names.iter().map(String::as_str));
+        self.set_comment_with_undo(content, &next)
+    }
+
+    /// Turning Add "My Tag" to the "Comments" on (`on`) or off, as
+    /// rekordbox's `WriteOrEraseMyTagWindow::run` @0x101fe92a4 does it
+    /// (#605): every track that has a My Tag gets the block written with
+    /// its tags in the My Tag panel's order, or taken off. A track with no
+    /// My Tag, or whose comment already reads so, is left as it is.
+    ///
+    /// One transaction; each rewritten row takes the next update number, as
+    /// rekordbox calls `modifyTrackData` once per track. The edits returned
+    /// are the rows written, for one Undo of the whole run.
+    pub fn write_my_tag_comments_with_undo(&mut self, on: bool) -> Result<(Changed, Vec<TrackEdit>)> {
+        self.prepare()?;
+        let stamp = time::now();
+        let tx = self.library.connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // The panel: categories by `Seq`, then each one's tags by `Seq`
+        // (`getMyTagList`, "... ParentID = 'root' order by Seq" and
+        // "... ParentID = %lu order by Seq").
+        let mut statement = tx.prepare(
+            "SELECT t.ID, COALESCE(t.Name, '') FROM djmdMyTag t
+             JOIN djmdMyTag c ON c.ID = t.ParentID AND c.ParentID = 'root' AND c.rb_local_deleted = 0
+             WHERE t.rb_local_deleted = 0
+             ORDER BY c.Seq, c.ID, t.Seq, t.ID",
+        )?;
+        let panel: Vec<(String, String)> = statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(statement);
+        let mut statement = tx.prepare(
+            "SELECT s.ContentID, s.MyTagID FROM djmdSongMyTag s
+             JOIN djmdContent c ON c.ID = s.ContentID AND c.rb_local_deleted = 0
+             WHERE s.rb_local_deleted = 0
+             ORDER BY s.ContentID",
+        )?;
+        let memberships: Vec<(String, String)> = statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(statement);
+        let mut tracks: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+        for (content, tag) in memberships {
+            tracks.entry(content).or_default().push(tag);
+        }
+        let mut edits = Vec::new();
+        let mut rows = 0;
+        let mut usn = 0;
+        let mut next = None;
+        for (content, tags) in &tracks {
+            let before: Value = tx.query_row(
+                "SELECT Commnt FROM djmdContent WHERE ID = ?1 AND rb_local_deleted = 0",
+                params![content],
+                |r| r.get(0),
+            )?;
+            let comment = match &before {
+                Value::Text(text) => text.clone(),
+                _ => String::new(),
+            };
+            let after = if on {
+                let names = panel.iter().filter(|(id, _)| tags.contains(id)).map(|(_, name)| name.as_str());
+                crate::my_tag_comment::written(&comment, names)
+            } else {
+                crate::my_tag_comment::erased(&comment).to_owned()
+            };
+            if after == comment {
+                continue;
+            }
+            let this = match next {
+                Some(n) => n,
+                None => next_usn(&tx)?,
+            };
+            rows += tx.execute(
+                "UPDATE djmdContent SET Commnt = ?1, rb_local_usn = ?2, updated_at = ?3
+                 WHERE ID = ?4 AND rb_local_deleted = 0",
+                params![after, this, stamp, content],
+            )?;
+            usn = this;
+            next = Some(this + 1);
+            edits.push(TrackEdit { content: content.clone(), column: "Commnt", before, after: Value::Text(after) });
+        }
+        if rows > 0 {
+            set_counter(&tx, usn)?;
+        }
+        tx.commit()?;
+        Ok((Changed { rows, usn }, edits))
+    }
+
+    /// Undoes (`undo`) or redoes every step of `edits` in one transaction:
+    /// all of them, or, when any track no longer holds the value the step
+    /// expects ([`Self::check_track_edit`]), none, refused as a
+    /// [`DbError::Conflict`]. For a run of many tracks, such as the comments
+    /// [`Self::write_my_tag_comments_with_undo`] rewrote.
+    pub fn step_track_edits_at_once(&mut self, edits: &[TrackEdit], undo: bool) -> Result<Changed> {
+        self.prepare()?;
+        let stamp = time::now();
+        let tx = self.library.connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for edit in edits {
+            if !WRITABLE_COLUMNS.contains(&edit.column) {
+                return Err(DbError::WriteRefused(format!("{} is not writable", edit.column)));
+            }
+            let expected = if undo { &edit.after } else { &edit.before };
+            let same: Option<bool> = tx.query_row(
+                &format!("SELECT (`{}` IS ?2) FROM djmdContent WHERE ID = ?1 AND rb_local_deleted = 0", edit.column),
+                params![edit.content, expected],
+                |row| row.get(0),
+            ).optional()?;
+            match same {
+                Some(true) => {}
+                Some(false) => return Err(DbError::Conflict("the track has changed since".to_owned())),
+                None => return Err(DbError::Conflict("the track is no longer in the collection".to_owned())),
+            }
+        }
+        let mut rows = 0;
+        let mut usn = 0;
+        let mut next = None;
+        let ordered: Vec<&TrackEdit> = if undo { edits.iter().rev().collect() } else { edits.iter().collect() };
+        for edit in ordered {
+            let this = match next {
+                Some(n) => n,
+                None => next_usn(&tx)?,
+            };
+            let value = if undo { &edit.before } else { &edit.after };
+            rows += tx.execute(
+                &format!(
+                    "UPDATE djmdContent SET `{}` = ?1, rb_local_usn = ?2, updated_at = ?3
+                     WHERE ID = ?4 AND rb_local_deleted = 0",
+                    edit.column
+                ),
+                params![value, this, stamp, edit.content],
+            )?;
+            usn = this;
+            next = Some(this + 1);
+        }
+        if rows > 0 {
+            set_counter(&tx, usn)?;
+        }
+        tx.commit()?;
+        Ok(Changed { rows, usn })
+    }
+
+    /// Adding My Tag: a new tag at the end of `category`, named as
+    /// rekordbox names one, and its id and name returned.
+    ///
+    /// The row is rekordbox's `AppSyncDBController::addNewMyTag` (7.2.19
+    /// arm64 @0x100a60e0c, static analysis): a random 32-bit id that is not
+    /// 0 to 4 (the categories' ids) nor `0xFFFFFFFF`, a new UUID, `Seq` one
+    /// past the category's highest (1 in an empty one), `Attribute` 0 and the
+    /// category's id as `ParentID`. A library rekordbox 7 made holds its
+    /// default tags in exactly that shape [OBS]. rekordbox does not look for
+    /// a clash before inserting; this does, since the id is the key.
+    ///
+    /// The `+` is greyed once a category holds [`MY_TAG_LIMIT`] tags
+    /// (`MyTagItemComponent::isActiveButton` @0x10066c940 against the 50 the
+    /// view's constructor sets), so a write past that is refused here too.
+    pub fn create_my_tag(&mut self, category: &str) -> Result<NewMyTag> {
+        self.prepare()?;
+        let conn = self.library.connection();
+        let is_category: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM djmdMyTag
+             WHERE ID = ?1 AND Attribute = 1 AND ParentID = 'root' AND rb_local_deleted = 0",
+            params![category],
+            |r| r.get(0),
+        )?;
+        if is_category == 0 {
+            return Err(DbError::WriteRefused(format!("no My Tag category {category}")));
+        }
+        let names = my_tag_names_under(conn, category)?;
+        if names.len() >= MY_TAG_LIMIT {
+            return Err(DbError::WriteRefused(format!(
+                "a My Tag category holds at most {MY_TAG_LIMIT} tags"
+            )));
+        }
+        let name = new_my_tag_name(&names);
+        let id = self.unused_my_tag_id()?;
+        let uuid = self.rng.uuid4();
+        let stamp = time::now();
+        let tx = self.library.connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let seq: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(Seq), 0) + 1 FROM djmdMyTag
+             WHERE ParentID = ?1 AND rb_local_deleted = 0",
+            params![category],
+            |r| r.get(0),
+        )?;
+        let usn = next_usn(&tx)?;
+        tx.execute(
+            "INSERT INTO djmdMyTag
+                (ID, Seq, Name, Attribute, ParentID, UUID,
+                 rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced,
+                 usn, rb_local_usn, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, 0, 0, 0, 0, NULL, ?6, ?7, ?7)",
+            params![id, seq, name, category, uuid, usn, stamp],
+        )?;
+        set_counter(&tx, usn)?;
+        tx.commit()?;
+        Ok(NewMyTag { id, name })
+    }
+
+    /// Renames a My Tag or a category.
+    ///
+    /// rekordbox writes the new name over the old one and nothing else
+    /// (`AppSyncDBController::modifyMyTagName` @0x100a62234). Its panel
+    /// writes nothing for an empty name, and refuses a name another row
+    /// under the same parent already has, matched exactly, with "An item
+    /// with the same name already exists!" (`BrowseMyTagView::
+    /// didChangeLabelText` @0x10066cce0, `isExistSameNameTag` @0x10066e98c).
+    pub fn rename_my_tag(&mut self, id: &str, name: &str) -> Result<Changed> {
+        self.prepare()?;
+        if name.is_empty() {
+            return Err(DbError::WriteRefused("a My Tag needs a name".to_owned()));
+        }
+        let stamp = time::now();
+        let tx = self.library.connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, String)> = tx.query_row(
+            "SELECT COALESCE(ParentID, ''), COALESCE(Name, '') FROM djmdMyTag
+             WHERE ID = ?1 AND rb_local_deleted = 0",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        let Some((parent, current)) = row else {
+            return Err(DbError::WriteRefused(format!("no My Tag {id}")));
+        };
+        if current == name {
+            return Ok(Changed { rows: 0, usn: 0 });
+        }
+        let clash: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM djmdMyTag
+             WHERE ParentID = ?1 AND ID <> ?2 AND Name = ?3 AND rb_local_deleted = 0",
+            params![parent, id, name],
+            |r| r.get(0),
+        )?;
+        if clash > 0 {
+            return Err(DbError::WriteRefused(MY_TAG_NAME_TAKEN.to_owned()));
+        }
+        let usn = next_usn(&tx)?;
+        let rows = tx.execute(
+            "UPDATE djmdMyTag SET Name = ?1, rb_local_usn = ?2, updated_at = ?3
+             WHERE ID = ?4 AND rb_local_deleted = 0",
+            params![name, usn, stamp, id],
+        )?;
+        set_counter(&tx, usn)?;
+        tx.commit()?;
+        Ok(Changed { rows, usn })
+    }
+
+    /// Deletes a My Tag: its row, every track's membership of it, and the
+    /// gap it leaves in its category's `Seq`.
+    ///
+    /// rekordbox's `AppSyncDBController::deleteMyTag` @0x100a615c8 refuses a
+    /// category, marks the tag deleted (`DeleteEntity` takes the row to its
+    /// delete status rather than removing it), renumbers what is left under
+    /// the category to `Seq` 1..N, touching only the rows whose number
+    /// changes, under one update number (`SongListRepositoryBase::
+    /// updateRenumberSeq` @0x10022e0b0), then drops the tag's
+    /// `djmdSongMyTag` rows. Those are marked deleted here, as every other
+    /// row this writer removes is.
+    pub fn delete_my_tag(&mut self, id: &str) -> Result<Changed> {
+        self.prepare()?;
+        let stamp = time::now();
+        let tx = self.library.connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(i64, String)> = tx.query_row(
+            "SELECT COALESCE(Attribute, 0), COALESCE(ParentID, '') FROM djmdMyTag
+             WHERE ID = ?1 AND rb_local_deleted = 0",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        let Some((attribute, parent)) = row else {
+            return Err(DbError::WriteRefused(format!("no My Tag {id}")));
+        };
+        if attribute != 0 {
+            return Err(DbError::WriteRefused("a My Tag category cannot be deleted".to_owned()));
+        }
+        // One update number stamps the whole delete (the tag, the
+        // renumbered siblings and the memberships), as `set_my_tags` does:
+        // the counter is only written at commit and neither table is in
+        // `USN_TABLES`, so asking again in this transaction would return
+        // the same number anyway.
+        let usn = next_usn(&tx)?;
+        let mut rows = tx.execute(
+            "UPDATE djmdMyTag SET rb_local_deleted = 1, rb_local_usn = ?1, updated_at = ?2
+             WHERE ID = ?3 AND rb_local_deleted = 0",
+            params![usn, stamp, id],
+        )?;
+
+        let mut statement = tx.prepare(
+            "SELECT ID, COALESCE(Seq, 0) FROM djmdMyTag
+             WHERE ParentID = ?1 AND rb_local_deleted = 0 ORDER BY Seq, ID",
+        )?;
+        let siblings: Vec<(String, i64)> = statement
+            .query_map(params![parent], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(statement);
+        let moved: Vec<(&String, i64)> = siblings.iter().zip(1_i64..)
+            .filter(|((_, seq), want)| seq != want)
+            .map(|((sibling, _), want)| (sibling, want))
+            .collect();
+        for (sibling, seq) in moved {
+            rows += tx.execute(
+                "UPDATE djmdMyTag SET Seq = ?1, rb_local_usn = ?2, updated_at = ?3 WHERE ID = ?4",
+                params![seq, usn, stamp, sibling],
+            )?;
+        }
+
+        let mut statement = tx.prepare(
+            "SELECT ID FROM djmdSongMyTag WHERE MyTagID = ?1 AND rb_local_deleted = 0",
+        )?;
+        let memberships: Vec<String> = statement
+            .query_map(params![id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(statement);
+        for membership in memberships {
+            rows += tx.execute(
+                "UPDATE djmdSongMyTag SET rb_local_deleted = 1, rb_local_usn = ?1, updated_at = ?2
+                 WHERE ID = ?3 AND rb_local_deleted = 0",
+                params![usn, stamp, membership],
+            )?;
+        }
+        set_counter(&tx, usn)?;
+        tx.commit()?;
+        Ok(Changed { rows, usn })
+    }
+
+    /// Puts one run of My Tag siblings in the order given: every category,
+    /// or every tag of one category, each named once. Nothing else changes:
+    /// no row is made, deleted, renamed or given another parent, and no
+    /// track's memberships are touched.
+    ///
+    /// rekordbox orders categories by `Seq` among `ParentID = 'root'` rows
+    /// and tags by `Seq` within their category (its `djmdMyTag` reads
+    /// `... ParentID = 'root' order by Seq` and `... ParentID = %lu order by
+    /// Seq`, 7.2.19 arm64 strings). Its My Tag panel reorders by drag
+    /// (`BrowseMyTagView::itemDroppedMyTag` @0x10066f618 calls
+    /// `DatabaseIF::moveMyTag(id, parent, seq)`) and
+    /// `SongListRepositoryBase<MyTag>::Move` @0x100229d28 leaves the run
+    /// numbered `Seq` 1..N, writing only the rows whose number changes, each
+    /// with an update number of its own (`LibrarySyncRepository::
+    /// UpdateLocalUsn` per row). This writes the order that a sequence of
+    /// such moves would leave, in the same shape. rekordbox's drag can also
+    /// put a tag in another category; this cannot, because the list must be
+    /// exactly one run of siblings.
+    ///
+    /// Every id is checked before anything is written, in one transaction:
+    /// an unknown, deleted, repeated or missing id, or ids from two runs,
+    /// refuse the whole request. An order the library already has writes
+    /// nothing and its edit is empty.
+    pub fn reorder_my_tags_with_undo(&mut self, order: &[String]) -> Result<(Changed, MyTagOrder)> {
+        self.prepare()?;
+        let Some(first) = order.first() else {
+            return Err(DbError::WriteRefused("name the My Tags to put in order".to_owned()));
+        };
+        let stamp = time::now();
+        let tx = self.library.connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let parent = my_tag_run_of(&tx, first)?;
+        let before = my_tag_run(&tx, &parent)?;
+        let what = if parent == ROOT { "every My Tag category" } else { "every tag in its category" };
+        let mut seen: Vec<&str> = Vec::with_capacity(order.len());
+        for id in order {
+            if seen.contains(&id.as_str()) {
+                return Err(DbError::WriteRefused(format!("My Tag {id} is named more than once")));
+            }
+            if !before.iter().any(|(sibling, _)| sibling == id) {
+                // Distinguish a typo from an id in another run.
+                my_tag_run_of(&tx, id)?;
+                return Err(DbError::WriteRefused(format!(
+                    "My Tag {id} is not in the same run as {first}: name {what}, and only those"
+                )));
+            }
+            seen.push(id);
+        }
+        if let Some((missing, _)) = before.iter().find(|(sibling, _)| !seen.contains(&sibling.as_str())) {
+            return Err(DbError::WriteRefused(format!("the order leaves out My Tag {missing}: name {what}")));
+        }
+        let after: Vec<(String, Option<i64>)> = order.iter().cloned().zip((1_i64..).map(Some)).collect();
+        let edit = MyTagOrder { parent, before, after };
+        let changed = write_my_tag_seqs(&tx, &edit.before, &edit.after, &stamp)?;
+        tx.commit()?;
+        Ok((changed, edit))
+    }
+
+    /// Puts a run of My Tags back in the order it had, refused as a
+    /// [`DbError::Conflict`] unless it is still exactly as the reorder left
+    /// it: a tag made, deleted, renamed into place or moved there since
+    /// would otherwise be given a place it does not have.
+    pub fn undo_my_tag_order(&mut self, edit: &MyTagOrder) -> Result<Changed> {
+        self.step_my_tag_order(edit, true)
+    }
+
+    /// Reorders a run of My Tags again, as [`Self::undo_my_tag_order`]
+    /// does the other way.
+    pub fn redo_my_tag_order(&mut self, edit: &MyTagOrder) -> Result<Changed> {
+        self.step_my_tag_order(edit, false)
+    }
+
+    fn step_my_tag_order(&mut self, edit: &MyTagOrder, undo: bool) -> Result<Changed> {
+        self.prepare()?;
+        let (expected, target) = if undo { (&edit.after, &edit.before) } else { (&edit.before, &edit.after) };
+        let stamp = time::now();
+        let tx = self.library.connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if my_tag_run(&tx, &edit.parent)? != *expected {
+            return Err(DbError::Conflict("the order of those My Tags has changed since".to_owned()));
+        }
+        let changed = write_my_tag_seqs(&tx, expected, target, &stamp)?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// A My Tag id rekordbox could have chosen and the table does not hold,
+    /// deleted rows included since they keep their key.
+    fn unused_my_tag_id(&mut self) -> Result<String> {
+        for _ in 0..ID_ATTEMPTS {
+            let value = (self.rng.next_u64() >> 32) as u32;
+            if value < 5 || value == u32::MAX {
+                continue;
+            }
+            let candidate = value.to_string();
+            let taken: i64 = self.library.connection().query_row(
+                "SELECT COUNT(*) FROM djmdMyTag WHERE ID = ?1",
+                params![candidate],
+                |r| r.get(0),
+            )?;
+            if taken == 0 {
+                return Ok(candidate);
+            }
+        }
+        Err(DbError::WriteRefused(format!(
+            "could not find an unused id for djmdMyTag in {ID_ATTEMPTS} attempts"
+        )))
     }
 
     /// Persist an edited grid's tempo and invalidate cached analysis consumers.
@@ -2844,14 +4681,75 @@ impl Writer {
         let usn = next_usn(&tx)?;
         tx.execute("UPDATE djmdCue SET rb_local_deleted=1, rb_local_usn=?2, updated_at=?3 WHERE ContentID=?1 AND rb_local_deleted=0", params![content, usn, stamp])?;
         for ((cue, id), uuid) in cues.iter().zip(ids).zip(uuids) {
-            let kind = if cue.hot_cue >= 4 { cue.hot_cue + 1 } else { cue.hot_cue };
             let end = (cue.kind == 2).then_some(i64::from(cue.loop_time_ms));
-            tx.execute("INSERT INTO djmdCue (ID, ContentID, InMsec, InFrame, InMpegFrame, InMpegAbs, OutMsec, Kind, Color, ColorTableIndex, ActiveLoop, Comment, ContentUUID, UUID, rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced, rb_local_usn, created_at, updated_at) VALUES (?1,?2,?3,0,0,0,?4,?5,?6,?7,0,?8,?9,?10,0,0,0,0,?11,?12,?12)", params![id, content, cue.time_ms, end, kind, if kind == 0 {255} else {-1}, cue.color_code.unwrap_or(cue.color_id), cue.comment.as_deref().unwrap_or(""), owner, uuid, usn, stamp])?;
+            // A memory cue's colour row goes back into `Color` (#617).
+            tx.execute("INSERT INTO djmdCue (ID, ContentID, InMsec, InFrame, InMpegFrame, InMpegAbs, OutMsec, Kind, Color, ColorTableIndex, ActiveLoop, Comment, ContentUUID, UUID, rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced, rb_local_usn, created_at, updated_at) VALUES (?1,?2,?3,0,0,0,?4,?5,?6,?7,0,?8,?9,?10,0,0,0,0,?11,?12,?12)", params![id, content, cue.time_ms, end, cue.library_kind(), cue.library_color(), cue.library_color_table_index(), cue.comment.as_deref().unwrap_or(""), owner, uuid, usn, stamp])?;
         }
         tx.execute("UPDATE djmdContent SET BPM=CASE WHEN ?2>0 THEN ?2 ELSE BPM END, AnalysisUpdated=CAST(COALESCE(AnalysisUpdated, '0') AS INTEGER)+1, rb_local_usn=?3, updated_at=?4 WHERE ID=?1", params![content, bpm, usn, stamp])?;
         set_counter(&tx, usn)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Gives a track Import Playlist just added from a copy of a device's
+    /// file what the device knows of it, as rekordbox does for each track
+    /// it copies [static, rekordbox 7.2.19 macOS arm64,
+    /// `importFromDeviceThread::run` @0x1001d9618: `addTrackFromDevice`
+    /// adds the track from the device's row, then
+    /// `getDeviceContentCueInfo`, `import_device_analysis` (@0x1001db460,
+    /// the analysis files) and the analyse status]: its BPM and key, its
+    /// analysis files, already in place at `analysis_data_path`, and its
+    /// cues. One transaction.
+    ///
+    /// A BPM of 0 or a key no `djmdKey` row is named after leaves the
+    /// track's own. With an analysis path the track is marked analysed
+    /// ([`ANALYSED_FULL`]) and its `AnalysisUpdated` counted on; without
+    /// one, neither changes. A cue the library cannot hold (a hot cue past
+    /// H, a loop that ends before it starts) is left out.
+    pub fn import_device_analysis(&mut self, content: &str, analysis: &DeviceAnalysis<'_>) -> Result<Changed> {
+        self.prepare()?;
+        let cues: Vec<&rbl_anlz::CueEntry> = analysis
+            .cues
+            .iter()
+            .filter(|c| c.hot_cue <= 16 && matches!(c.kind, 1 | 2) && (c.kind != 2 || c.loop_time_ms > c.time_ms))
+            .collect();
+        let ids: Vec<_> = cues.iter().map(|_| self.unused_id_below("djmdCue", MAX_CUE_ID)).collect::<Result<_>>()?;
+        let uuids: Vec<_> = cues.iter().map(|_| self.rng.uuid4()).collect();
+        let tx = self.library.connection_mut().transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner: String = tx
+            .query_row("SELECT UUID FROM djmdContent WHERE ID=?1 AND rb_local_deleted=0", [content], |r| r.get(0))
+            .map_err(|_| DbError::WriteRefused(format!("{content} is not a live track")))?;
+        let key_id = match analysis.key {
+            Some(name) if !name.is_empty() => key_id_for(&tx, name).ok(),
+            _ => None,
+        };
+        let stamp = time::now();
+        let usn = next_usn(&tx)?;
+        let rows = tx.execute(
+            "UPDATE djmdContent
+             SET BPM = CASE WHEN ?2 > 0 THEN ?2 ELSE BPM END,
+                 KeyID = COALESCE(?3, KeyID),
+                 AnalysisDataPath = COALESCE(?4, AnalysisDataPath),
+                 Analysed = CASE WHEN ?4 IS NULL THEN Analysed ELSE ?5 END,
+                 AnalysisUpdated = CASE WHEN ?4 IS NULL THEN AnalysisUpdated
+                                        ELSE CAST(COALESCE(AnalysisUpdated, '0') AS INTEGER) + 1 END,
+                 rb_local_usn = ?6, updated_at = ?7
+             WHERE ID = ?1 AND rb_local_deleted = 0",
+            params![content, i64::from(analysis.bpm_x100), key_id, analysis.analysis_data_path, ANALYSED_FULL, usn, stamp],
+        )?;
+        for ((cue, id), uuid) in cues.iter().zip(ids).zip(uuids) {
+            let end = (cue.kind == 2).then_some(i64::from(cue.loop_time_ms));
+            // A memory cue keeps the stick's colour in `Color`, as
+            // `get_pmai_ext_specified_memcue_ext` reads it (#617).
+            tx.execute(
+                "INSERT INTO djmdCue (ID, ContentID, InMsec, InFrame, InMpegFrame, InMpegAbs, OutMsec, Kind, Color, ColorTableIndex, ActiveLoop, Comment, ContentUUID, UUID, rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced, rb_local_usn, created_at, updated_at)
+                 VALUES (?1,?2,?3,0,0,0,?4,?5,?6,?7,0,?8,?9,?10,0,0,0,0,?11,?12,?12)",
+                params![id, content, cue.time_ms, end, cue.library_kind(), cue.library_color(), cue.library_color_table_index(), cue.comment.as_deref().unwrap_or(""), owner, uuid, usn, stamp],
+            )?;
+        }
+        set_counter(&tx, usn)?;
+        tx.commit()?;
+        Ok(Changed { rows, usn })
     }
 
     /// Imports a USB session once, preserving order and repeated plays.
@@ -2993,10 +4891,20 @@ impl Writer {
     /// Remove from History: the tracks' plays leave the session, which closes
     /// its gaps as a playlist does.
     pub fn remove_from_history(&mut self, history: &str, contents: &[String]) -> Result<Changed> {
+        self.remove_from_history_with_undo(history, contents).map(|(changed, _)| changed)
+    }
+
+    /// [`Writer::remove_from_history`], keeping the plays it took off and
+    /// the session's plays with their `TrackNo` before and after, read in
+    /// the same transaction, so the removal can be undone (#508). No
+    /// track's `DJPlayCount` changes, now or on Undo or Redo.
+    pub fn remove_from_history_with_undo(&mut self, history: &str, contents: &[String]) -> Result<(Changed, ListRemoval)> {
         self.prepare()?;
         let stamp = time::now();
+        let list = RemovalList::History(history.to_owned());
         let tx = self.library.connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let before = numbered_rows(&tx, &list)?;
         let mut rows = 0;
         let mut usn = 0;
         for content in contents {
@@ -3011,8 +4919,9 @@ impl Writer {
             usn = renumber_history(&tx, history, &stamp)?;
         }
         set_counter(&tx, usn)?;
+        let after = numbered_rows(&tx, &list)?;
         tx.commit()?;
-        Ok(Changed { rows, usn })
+        Ok((Changed { rows, usn }, ListRemoval::between(list, before, after)))
     }
 
     /// Add Artwork and Delete Artwork on the information panel.
@@ -3293,23 +5202,94 @@ impl Writer {
     /// file's number, a later Auto Relocate could take another file that
     /// happens to have it.
     pub fn relocate(&mut self, content: &str, path: &Path) -> Result<Changed> {
-        if !path.is_file() {
-            return Err(DbError::WriteRefused(format!(
-                "{} is not a file; a track must point at one",
-                path.display()
-            )));
+        self.relocate_with_undo(&[(content.to_owned(), path.to_path_buf())]).map(|(changed, _)| changed)
+    }
+
+    /// Points each track of `moves` at its file in one transaction, as one
+    /// Relocate, Relocate by location or Auto Relocate run, and keeps each
+    /// track's link (`FolderPath`, `FileNameL`, `rb_file_id`) before and
+    /// after for Undo (#502). Every path is checked before anything is
+    /// written: one that is not a file refuses the whole run. A track named
+    /// twice is moved by its first entry; one not in the collection is
+    /// passed over.
+    pub fn relocate_with_undo(&mut self, moves: &[(String, PathBuf)]) -> Result<(Changed, TrackRelocation)> {
+        for (_, path) in moves {
+            if !path.is_file() {
+                return Err(DbError::WriteRefused(format!(
+                    "{} is not a file; a track must point at one",
+                    path.display()
+                )));
+            }
         }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let full = path.to_string_lossy().into_owned();
         self.prepare()?;
         let tx = self.library.connection_mut().transaction_with_behavior(TransactionBehavior::Immediate)?;
         let usn = next_usn(&tx)?;
-        let file_id = crate::file_id::column(path);
-        let rows = tx.execute("UPDATE djmdContent SET FolderPath=?1, FileNameL=?2, rb_file_id=?6, rb_local_usn=?3, updated_at=?4 WHERE ID=?5 AND rb_local_deleted=0",
-            params![full, name, usn, time::now(), content, file_id])?;
+        let stamp = time::now();
+        let mut links = Vec::with_capacity(moves.len());
+        let mut seen = std::collections::HashSet::with_capacity(moves.len());
+        let mut rows = 0;
+        for (content, path) in moves {
+            if !seen.insert(content.as_str()) {
+                continue;
+            }
+            let Some(before) = link_of(&tx, content)? else { continue };
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let after = [
+                Value::Text(path.to_string_lossy().into_owned()),
+                Value::Text(name),
+                Value::Text(crate::file_id::column(path)),
+            ];
+            rows += write_link(&tx, content, &after, usn, &stamp)?;
+            links.push(TrackLink { content: content.clone(), before, after });
+        }
+        set_counter(&tx, usn)?;
+        tx.commit()?;
+        Ok((Changed { rows, usn }, TrackRelocation { links }))
+    }
+
+    /// Puts back every link `edit` changed, in one transaction, last first.
+    /// The old file need not be there: Undo restores where the library
+    /// pointed, so a track whose old file is gone is missing again and can
+    /// be relocated anew. Refused with [`DbError::Conflict`], writing
+    /// nothing, as [`Self::relocation_conflict`] says.
+    pub fn undo_relocation(&mut self, edit: &TrackRelocation) -> Result<Changed> {
+        self.write_relocation(edit, true)
+    }
+
+    /// Points the tracks of `edit` at the files it chose again, under the
+    /// same condition as [`Self::undo_relocation`] the other way round.
+    pub fn redo_relocation(&mut self, edit: &TrackRelocation) -> Result<Changed> {
+        self.write_relocation(edit, false)
+    }
+
+    /// Why Undo (`undo`) or Redo of `edit` would overwrite something written
+    /// since outside the history, or `None` when it would not (#506): each
+    /// track must still hold the link the history expects (the run's for
+    /// Undo, the one it replaced for Redo), compared column by column with
+    /// SQL `IS`, and no other track in the collection may have taken the
+    /// file it would point at since, which would leave two tracks on one
+    /// file.
+    pub fn relocation_conflict(&self, edit: &TrackRelocation, undo: bool) -> Result<Option<String>> {
+        relocation_conflict_in(self.library.connection(), edit, undo)
+    }
+
+    fn write_relocation(&mut self, edit: &TrackRelocation, undo: bool) -> Result<Changed> {
+        self.prepare()?;
+        let tx = self.library.connection_mut().transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(reason) = relocation_conflict_in(&tx, edit, undo)? {
+            return Err(DbError::Conflict(reason));
+        }
+        let usn = next_usn(&tx)?;
+        let stamp = time::now();
+        let mut rows = 0;
+        let ordered: Box<dyn Iterator<Item = &TrackLink>> =
+            if undo { Box::new(edit.links.iter().rev()) } else { Box::new(edit.links.iter()) };
+        for link in ordered {
+            rows += write_link(&tx, &link.content, if undo { &link.before } else { &link.after }, usn, &stamp)?;
+        }
         set_counter(&tx, usn)?;
         tx.commit()?;
         Ok(Changed { rows, usn })
@@ -3364,12 +5344,42 @@ impl Writer {
     /// affected playlist closes its gaps once, and the USN is counted up from
     /// one read. A track that is not live is skipped, as it is there.
     pub fn delete_tracks(&mut self, contents: &[String]) -> Result<Changed> {
+        self.delete_tracks_expected(contents, None)
+    }
+
+    /// Companion removal verifies library identity and exact paths inside the
+    /// deletion transaction. Retrying already tombstoned tracks is safe.
+    pub fn delete_tracks_checked(&mut self, library_id: &str, tracks: &[(String, String)]) -> Result<Changed> {
+        let ids: Vec<_> = tracks.iter().map(|(id, _)| id.clone()).collect();
+        self.delete_tracks_expected(&ids, Some((library_id, tracks)))
+    }
+
+    fn delete_tracks_expected(&mut self, contents: &[String], expected: Option<(&str, &[(String, String)])>) -> Result<Changed> {
         use std::collections::BTreeSet;
 
         self.prepare()?;
         let stamp = time::now();
         let tx = self.library.connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if let Some((library_id, tracks)) = expected {
+            let current = crate::export_info::db_id(&tx)?;
+            if current == 0 || current.to_string() != library_id || tracks.is_empty() || tracks.len() > 200 {
+                return Err(DbError::WriteRefused("Library changed or invalid removal batch.".into()));
+            }
+            let selected: BTreeSet<_> = contents.iter().collect();
+            for (id, path) in tracks {
+                let stored: Option<String> = tx.query_row("SELECT FolderPath FROM djmdContent WHERE ID=?1", [id], |r| r.get(0)).optional()?;
+                if path.is_empty() || stored.as_ref() != Some(path) {
+                    return Err(DbError::WriteRefused("Track location changed. Preview deletion again.".into()));
+                }
+                let mut stmt = tx.prepare("SELECT ID FROM djmdContent WHERE FolderPath=?1 AND rb_local_deleted=0")?;
+                let references = stmt.query_map([path], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                if references.iter().any(|id| !selected.contains(id)) {
+                    return Err(DbError::WriteRefused("Another collection track references this file. Include all references or keep the file.".into()));
+                }
+            }
+        }
 
         let mut memberships: Vec<String> = Vec::new();
         let mut playlists: BTreeSet<String> = BTreeSet::new();
@@ -4055,7 +6065,6 @@ fn tombstone_subtree(tx: &Connection, id: &str, stamp: &str) -> Result<(Changed,
     }))
 }
 
-/// `parent`'s live children as `(ID, Seq)`, in tree order.
 /// `staying` with `entering` put back in its place in `recorded`: right after
 /// the nearest sibling before it there that is still in `staying`, or else
 /// right before the nearest one after it, or else at the end. Siblings not in
@@ -4080,6 +6089,64 @@ fn place_among(
     staying
 }
 
+/// Why Undo of `edit` must not tombstone its row, if it must not: the row
+/// is gone or no longer as it was made, or something has been put in it
+/// since. `None` when Undo may run.
+fn creation_conflict(conn: &Connection, edit: &PlaylistCreation) -> Result<Option<String>> {
+    let row: Option<(String, String, Option<String>, Option<String>)> = conn.query_row(
+        "SELECT ParentID, COALESCE(Name, ''), SmartList, ImagePath
+         FROM djmdPlaylist WHERE ID = ?1 AND rb_local_deleted = 0",
+        params![edit.id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    ).optional()?;
+    let Some((parent, name, smart_list, image)) = row else {
+        return Ok(Some("the playlist is no longer there".to_owned()));
+    };
+    let children: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM djmdPlaylist WHERE ParentID = ?1 AND rb_local_deleted = 0",
+        params![edit.id],
+        |r| r.get(0),
+    )?;
+    let reason = if children > 0 {
+        Some("playlists have been added to the folder since")
+    } else if !live_members(conn, &edit.id)?.is_empty() {
+        Some("tracks have been added to the playlist since")
+    } else if parent != edit.parent {
+        Some("the playlist has been moved since")
+    } else if name != edit.name {
+        Some("the playlist has been renamed since")
+    } else if smart_list != edit.smart_list {
+        Some("the playlist's rule has changed since")
+    } else if image.is_some_and(|path| !path.is_empty()) {
+        Some("the playlist's artwork has changed since")
+    } else {
+        None
+    };
+    Ok(reason.map(str::to_owned))
+}
+
+/// Why Redo of `edit` must not bring its row back, if it must not.
+fn recreation_conflict(conn: &Connection, edit: &PlaylistCreation) -> Result<Option<String>> {
+    let row: Option<(String, i64, i64)> = conn.query_row(
+        "SELECT ParentID, Attribute, rb_local_deleted FROM djmdPlaylist WHERE ID = ?1",
+        params![edit.id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).optional()?;
+    let reason = match row {
+        None => Some("the playlist is no longer there"),
+        Some((_, _, 0)) => Some("the playlist is already there"),
+        Some((parent, attribute, _)) if parent != edit.parent || attribute != edit.attribute => {
+            Some("the playlist has changed since")
+        }
+        Some(_) if edit.parent != ROOT && !node_exists(conn, &edit.parent)? => {
+            Some("the folder it was made in is no longer there")
+        }
+        Some(_) => None,
+    };
+    Ok(reason.map(str::to_owned))
+}
+
+/// `parent`'s live children as `(ID, Seq)`, in tree order.
 fn children_with_seq(conn: &Connection, parent: &str) -> Result<Vec<(String, Option<i64>)>> {
     let mut stmt = conn.prepare(
         "SELECT ID, Seq FROM djmdPlaylist
@@ -4099,6 +6166,60 @@ fn live_members(conn: &Connection, playlist: &str) -> Result<Vec<String>> {
     let found = stmt.query_map(params![playlist], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     Ok(found)
+}
+
+/// [`live_members`] with each row's `TrackNo`.
+fn numbered_members(conn: &Connection, playlist: &str) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT ID, TrackNo FROM djmdSongPlaylist
+         WHERE PlaylistID = ?1 AND rb_local_deleted = 0 ORDER BY TrackNo, ID",
+    )?;
+    let found = stmt.query_map(params![playlist], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(found)
+}
+
+/// The live rows of the Tag List or of one history session, with their
+/// `TrackNo`, in order (#508).
+fn numbered_rows(conn: &Connection, list: &RemovalList) -> Result<Vec<(String, i64)>> {
+    let found = match list {
+        RemovalList::TagList => conn
+            .prepare("SELECT ID, TrackNo FROM djmdSongTagList WHERE rb_local_deleted = 0 ORDER BY TrackNo, ID")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?,
+        RemovalList::History(history) => conn
+            .prepare(
+                "SELECT ID, TrackNo FROM djmdSongHistory
+                 WHERE HistoryID = ?1 AND rb_local_deleted = 0 ORDER BY TrackNo, ID",
+            )?
+            .query_map(params![history], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?,
+    };
+    Ok(found)
+}
+
+/// Why Undo (`deleted` false) or Redo (`deleted` true) of `edit` cannot run
+/// now, or `None` (#506): the list must hold exactly the rows, at exactly
+/// the numbers, the history left in it — what the removal left for Undo,
+/// what it started from for Redo. A track tagged, played, taken off or
+/// moved there since would otherwise be lost from the order or numbered
+/// twice; a history deleted since is not brought back with its plays.
+fn list_removal_conflict(conn: &Connection, edit: &ListRemoval, deleted: bool) -> Result<Option<String>> {
+    if let RemovalList::History(history) = &edit.list {
+        let live: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM djmdHistory WHERE ID = ?1 AND rb_local_deleted = 0",
+            params![history],
+            |r| r.get(0),
+        )?;
+        if live == 0 {
+            return Ok(Some("the history has been deleted since".to_owned()));
+        }
+    }
+    let expected = if deleted { &edit.before } else { &edit.after };
+    if numbered_rows(conn, &edit.list)? != *expected {
+        return Ok(Some(edit.changed_since().to_owned()));
+    }
+    Ok(None)
 }
 
 /// Whether the live subtree under `deletion`'s root is exactly the lists and
@@ -4130,6 +6251,112 @@ fn live_subtree_is(conn: &Connection, deletion: &PlaylistDeletion) -> Result<boo
         *found == known
     };
     Ok(same(&mut lists, &deletion.playlist_ids) && same(&mut members, &deletion.membership_ids))
+}
+
+/// Sort Items is a folder's, or the top of the tree's: a playlist has no
+/// children to put in order.
+fn refuse_unless_folder(conn: &Connection, id: &str) -> Result<()> {
+    if id == ROOT {
+        return Ok(());
+    }
+    let attribute: Option<i64> = conn
+        .query_row(
+            "SELECT Attribute FROM djmdPlaylist WHERE ID = ?1 AND rb_local_deleted = 0",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match attribute {
+        Some(ATTRIBUTE_FOLDER) => Ok(()),
+        Some(_) => Err(DbError::WriteRefused(format!("{id} is not a folder"))),
+        None => Err(DbError::WriteRefused(format!("no playlist or folder {id}"))),
+    }
+}
+
+/// Gives `parent`'s children `order`, `Seq` counted from 0 as
+/// [`Writer::move_to`] counts it, each row with a fresh USN.
+fn write_child_order(conn: &Connection, parent: &str, order: &[String], stamp: &str) -> Result<Changed> {
+    let mut rows = 0;
+    let mut usn = 0;
+    for (seq, node) in order.iter().enumerate() {
+        usn = next_usn(conn)?;
+        let seq = i64::try_from(seq).unwrap_or(i64::MAX);
+        rows += conn.execute(
+            "UPDATE djmdPlaylist SET Seq = ?1, rb_local_usn = ?2, updated_at = ?3
+             WHERE ID = ?4 AND ParentID = ?5 AND rb_local_deleted = 0",
+            params![seq, usn, stamp, node, parent],
+        )?;
+    }
+    set_counter(conn, usn)?;
+    Ok(Changed { rows, usn })
+}
+
+/// The run of siblings a live My Tag is ordered in: [`ROOT`] for a
+/// category, otherwise its category's id. An unknown or deleted id is
+/// refused.
+fn my_tag_run_of(conn: &Connection, id: &str) -> Result<String> {
+    let row: Option<(i64, String)> = conn.query_row(
+        "SELECT COALESCE(Attribute, 0), COALESCE(ParentID, '') FROM djmdMyTag
+         WHERE ID = ?1 AND rb_local_deleted = 0",
+        params![id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional()?;
+    match row {
+        None => Err(DbError::WriteRefused(format!("no My Tag {id}"))),
+        Some((1, parent)) if parent == ROOT => Ok(ROOT.to_owned()),
+        Some((0, parent)) => Ok(parent),
+        Some(_) => Err(DbError::WriteRefused(format!("My Tag {id} is neither a category nor a tag in one"))),
+    }
+}
+
+/// Every live sibling in one My Tag run, with its `Seq` as stored, in the
+/// order rekordbox reads them. A NULL `Attribute` counts as a tag, as in
+/// [`my_tag_run_of`].
+fn my_tag_run(conn: &Connection, parent: &str) -> Result<Vec<(String, Option<i64>)>> {
+    let attribute = i64::from(parent == ROOT);
+    let mut statement = conn.prepare(
+        "SELECT ID, Seq FROM djmdMyTag
+         WHERE ParentID = ?1 AND COALESCE(Attribute, 0) = ?2 AND rb_local_deleted = 0
+         ORDER BY Seq, ID",
+    )?;
+    let run = statement
+        .query_map(params![parent, attribute], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(run)
+}
+
+/// Writes `target`'s `Seq` over the rows of `current` (the same ids) whose
+/// number differs, each with the next update number, as rekordbox's
+/// `SongListRepositoryBase::Move` stamps a renumbered row.
+fn write_my_tag_seqs(
+    conn: &Connection,
+    current: &[(String, Option<i64>)],
+    target: &[(String, Option<i64>)],
+    stamp: &str,
+) -> Result<Changed> {
+    let mut rows = 0;
+    let mut usn = 0;
+    let mut next = None;
+    for (id, seq) in target {
+        if current.iter().any(|(was, old)| was == id && old == seq) {
+            continue;
+        }
+        let this = match next {
+            Some(n) => n,
+            None => next_usn(conn)?,
+        };
+        rows += conn.execute(
+            "UPDATE djmdMyTag SET Seq = ?1, rb_local_usn = ?2, updated_at = ?3
+             WHERE ID = ?4 AND rb_local_deleted = 0",
+            params![seq, this, stamp, id],
+        )?;
+        usn = this;
+        next = Some(this.checked_add(1).ok_or_else(|| DbError::WriteRefused("local update counter overflow".into()))?);
+    }
+    if rows > 0 {
+        set_counter(conn, usn)?;
+    }
+    Ok(Changed { rows, usn })
 }
 
 /// Whether a playlist or folder exists and is not deleted.
@@ -4278,6 +6505,108 @@ fn write_artwork_sizes(target: &Path, bytes: &[u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn cue_rows_where(conn: &Connection, filter: &str, value: &str) -> Result<Vec<CueRow>> {
+    let mut stmt = conn.prepare(&format!("SELECT ID, {} FROM djmdCue WHERE {filter} ORDER BY ID", CUE_STATE.join(", ")))?;
+    let rows = stmt.query_map([value], |r| {
+        let values = (1..=CUE_STATE.len()).map(|i| r.get::<_, Value>(i)).collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(CueRow { id: r.get(0)?, values })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// See [`Writer::cue_revision_conflict`].
+fn cue_conflict(conn: &Connection, revision: &CueRevision, undo: bool) -> Result<Option<String>> {
+    for (before, after) in &revision.steps {
+        let expected = if undo { after } else { before };
+        let current = cue_rows_where(conn, "ID = ?1", &expected.id)?;
+        if current.first() != Some(expected) {
+            return Ok(Some("the track's cues have changed since".to_owned()));
+        }
+    }
+    // A slot the revision would fill, held now by a cue it does not name:
+    // a hot cue set on that pad since, or another loop made the Active Loop.
+    let named: Vec<&str> = revision.steps.iter().map(|(row, _)| row.id.as_str()).collect();
+    let live = cue_rows_where(conn, "ContentID = ?1 AND rb_local_deleted = 0", &revision.content)?;
+    for (before, after) in &revision.steps {
+        let target = if undo { before } else { after };
+        let Some(kind) = target.kind().filter(|kind| *kind > 0 && target.live()) else { continue };
+        let taken = live.iter().any(|row| !named.contains(&row.id.as_str()) && row.kind() == Some(kind));
+        if taken {
+            return Ok(Some(match HOT_CUE_SLOTS.iter().position(|slot| *slot == kind) {
+                Some(slot) => format!("Hot Cue {} has been set since", char::from(b'A' + u8::try_from(slot).unwrap_or(0))),
+                None => "another loop has become the Active Loop since".to_owned(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// A live track's stored link ([`LINK_COLUMNS`]), or `None` when it is not
+/// in the collection.
+fn link_of(conn: &Connection, content: &str) -> Result<Option<[Value; 3]>> {
+    conn.query_row(
+        "SELECT FolderPath, FileNameL, rb_file_id FROM djmdContent WHERE ID = ?1 AND rb_local_deleted = 0",
+        params![content],
+        |r| Ok([r.get(0)?, r.get(1)?, r.get(2)?]),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn write_link(conn: &Connection, content: &str, link: &[Value; 3], usn: i64, stamp: &str) -> Result<usize> {
+    conn.execute(
+        "UPDATE djmdContent SET FolderPath = ?1, FileNameL = ?2, rb_file_id = ?3, rb_local_usn = ?4, updated_at = ?5
+         WHERE ID = ?6 AND rb_local_deleted = 0",
+        params![link[0], link[1], link[2], usn, stamp, content],
+    )
+    .map_err(Into::into)
+}
+
+/// [`Writer::relocation_conflict`] on `conn`, so the transaction that
+/// writes can check again what it reads.
+fn relocation_conflict_in(conn: &Connection, edit: &TrackRelocation, undo: bool) -> Result<Option<String>> {
+    let several = edit.links.len() > 1;
+    for link in &edit.links {
+        let (expected, target) = if undo { (&link.after, &link.before) } else { (&link.before, &link.after) };
+        let held: Option<bool> = conn
+            .query_row(
+                &format!(
+                    "SELECT ({} IS ?2) AND ({} IS ?3) AND ({} IS ?4) FROM djmdContent WHERE ID = ?1 AND rb_local_deleted = 0",
+                    LINK_COLUMNS[0], LINK_COLUMNS[1], LINK_COLUMNS[2],
+                ),
+                params![link.content, expected[0], expected[1], expected[2]],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match held {
+            None if several => return Ok(Some("one of the tracks is no longer in the collection".to_owned())),
+            None => return Ok(Some("the track is no longer in the collection".to_owned())),
+            Some(false) if several => return Ok(Some("one of the tracks has been pointed at another file since".to_owned())),
+            Some(false) => return Ok(Some("the track has been pointed at another file since".to_owned())),
+            Some(true) => {}
+        }
+        let empty = match &target[0] {
+            Value::Null => true,
+            Value::Text(path) => path.is_empty(),
+            _ => false,
+        };
+        if empty {
+            continue;
+        }
+        let mut stmt = conn.prepare_cached(
+            "SELECT ID FROM djmdContent WHERE FolderPath IS ?1 AND rb_local_deleted = 0",
+        )?;
+        let holders = stmt.query_map(params![target[0]], |r| r.get::<_, String>(0))?;
+        for holder in holders {
+            let holder = holder?;
+            if !edit.links.iter().any(|other| other.content == holder) {
+                return Ok(Some("another track in the collection uses that file".to_owned()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn next_usn(conn: &Connection) -> Result<i64> {

@@ -140,7 +140,7 @@ impl Volume {
         cache: Option<&PreparationCache>,
     ) -> ExportReport {
         let tree = playlists.iter().map(|p| SyncNode { id: p.id, parent: 0, attribute: 0 }).collect();
-        let sync = SyncSource { db_id: 123, tree, automatic: false };
+        let sync = SyncSource { db_id: 123, tree, automatic: false, cloud_db_id: 0 };
         let options = ExportOptions { sync: Some(&sync), root: self.root, cache, ..Default::default() };
         export_with_options(destination, tracks, playlists, &[], &options, &mut |_| {})
             .unwrap_or_else(|e| panic!("{}: {e}", self.label))
@@ -423,4 +423,168 @@ fn a_sync_writes_every_stick_at_once() {
         assert!(volume.mount.join(volume.library_dir()).is_dir(), "{name}: wrong rekordbox root");
         assert!(leftovers(&volume.mount).is_empty(), "{name}: {:?}", leftovers(&volume.mount));
     }
+}
+
+/// A blank exFAT image with 128 KiB clusters, as Windows formats a stick
+/// over 32 GB, mounted at a fresh folder; `None` where the tools cannot
+/// make one. Detached on drop through [`Volume`].
+fn large_cluster_exfat() -> Option<Volume> {
+    let dir = tempfile::tempdir().ok()?;
+    let image = dir.path().join("stick.dmg");
+    let mount = dir.path().join("mnt");
+    let run = |command: &mut Command| command.output().ok().filter(|o| o.status.success());
+    run(Command::new("hdiutil").args(["create", "-quiet", "-size", "512m", "-layout", "NONE", "-type", "UDIF", "-o"]).arg(&image))?;
+    let attached = run(Command::new("hdiutil").args(["attach", "-nomount"]).arg(&image))?;
+    let device = String::from_utf8_lossy(&attached.stdout).split_whitespace().next()?.to_owned();
+    let formatted = run(Command::new("newfs_exfat").args(["-b", "131072", "-v", "RBXTEST", &device]));
+    std::fs::create_dir_all(&mount).ok()?;
+    let mounted = formatted.and_then(|_| run(Command::new("diskutil").args(["mount", "-mountPoint"]).arg(&mount).arg(&device)));
+    if mounted.is_none() {
+        let _ = Command::new("hdiutil").args(["detach", "-quiet", "-force", &device]).status();
+        return None;
+    }
+    Some(Volume { label: "exFAT, 128 KiB clusters".into(), mount, root: None, image: Some(dir) })
+}
+
+/// The space a sync says it needs covers what it really takes at its fullest
+/// on a stick with large clusters, AppleDouble companions included, so a
+/// sync the check lets start does not run out of room part way (#591).
+/// [OBS 2026-10-19, macOS 26] 120 tracks: estimated peak 727,131,648 B,
+/// sampled 725,483,520 B; 4 KiB rounding had said 457,576,388 B.
+#[test]
+fn the_space_check_covers_a_large_cluster_stick() {
+    let Some(volume) = large_cluster_exfat() else {
+        eprintln!("skipping: could not make a 128 KiB-cluster exFAT image here");
+        return;
+    };
+    assert_eq!(rbl_export::plan::allocation_unit(&volume.mount), 128 * 1024);
+    let source = tempfile::tempdir().unwrap();
+    let art = source.path().join("art.jpg");
+    std::fs::write(&art, vec![0xff_u8; 30_000]).unwrap();
+    let tracks: Vec<SourceTrack> = (1..=40_u64)
+        .map(|id| {
+            let path = source.path().join(format!("track-{id}.mp3"));
+            std::fs::write(&path, vec![id as u8; 500_000 + (id as usize * 7_919_191) % 6_000_000]).unwrap();
+            let anlz = |n: usize| rbl_anlz::AnlzBuilder::new().path("/x.mp3").waveform_preview(b"PWAV", &vec![7_u8; n]).finish();
+            SourceTrack {
+                id, source_path: path, title: format!("Track {id}"), artist: format!("Artist {}", id % 7),
+                album: format!("Album {}", id % 13), duration_sec: 120, sample_rate: 44_100,
+                analysis: vec![("DAT".into(), anlz(2_000)), ("EXT".into(), anlz(40_000)), ("2EX".into(), anlz(200_000))],
+                artwork: (id % 3 == 0).then(|| art.clone()),
+                ..Default::default()
+            }
+        })
+        .collect();
+    let set = [playlist(10, "Set", (0..tracks.len()).collect())];
+    let tree = set.iter().map(|p| SyncNode { id: p.id, parent: 0, attribute: 0 }).collect();
+    let sync = SyncSource { db_id: 123, tree, automatic: false, cloud_db_id: 0 };
+    let options = ExportOptions { sync: Some(&sync), ..Default::default() };
+    let plan = rbl_export::plan::preview(&volume.mount, &tracks, &set, &[], &options).unwrap();
+    assert!(!plan.unknown_size);
+
+    let free = || fs2::available_space(&volume.mount).unwrap();
+    let before = free();
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let fullest = std::thread::scope(|scope| {
+        let sampler = scope.spawn(|| {
+            let mut least = u64::MAX;
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                least = least.min(free());
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            least
+        });
+        let report = export_with_options(&volume.mount, &tracks, &set, &[], &options, &mut |_| {}).unwrap();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(report.failed.is_empty(), "{report:?}");
+        before - sampler.join().unwrap().min(free())
+    });
+    let used = before - free();
+    assert!(plan.peak_bytes >= fullest, "estimated peak {} < used at the fullest {fullest}", plan.peak_bytes);
+    // And not so far over that it turns away a sync that fits.
+    assert!(plan.peak_bytes <= fullest + fullest / 20, "estimated peak {} far over {fullest}", plan.peak_bytes);
+    let net = u64::try_from(plan.net_additional_bytes).unwrap();
+    assert!(net.abs_diff(used) <= used / 100, "estimated {net}, used {used}");
+}
+
+/// A Journaled HFS+ image at its root: what rbxport's Format HFS+ and Disk
+/// Utility make, mounted read-write as macOS mounts it.
+fn hfs_plus() -> Option<Volume> {
+    let volume = Volume::image("JHFS+");
+    if volume.is_none() {
+        eprintln!("skipping Journaled HFS+: hdiutil could not create or attach an image here");
+    }
+    volume
+}
+
+/// The Sync Manager's SYNC to an HFS+ stick: the hidden `.PIONEER` root
+/// rekordbox uses there, then a resync that adds a playlist and one that
+/// drops a track (#285).
+///
+/// [OBS 2026-10-13, macOS 26, `hdiutil` image]: HFS+ stores names in NFD
+/// but, unlike FAT32 and exFAT, renames and deletes them by either form,
+/// and accepts `F_FULLFSYNC`; plain and case-sensitive HFS+ behave the same.
+#[test]
+fn an_hfs_plus_stick_takes_a_sync_and_its_resyncs_under_the_hidden_root() {
+    let Some(volume) = hfs_plus() else { return };
+    let root = &volume.mount;
+    let src = tempfile::tempdir().unwrap();
+    let tracks = tracks(src.path());
+    let set = SourcePlaylist { id: 10, name: "Set".into(), track_indices: vec![0, 1], ..Default::default() };
+    let added = SourcePlaylist { id: 11, name: "Warm-up".into(), track_indices: vec![2], ..Default::default() };
+    let node = |id| SyncNode { id, parent: 0, attribute: 0 };
+    let sync = |tracks: &[SourceTrack], playlists: &[SourcePlaylist], tree: Vec<SyncNode>| {
+        let source = SyncSource { db_id: 123, tree, automatic: false, cloud_db_id: 0 };
+        let options = ExportOptions { sync: Some(&source), root: Some(ExportRoot::Hidden), ..Default::default() };
+        export_with_options(root, tracks, playlists, &[], &options, &mut |_| {}).unwrap()
+    };
+
+    let first = sync(&tracks[..2], std::slice::from_ref(&set), vec![node(10)]);
+    assert_eq!((first.tracks, first.failed.len()), (2, 0));
+    let second = sync(&tracks, &[set.clone(), added], vec![node(10), node(11)]);
+    assert_eq!((second.tracks, second.reused, second.failed.len()), (3, 2, 0));
+    let set = SourcePlaylist { track_indices: vec![0], ..set };
+    let third = sync(&tracks[..1], &[set], vec![node(10)]);
+    assert_eq!((third.removed, third.failed.len()), (2, 0));
+
+    assert!(root.join(".PIONEER/rekordbox/exportLibrary.db").is_file());
+    assert!(!root.join("PIONEER").exists());
+    let check = verify(root).unwrap();
+    assert!(check.is_ok(), "{:?}", check.errors);
+    assert_eq!(check.tracks, 1);
+    assert!(root.join("Contents/Bj\u{f6}rk/Album/Kes\u{e4} (On Kaunis).mp3").is_file());
+    assert!(leftovers(root).is_empty(), "{:?}", leftovers(root));
+}
+
+/// A stick mounted read-only, as Linux mounts a Journaled HFS+ volume
+/// without `force` (AlphaTheta's players pass `force`; see alphatheta-docs
+/// `devices/xdj-rx3/operating-system/storage-mounting.md`), is refused
+/// before anything is written, with the system's reason (#285).
+#[test]
+fn a_read_only_hfs_plus_stick_is_refused_up_front_with_the_reason() {
+    let Some(volume) = hfs_plus() else { return };
+    let src = tempfile::tempdir().unwrap();
+    let tracks = tracks(src.path());
+    volume.export(&volume.mount, &tracks, &[playlist(10, "Set", (0..tracks.len()).collect())]);
+    let before = verify(&volume.mount).unwrap();
+
+    let image = volume.image.as_ref().unwrap().path().join("stick.dmg");
+    assert!(Command::new("hdiutil").args(["detach", "-quiet", "-force"]).arg(&volume.mount).status().unwrap().success());
+    let attached = Command::new("hdiutil")
+        .args(["attach", "-quiet", "-readonly", "-nobrowse", "-mountpoint"])
+        .arg(&volume.mount)
+        .arg(&image)
+        .status()
+        .unwrap();
+    assert!(attached.success());
+
+    let source = SyncSource { db_id: 123, tree: vec![SyncNode { id: 10, parent: 0, attribute: 0 }], automatic: false, cloud_db_id: 0 };
+    let options = ExportOptions { sync: Some(&source), root: volume.root, ..Default::default() };
+    let lists = [playlist(10, "Set", vec![0])];
+    let error = export_with_options(&volume.mount, &tracks[..1], &lists, &[], &options, &mut |_| {}).unwrap_err();
+    let rbl_export::ExportError::Io(io) = &error else { panic!("{error:?}") };
+    assert_eq!(io.kind(), std::io::ErrorKind::ReadOnlyFilesystem, "{error}");
+    assert!(error.to_string().contains("Read-only file system"), "{error}");
+    let after = verify(&volume.mount).unwrap();
+    assert_eq!((after.tracks, after.is_ok()), (before.tracks, true));
 }

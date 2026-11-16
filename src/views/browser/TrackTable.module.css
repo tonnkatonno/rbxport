@@ -125,6 +125,16 @@
   height: var(--s-filter-toggle-glyph);
   color: var(--c-filter-text);
 }
+/* The artwork display pattern: rekordbox's two buttons beside the MASTER
+   menu, the same outlined squares as the filter's (its skins draw all three
+   in one 18-unit frame), blue around whichever is chosen. */
+.artworkModes {
+  display: flex;
+  align-items: center;
+  gap: var(--s-artwork-mode-gap);
+  flex: none;
+}
+.artworkModes > .filterToggle { margin-right: 0; }
 /* The capture draws it black with no border of its own, sitting in the
    header row rather than boxed like the tree's own search. */
 .search { flex: 0 1 var(--s-search-w); border: none; }
@@ -308,6 +318,17 @@
    the text in black, selected or not. */
 .cell[data-lit],
 .row[data-selected] .cell[data-lit] { background: var(--c-traffic-light); color: var(--c-black); }
+
+/* A played track (#540): its text columns in rekordbox 7.2.19's played
+   green, selected or not. `ListViewer::findTextColour` @0x1003efb70 answers
+   theme colour 0x30000e1 for an unselected played row and #69B900 for a
+   selected one; the dark theme's 0x30000e1 is #69B900 too
+   (`__GLOBAL__sub_I_ColorTheme.cpp`, `__GLOBAL__sub_I_ListViewer.cpp`)
+   [OBS static]. The rating, colour and attribute columns are drawn by their
+   own painters and keep their colours; a lit Traffic Light key keeps its
+   black. */
+.row[data-played] .cell { color: var(--c-played); }
+.row[data-played] .cell[data-lit] { color: var(--c-black); }
 
 .row[data-selected] .cell,
 .row[data-selected] .attr,

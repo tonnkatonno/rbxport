@@ -1,0 +1,149 @@
+/* rekordbox's My Tag configuration window. Every measure is a --*-mytag-*
+   token, from the rig capture and BrowseMyTagView's own layout code. */
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  /* The window's own 1px black edge, then its rows. */
+  padding-left: 1px;
+  background: var(--c-black);
+  font-family: var(--f-ui);
+  font-size: var(--f-size-info);
+  user-select: none;
+}
+
+.list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.heading,
+.tag {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: var(--s-mytag-row-h);
+  white-space: nowrap;
+}
+
+.heading {
+  padding-left: var(--s-mytag-heading-x);
+  background: var(--c-mytag-heading);
+  color: var(--c-mytag-heading-text);
+}
+
+.tag {
+  padding-left: var(--s-mytag-name-x);
+  color: var(--c-mytag-text-off);
+}
+.panel[data-enabled] .tag {
+  color: var(--c-mytag-text);
+}
+
+.name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* Clear of the add button, which sits over the row's right end. */
+  padding-right: calc(var(--s-mytag-add-right) + 4px);
+}
+
+/* The name's Label put into edit mode (MyTagItemComponent::beginTextEdit,
+   rekordbox 7.2.19 @0x10066ca3c): a box 1px inside the row, from the name's
+   x to 25px short of a tag row's right edge, or to the right edge of a
+   heading (resized @0x10066d538). No outline: the Label's outline, focused
+   outline and shadow colours are all transparent (ctor @0x10066c13c). Black
+   behind a tag's name, #191919 behind a category's. */
+.edit {
+  width: calc(100% - 25px);
+  height: calc(var(--s-mytag-row-h) - 2px);
+  padding: 0 1px;
+  border: 0;
+  background: var(--c-black);
+  color: var(--c-mytag-edit-text);
+  font: inherit;
+  outline: none;
+}
+/* Over the app's focus ring too: rekordbox draws none here. */
+.panel .edit:focus-visible {
+  outline: none;
+}
+.heading .edit {
+  width: 100%;
+  background: var(--c-mytag-heading);
+}
+.edit::selection {
+  background: var(--c-mytag-edit-select);
+  color: var(--c-mytag-edit-select-text);
+}
+
+.check {
+  position: absolute;
+  left: var(--s-mytag-check-x);
+  top: calc((var(--s-mytag-row-h) - var(--s-mytag-check)) / 2);
+  width: var(--s-mytag-check);
+  height: var(--s-mytag-check);
+  padding: 0;
+  border: 0;
+  /* The face's anti-aliased edge: one pixel along each side at about an
+     eighth of its colour, leaving the corners black as drawTickBox's
+     stretched png does. Four shadows rather than a spread, which would
+     fill the corners. */
+  --edge: var(--c-mytag-check-edge);
+  box-shadow: 0 -1px var(--edge), 0 1px var(--edge), -1px 0 var(--edge), 1px 0 var(--edge);
+  background: var(--c-mytag-check);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: default;
+}
+.check:disabled {
+  --edge: var(--c-mytag-check-off-edge);
+  background: var(--c-mytag-check-off);
+}
+/* Ticked: skins/checkbox_mark.png as drawTickBox stretches it (see the
+   tokens), its tick the white of skins/checkbox_on.svg. */
+.check[data-checked] {
+  --edge: var(--c-mytag-check-on-edge);
+  background: var(--c-mytag-check-on);
+  color: var(--c-mytag-tick);
+}
+.check[data-checked]:disabled {
+  background: var(--c-mytag-check-on-off);
+  color: var(--c-mytag-tick-off);
+}
+.tick {
+  width: var(--s-mytag-check);
+  height: var(--s-mytag-check);
+}
+
+.add {
+  position: absolute;
+  /* The glyph itself: rekordbox draws the 11px svg 2px in and 1px down in
+     its 14px button, which puts it 5px under the row's top and its right
+     edge 20px from the window's [OBS rig x 1856..1866, y +5..+15]. */
+  right: var(--s-mytag-add-right);
+  top: 5px;
+  width: var(--s-mytag-add);
+  height: var(--s-mytag-add);
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--c-mytag-add);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: default;
+}
+/* Greyed at fifty tags, as rekordbox fades the svg to 30%. */
+.add:disabled {
+  opacity: 0.3;
+}
+.addIcon {
+  width: var(--s-mytag-add);
+  height: var(--s-mytag-add);
+}
+.addPlus {
+  fill: var(--c-mytag-heading);
+}

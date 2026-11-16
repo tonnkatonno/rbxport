@@ -5,10 +5,11 @@
 //! File › Display All Missing Files opens the Missing File Manager: every
 //! track whose file is not there (36,444 of the rig's 38,733), with a
 //! "N Track" count and Auto Relocate, Relocate, Delete and OK. The browser
-//! checks the working path of each row it draws
+//! checks the working path of a row when it is selected
 //! (`BrowseBasicView::updateMissingStatus` @0x100321010 in 7.2.19 macOS,
-//! see `rbl_db::track_path`); this reads the same path, the index's
-//! resolved `folder_path`.
+//! see `rbl_db::track_path` and [`track_missing`]); this reads the same
+//! path, the index's resolved `folder_path`, each time a page of rows is
+//! fetched and again when one row is selected.
 //!
 //! Auto Relocate ([`auto_relocate`]) is rekordbox's
 //! (`MissingFileTable::relocateSelectedFiles` with `SearchMode` 2, the
@@ -45,11 +46,11 @@ use tauri::{Manager, State};
 
 use rbl_index::Library;
 
-use crate::commands::{blocking, permanent_edit, reload, write_error, MAX_ROWS};
+use crate::commands::{announce_history, blocking, permanent_edit, reload, write_error, MAX_ROWS, RELOCATE_LABEL};
 use crate::dto::{MissingTrackDto, MissingTracksDto};
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::commands::Touched;
-use crate::state::AppState;
+use crate::state::{AppState, LibraryEdit};
 
 /// Whether a track's file is gone: it has a path and nothing is there.
 ///
@@ -64,6 +65,32 @@ pub fn is_missing(path: &str) -> bool {
 pub fn is_missing_path(path: &Path) -> bool {
     // perf-ok: one `stat`, as rekordbox's own load does before it opens.
     !path.as_os_str().is_empty() && !path.exists()
+}
+
+/// Whether a track's file is gone, looked at now; `None` for an id the
+/// library does not hold.
+///
+/// [OBS rekordbox 7.2.19 macOS arm64, static, issue #682] The browser's
+/// `[!]` is a flag on the track (bit `0x20` of `RowDataTrack+0x3f8`, read by
+/// `browse::Status::isMissing` @0x1018a2e04), not a look at the disk each
+/// time a row is drawn. `BrowseBasicView::changedSelectedRows` @0x100321688
+/// looks again when exactly one row is selected: it calls
+/// `BrowseBasicView::updateMissingStatus` @0x100321010 on that row, which
+/// sets or clears the flag (`DatabaseIF::changeFileExistence`) from
+/// `juce::File::existsAsFile` on the working path, then repaints the row
+/// (`CustomListBox::repaintRow`). So a file that goes missing, or comes
+/// back, while the list is up is shown once its row is selected. The
+/// browser asks this then, since the rows it holds were read when their page
+/// was fetched.
+fn track_missing_in(library: &Library, track: &str) -> Option<bool> {
+    library.row_of(track).map(|row| is_missing(library.folder_path.get(row as usize)))
+}
+
+/// See [`track_missing_in`].
+#[tauri::command]
+pub async fn track_missing(state: State<'_, Arc<AppState>>, track: String) -> AppResult<Option<bool>> {
+    let library = state.library()?;
+    blocking("track_missing", move || Ok(track_missing_in(&library, &track))).await
 }
 
 /// rekordbox's `kPlayerOperateErrorLoadMissingFile` (global 0x1056c6b00,
@@ -83,7 +110,9 @@ fn scan(library: &Library) -> Vec<u32> {
 ///
 /// The list can run to tens of thousands of tracks, more than one response
 /// may carry, so it is paged out from here; it belongs to the library it was
-/// taken of and is thrown away once that is reloaded.
+/// taken of and is thrown away once that is reloaded. `rows` is in the
+/// order the manager shows them: the index's, until a column heading sorts
+/// it ([`sort_missing_tracks`]).
 pub struct MissingScan {
     library: Arc<Library>,
     rows: Arc<Vec<u32>>,
@@ -91,16 +120,42 @@ pub struct MissingScan {
 
 /// The missing rows of `library`: a fresh scan when asked for or when the
 /// last one was of another library, the last one otherwise.
-fn missing_rows(state: &AppState, library: &Arc<Library>, rescan: bool) -> Arc<Vec<u32>> {
+///
+/// With `keep_order` a fresh scan keeps the last one's order: the tracks
+/// still missing stay where they were, as rekordbox's list only loses the
+/// rows a relocate or delete took away (`MissingFileTable::relocateSelectedFiles`
+/// @0x1012a62dc removes them from its array and leaves the rest), and any
+/// track newly missing goes at the end [ASSUME: rekordbox's open list never
+/// gains one].
+fn missing_rows(state: &AppState, library: &Arc<Library>, rescan: bool, keep_order: bool) -> Arc<Vec<u32>> {
     let mut held = state.missing_scan.lock();
     if !rescan {
         if let Some(scan) = held.as_ref().filter(|scan| Arc::ptr_eq(&scan.library, library)) {
             return Arc::clone(&scan.rows);
         }
     }
-    let rows = Arc::new(scan(library));
+    let mut rows = scan(library);
+    if keep_order {
+        if let Some(last) = held.as_ref() {
+            keep_order_of(last, library, &mut rows);
+        }
+    }
+    let rows = Arc::new(rows);
     *held = Some(MissingScan { library: Arc::clone(library), rows: Arc::clone(&rows) });
     rows
+}
+
+/// Puts `rows`, of `library`, in the order `last` had the same tracks in,
+/// by track id since a reload can renumber rows. Tracks `last` did not list
+/// follow, in index order.
+fn keep_order_of(last: &MissingScan, library: &Library, rows: &mut [u32]) {
+    let at: HashMap<u64, usize> = last
+        .rows
+        .iter()
+        .enumerate()
+        .filter_map(|(at, &row)| last.library.ids.get(row as usize).map(|&id| (id, at)))
+        .collect();
+    rows.sort_by_key(|&row| library.ids.get(row as usize).and_then(|id| at.get(id)).copied().unwrap_or(usize::MAX));
 }
 
 fn missing_dto(library: &Library, row: u32) -> MissingTrackDto {
@@ -117,19 +172,22 @@ fn missing_dto(library: &Library, row: u32) -> MissingTrackDto {
 /// A page of the Missing File Manager's list.
 ///
 /// `rescan` checks every track's file again, as opening the manager does;
-/// otherwise the page comes from the last scan.
+/// otherwise the page comes from the last scan. `keep_order` makes such a
+/// check keep the list's sorted order, for the check after a change made
+/// from the manager.
 #[tauri::command]
 pub async fn missing_tracks(
     state: State<'_, Arc<AppState>>,
     offset: u32,
     limit: u32,
     rescan: bool,
+    keep_order: Option<bool>,
 ) -> AppResult<MissingTracksDto> {
     let library = state.library()?;
     let state = Arc::clone(&state);
     let wanted = limit.min(MAX_ROWS) as usize;
     blocking("missing_tracks", move || {
-        let rows = missing_rows(&state, &library, rescan);
+        let rows = missing_rows(&state, &library, rescan, keep_order.unwrap_or(false));
         let tracks = rows
             .iter()
             .skip(offset as usize)
@@ -141,11 +199,113 @@ pub async fn missing_tracks(
     .await
 }
 
+/// A Missing File Manager column, by its heading.
+///
+/// [OBS rekordbox 7.2.19 static] `MissingFileTable`'s ctor (@0x1012a5404)
+/// adds four columns, ids 1 to 4, all sortable (flags 0x1f).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MissingColumn {
+    Title,
+    Artist,
+    Album,
+    Location,
+}
+
+/// The collator rekordbox sorts the list with.
+///
+/// [OBS rekordbox 7.2.19 static] `ListSorter::setLocale` (@0x1012a9930),
+/// called with two empty strings from `MissingFileTable::sortOrderChanged`,
+/// takes `icu::Collator::createInstance(Locale("en_US"))`: ICU's defaults,
+/// tertiary strength, no numeric ordering. English has no tailoring, so
+/// this is the CLDR root order.
+fn collator() -> AppResult<icu_collator::CollatorBorrowed<'static>> {
+    icu_collator::CollatorBorrowed::try_new(
+        icu_locale_core::locale!("en-US").into(),
+        icu_collator::options::CollatorOptions::default(),
+    )
+    .map_err(|error| AppError::internal(format!("the en-US collator for the Missing File Manager sort: {error}")))
+}
+
+/// `rows` sorted the way a click on `column`'s heading sorts rekordbox's
+/// Missing File Manager.
+///
+/// [OBS rekordbox 7.2.19 static] `MissingFileTable::sortOrderChanged`
+/// (@0x1012a7c3c) builds a `ListSorter` (@0x1012a94c4) and stable-sorts the
+/// list **as it stands** (`OwnedArray::sort(sorter, true)`), so each sort
+/// starts from the last. The sorter compares through a chain that stops at
+/// the first non-zero answer:
+///
+/// | Column | Chain |
+/// |---|---|
+/// | Track Title | title |
+/// | artist | artist, album, disc number, track number |
+/// | album | album, disc number, track number |
+/// | location | path |
+///
+/// Text goes through [`collator`]; the disc (`u16`) and track numbers are
+/// subtracted. The chain ends in `compareEnd` (@0x1012a9618), which answers
+/// -1, not 0, and the answer is multiplied by +1 forwards and -1 backwards
+/// (`[sorter+0xa8]`, `mul` @0x1012aadf0). So rows equal on every key compare
+/// as "the later is less" forwards, and libc++'s stable sort then reverses
+/// them; backwards they compare "not less" and keep their order. That is
+/// what this does, with each row's place as the last key.
+fn sorted_rows(library: &Library, rows: &[u32], column: MissingColumn, forwards: bool) -> AppResult<Vec<u32>> {
+    let collator = collator()?;
+    let text = |a: &str, b: &str| collator.compare(a, b);
+    let disc = |row: u32| library.disc_no.get(row as usize).copied().unwrap_or(0);
+    let track = |row: u32| library.track_number.get(row as usize).copied().unwrap_or(0);
+    let album = |a: u32, b: u32| {
+        text(library.album_name(a), library.album_name(b))
+            .then_with(|| disc(a).cmp(&disc(b)))
+            .then_with(|| track(a).cmp(&track(b)))
+    };
+    let keys = |a: u32, b: u32| match column {
+        MissingColumn::Title => text(library.title.get(a as usize), library.title.get(b as usize)),
+        MissingColumn::Artist => text(library.artist_name(a), library.artist_name(b)).then_with(|| album(a, b)),
+        MissingColumn::Album => album(a, b),
+        MissingColumn::Location => text(library.folder_path.get(a as usize), library.folder_path.get(b as usize)),
+    };
+    let mut placed: Vec<(usize, u32)> = rows.iter().copied().enumerate().collect();
+    placed.sort_by(|&(at_a, a), &(at_b, b)| {
+        if forwards {
+            keys(a, b).then(at_b.cmp(&at_a))
+        } else {
+            keys(b, a).then(at_a.cmp(&at_b))
+        }
+    });
+    Ok(placed.into_iter().map(|(_, row)| row).collect())
+}
+
+/// A click on a Missing File Manager column heading: the list, as it
+/// stands, sorted by that column, forwards or backwards. See [`sorted_rows`].
+#[tauri::command]
+pub async fn sort_missing_tracks(
+    state: State<'_, Arc<AppState>>,
+    column: MissingColumn,
+    forwards: bool,
+) -> AppResult<()> {
+    let library = state.library()?;
+    let state = Arc::clone(&state);
+    blocking("sort_missing_tracks", move || {
+        let rows = missing_rows(&state, &library, false, false);
+        let sorted = Arc::new(sorted_rows(&library, &rows, column, forwards)?);
+        let mut held = state.missing_scan.lock();
+        // Only over the list it sorted: a rescan in the meantime wins.
+        if held.as_ref().is_some_and(|scan| Arc::ptr_eq(&scan.rows, &rows)) {
+            *held = Some(MissingScan { library: Arc::clone(&library), rows: sorted });
+        }
+        Ok(())
+    })
+    .await
+}
+
 /// The rows an action over missing files applies to: the ones named that are
-/// still missing, or with none named every missing track, checked afresh.
+/// still missing, or with none named every missing track, checked afresh and
+/// in the list's order.
 fn chosen(state: &AppState, library: &Arc<Library>, tracks: Option<&[String]>) -> Vec<u32> {
     match tracks {
-        None => missing_rows(state, library, true).as_ref().clone(),
+        None => missing_rows(state, library, true, true).as_ref().clone(),
         Some(ids) => ids
             .iter()
             .filter_map(|id| library.row_of(id))
@@ -501,6 +661,23 @@ pub fn plan(
     out
 }
 
+/// Writes one relocation run (Relocate by location, Auto Relocate) in one
+/// transaction and records it as one "Relocate" entry of the library
+/// history (#502), under the edit gate so no Undo runs between the two.
+/// Answers how many tracks it pointed somewhere.
+fn record_relocation(state: &AppState, moves: &[(String, PathBuf)]) -> AppResult<u32> {
+    let _gate = state.edit_gate.lock();
+    let relocation = state
+        .write_history_then(|writer| writer.relocate_with_undo(moves), |_, (_, relocation)| Ok(relocation))
+        .map_err(write_error)?;
+    let count = u32::try_from(relocation.len()).unwrap_or(u32::MAX);
+    let edit = LibraryEdit::Relocate(relocation);
+    if !edit.is_empty() {
+        state.edit_history.lock().record(edit, RELOCATE_LABEL);
+    }
+    Ok(count)
+}
+
 /// Points missing tracks at their moved files, as rekordbox's Auto Relocate
 /// finds them: the tracks named, or every missing track when none are.
 ///
@@ -563,14 +740,7 @@ pub async fn auto_relocate<R: tauri::Runtime>(
         let relocated = if plan.moves.is_empty() {
             0
         } else {
-            writing
-                .write(|writer| {
-                    for (id, path) in &plan.moves {
-                        writer.relocate(id, path)?;
-                    }
-                    Ok(u32::try_from(plan.moves.len()).unwrap_or(u32::MAX))
-                })
-                .map_err(write_error)?
+            record_relocation(&writing, &plan.moves)?
         };
         Ok(RelocateReportDto { relocated, unresolved, in_collection, in_collection_total })
     })
@@ -579,7 +749,8 @@ pub async fn auto_relocate<R: tauri::Runtime>(
     // Only reload if anything moved; a search that found nothing has not
     // changed the library.
     if report.relocated > 0 {
-        reload(app, state_for_reload).await?;
+        reload(app.clone(), Arc::clone(&state_for_reload)).await?;
+        announce_history(&app, &state_for_reload);
     }
     Ok(report)
 }
@@ -748,18 +919,12 @@ pub async fn relocate_by_location<R: tauri::Runtime>(
         if moves.is_empty() {
             return Ok(0);
         }
-        writing
-            .write(|writer| {
-                for (id, path) in &moves {
-                    writer.relocate(id, path)?;
-                }
-                Ok(u32::try_from(moves.len()).unwrap_or(u32::MAX))
-            })
-            .map_err(write_error)
+        record_relocation(&writing, &moves)
     })
     .await?;
     if found > 0 {
-        reload(app, state_for_reload).await?;
+        reload(app.clone(), Arc::clone(&state_for_reload)).await?;
+        announce_history(&app, &state_for_reload);
     }
     Ok(found)
 }
@@ -946,6 +1111,31 @@ mod tests {
         assert!(!is_missing(""));
     }
 
+    /// #682: a file that goes missing after its row was read is found
+    /// missing when the row is looked at again, and found again when it
+    /// comes back, as rekordbox's `updateMissingStatus` sets and clears its
+    /// flag on selection.
+    #[test]
+    fn a_track_is_looked_at_again_when_asked() {
+        use rbl_index::testing::{library_from, TestTrack};
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("track.mp3");
+        std::fs::write(&file, b"x").unwrap();
+        let path: &'static str = Box::leak(file.to_string_lossy().into_owned().into_boxed_str());
+        let library = library_from(&[
+            TestTrack { id: 1, title: "Here, then gone", path, ..TestTrack::default() },
+            TestTrack { id: 2, title: "Never had one", path: "", ..TestTrack::default() },
+        ]);
+        assert_eq!(track_missing_in(&library, "1"), Some(false));
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(track_missing_in(&library, "1"), Some(true), "gone since the row was read");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(track_missing_in(&library, "1"), Some(false), "back again");
+        assert_eq!(track_missing_in(&library, "2"), Some(false));
+        assert_eq!(track_missing_in(&library, "99"), None, "not in the library");
+        assert_eq!(track_missing_in(&library, "/loose/file.mp3"), None);
+    }
+
     #[test]
     fn the_scan_lists_the_missing_tracks_in_index_order() {
         use rbl_index::testing::{library_from, TestTrack};
@@ -967,6 +1157,94 @@ mod tests {
         assert_eq!(titles, ["Gone", "Also gone"]);
         assert_eq!(listed[1].album, "Lost");
         assert_eq!(listed[1].path, also);
+    }
+
+    fn titles_of(library: &Library, rows: &[u32]) -> Vec<String> {
+        rows.iter().map(|&row| library.title.get(row as usize).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_heading_sorts_the_list_as_rekordboxs_list_sorter_does() {
+        use rbl_index::testing::{library_from, TestTrack};
+        let library = library_from(&[
+            TestTrack { id: 1, title: "b", artist: "Zed", album: "One", disc_no: 1, track_number: 2, path: "/m/c.mp3", ..TestTrack::default() },
+            TestTrack { id: 2, title: "B", artist: "Zed", album: "One", disc_no: 1, track_number: 1, path: "/m/B.mp3", ..TestTrack::default() },
+            TestTrack { id: 3, title: "a", artist: "ann", album: "Two", path: "/m/a.mp3", ..TestTrack::default() },
+            TestTrack { id: 4, title: "b", artist: "Zed", album: "One", disc_no: 0, track_number: 9, path: "/m/b.mp3", ..TestTrack::default() },
+            TestTrack { id: 5, title: "Ä", artist: "Ann", album: "", path: "/m/A.mp3", ..TestTrack::default() },
+        ]);
+        let rows: Vec<u32> = (0..5).collect();
+        // ICU's en_US order: accents and case only break ties, lower case
+        // first. The two "b" rows tie on every key: forwards they come out
+        // reversed (compareEnd answers -1), backwards in the order they had.
+        let forwards = sorted_rows(&library, &rows, MissingColumn::Title, true).unwrap();
+        assert_eq!(titles_of(&library, &forwards), ["a", "Ä", "b", "b", "B"]);
+        assert_eq!(forwards[2..4], [3, 0]);
+        let backwards = sorted_rows(&library, &rows, MissingColumn::Title, false).unwrap();
+        assert_eq!(titles_of(&library, &backwards), ["B", "b", "b", "Ä", "a"]);
+        assert_eq!(backwards[1..3], [0, 3]);
+        // Each sort starts from the list as it stands.
+        let again = sorted_rows(&library, &forwards, MissingColumn::Title, true).unwrap();
+        assert_eq!(again[2..4], [0, 3]);
+
+        // artist, then album, then disc and track number, as numbers.
+        let by_artist = sorted_rows(&library, &rows, MissingColumn::Artist, true).unwrap();
+        assert_eq!(by_artist, [2, 4, 3, 1, 0]);
+        // album, then disc and track number.
+        let by_album = sorted_rows(&library, &rows, MissingColumn::Album, true).unwrap();
+        assert_eq!(by_album, [4, 3, 1, 0, 2]);
+        let by_path = sorted_rows(&library, &rows, MissingColumn::Location, true).unwrap();
+        assert_eq!(by_path, [2, 4, 3, 1, 0]);
+    }
+
+    #[test]
+    fn album_forwards_then_backwards_leaves_rekordboxs_observed_tail() {
+        // [OBS rekordbox 7.2.14, chris-win11, issue #541,
+        // parity/issue-541/rekordbox-mfm-03-album-2.png] The list opened
+        // with these album-less tracks first, in this order; "album" clicked
+        // twice (forwards, then backwards) ended the list with them reversed.
+        use rbl_index::testing::{library_from, TestTrack};
+        let opened = ["It Feels So Good", "Castles In The Sky", "Castles In The Sky (Extended)", "Bring Me Back to Life",
+            "Around the World", "YES BITCH SAMBA", "Language (Same)", "174 to 128 - Switch"];
+        let mut tracks: Vec<TestTrack> = opened
+            .iter()
+            .enumerate()
+            .map(|(at, &title)| TestTrack { id: u64::try_from(at).unwrap() + 1, title, ..TestTrack::default() })
+            .collect();
+        tracks.insert(0, TestTrack { id: 100, title: "Go Back", album: "Go Back", ..TestTrack::default() });
+        tracks.insert(5, TestTrack { id: 101, title: "BATTERY OPERATED", album: "BATTERY OPERATED", ..TestTrack::default() });
+        let library = library_from(&tracks);
+        let rows: Vec<u32> = (0..u32::try_from(tracks.len()).unwrap()).collect();
+        let forwards = sorted_rows(&library, &rows, MissingColumn::Album, true).unwrap();
+        let backwards = sorted_rows(&library, &forwards, MissingColumn::Album, false).unwrap();
+        let tail: Vec<String> = titles_of(&library, &backwards).into_iter().skip(2).collect();
+        let reversed: Vec<&str> = opened.iter().rev().copied().collect();
+        assert_eq!(tail, reversed);
+        assert_eq!(titles_of(&library, &backwards)[..2], ["Go Back", "BATTERY OPERATED"]);
+    }
+
+    #[test]
+    fn a_rescan_after_a_change_keeps_the_sorted_order() {
+        use rbl_index::testing::{library_from, TestTrack};
+        let dir = tempfile::tempdir().unwrap();
+        let gone = |name: &str| -> &'static str {
+            Box::leak(dir.path().join(name).to_string_lossy().into_owned().into_boxed_str())
+        };
+        let before = Arc::new(library_from(&[
+            TestTrack { id: 10, title: "c", path: gone("c.mp3"), ..TestTrack::default() },
+            TestTrack { id: 11, title: "a", path: gone("a.mp3"), ..TestTrack::default() },
+            TestTrack { id: 12, title: "b", path: gone("b.mp3"), ..TestTrack::default() },
+        ]));
+        let last = MissingScan { library: Arc::clone(&before), rows: Arc::new(vec![1, 2, 0]) };
+        // Reloaded without "a", with a new missing track and rows renumbered.
+        let after = library_from(&[
+            TestTrack { id: 13, title: "new", path: gone("new.mp3"), ..TestTrack::default() },
+            TestTrack { id: 10, title: "c", path: gone("c.mp3"), ..TestTrack::default() },
+            TestTrack { id: 12, title: "b", path: gone("b.mp3"), ..TestTrack::default() },
+        ]);
+        let mut rows = scan(&after);
+        keep_order_of(&last, &after, &mut rows);
+        assert_eq!(titles_of(&after, &rows), ["b", "c", "new"]);
     }
 
     #[test]
@@ -1027,5 +1305,115 @@ mod tests {
     fn replacing_ignores_case_and_takes_every_occurrence() {
         assert_eq!(replace_ignoring_case("/Old/a/old/b", "/old", "/new"), "/new/a/new/b");
         assert_eq!(replace_ignoring_case("abc", "", "x"), "abc");
+    }
+
+    /// An app over a fresh fixture library, as the window drives it, and the
+    /// folder the fixture lives in.
+    fn app_over_fixture() -> (tempfile::TempDir, tauri::App<tauri::test::MockRuntime>) {
+        let dir = tempfile::tempdir().unwrap();
+        let location = rbl_db::fixture::build(dir.path(), rbl_db::fixture::Shape::default()).unwrap();
+        let db = rbl_db::Library::open(location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
+        let (library, _) = rbl_index::load(&db).unwrap();
+        let state = Arc::new(AppState::with_backups(dir.path().join("backups")));
+        state.set_library(library, false, db.schema().db_version, 0, location);
+        crate::backups::create(&state).unwrap();
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        (dir, app)
+    }
+
+    fn run<T>(future: impl std::future::Future<Output = T>) -> T {
+        tauri::async_runtime::block_on(future)
+    }
+
+    /// `FolderPath`, `FileNameL` and `rb_file_id` as stored.
+    fn link_of(app: &tauri::App<tauri::test::MockRuntime>, id: &str) -> (Option<String>, Option<String>, Option<String>) {
+        app.state::<Arc<AppState>>()
+            .read_db(|db| {
+                Ok(db.connection().query_row(
+                    "SELECT FolderPath, FileNameL, rb_file_id FROM djmdContent WHERE ID = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?)
+            })
+            .unwrap()
+    }
+
+    fn undo_label(app: &tauri::App<tauri::test::MockRuntime>) -> Option<String> {
+        crate::commands::current_history(&app.state::<Arc<AppState>>()).undo_label
+    }
+
+    /// #502: a Relocate by location over two tracks is one "Relocate" entry;
+    /// Undo puts both links back (the old files are still missing), Redo
+    /// the run's, and the index the lists read follows.
+    #[test]
+    fn a_relocate_by_location_is_one_undo_for_every_track_it_found() {
+        let (dir, app) = app_over_fixture();
+        let state = || app.state::<Arc<AppState>>();
+        let moved = dir.path().join("moved");
+        let tracks: Vec<String> = (1..=2).map(rbl_db::fixture::track_id).collect();
+        for at in 1..=2 {
+            touch(&moved.join(format!("track{at:03}.mp3")));
+        }
+        let before: Vec<_> = tracks.iter().map(|t| link_of(&app, t)).collect();
+        run(crate::commands::rename_playlist(app.handle().clone(), state(), rbl_db::fixture::playlist_id(0), "Earlier 502".into())).unwrap();
+
+        let found = run(relocate_by_location(
+            app.handle().clone(),
+            state(),
+            tracks.clone(),
+            "/fixture/audio".into(),
+            moved.to_string_lossy().into_owned(),
+        ))
+        .unwrap();
+        assert_eq!(found, 2);
+        let after: Vec<_> = tracks.iter().map(|t| link_of(&app, t)).collect();
+        assert_ne!(after, before);
+        assert_eq!(undo_label(&app).as_deref(), Some("Relocate"));
+
+        let undone = run(crate::commands::undo_edit(app.handle().clone(), state())).unwrap();
+        assert_eq!(tracks.iter().map(|t| link_of(&app, t)).collect::<Vec<_>>(), before, "both tracks in one step");
+        assert_eq!(undone.undo_label.as_deref(), Some("Rename Playlist"), "the earlier entry stays below it");
+        assert_eq!(undone.redo_label.as_deref(), Some("Relocate"));
+        let library = state().library().unwrap();
+        let row = library.row_of(&tracks[0]).unwrap();
+        assert!(is_missing(library.folder_path.get(row as usize)), "missing again, to relocate anew");
+
+        run(crate::commands::redo_edit(app.handle().clone(), state())).unwrap();
+        assert_eq!(tracks.iter().map(|t| link_of(&app, t)).collect::<Vec<_>>(), after);
+        let library = state().library().unwrap();
+        let row = library.row_of(&tracks[1]).unwrap();
+        assert!(!is_missing(library.folder_path.get(row as usize)));
+    }
+
+    /// #502: an Auto Relocate run is one "Relocate" entry too, and a run
+    /// that found nothing records nothing.
+    #[test]
+    fn an_auto_relocate_run_is_one_undo() {
+        let (dir, app) = app_over_fixture();
+        let state = || app.state::<Arc<AppState>>();
+        let search = dir.path().join("search");
+        std::fs::create_dir_all(&search).unwrap();
+        let only = |folders: Vec<String>| RelocateSearch { folders, music: false, video: false, desktop: false };
+        let tracks: Vec<String> = (3..=5).map(rbl_db::fixture::track_id).collect();
+
+        let report = run(auto_relocate(app.handle().clone(), state(), only(vec![search.to_string_lossy().into_owned()]), Some(tracks.clone()))).unwrap();
+        assert_eq!(report.relocated, 0);
+        assert_eq!(undo_label(&app), None, "nothing found, nothing recorded");
+
+        touch(&search.join("a/track003.mp3"));
+        touch(&search.join("b/track004.mp3"));
+        let before: Vec<_> = tracks.iter().map(|t| link_of(&app, t)).collect();
+        let report = run(auto_relocate(app.handle().clone(), state(), only(vec![search.to_string_lossy().into_owned()]), Some(tracks.clone()))).unwrap();
+        assert_eq!((report.relocated, report.unresolved), (2, 1));
+        let after: Vec<_> = tracks.iter().map(|t| link_of(&app, t)).collect();
+        assert_eq!(after[2], before[2], "the track not found is untouched");
+        assert_eq!(after[0].2, Some(rbl_db::file_id::column(&search.join("a/track003.mp3"))), "the file number follows the file");
+
+        let undone = run(crate::commands::undo_edit(app.handle().clone(), state())).unwrap();
+        assert!(!undone.can_undo, "one entry for the whole run");
+        assert_eq!(tracks.iter().map(|t| link_of(&app, t)).collect::<Vec<_>>(), before);
+        run(crate::commands::redo_edit(app.handle().clone(), state())).unwrap();
+        assert_eq!(tracks.iter().map(|t| link_of(&app, t)).collect::<Vec<_>>(), after);
     }
 }

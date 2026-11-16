@@ -650,6 +650,7 @@ fn add_tracks(app: &AppHandle, state: &AppState, id: &str, body: &[u8], allow_wr
         playlist_id,
         to_add,
         Some(allow_duplicates),
+        None,
     )) {
         Ok(generation) => {
             tracing::info!(playlist = id, added, "local API added tracks to a playlist");

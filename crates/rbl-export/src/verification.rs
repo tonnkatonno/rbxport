@@ -269,8 +269,21 @@ fn verify_assets(
             report.missing_audio.push(track.path.clone());
         }
         if !track.analysis.is_empty() {
-            let expected = format!("{}/ANLZ0000.DAT", crate::analysis_directory(&track.path, crate::export_root_name(root)?));
-            if track.analysis != expected {
+            let directory = crate::analysis_directory(&track.path, crate::export_root_name(root)?);
+            let expected = format!("{directory}/ANLZ0000.DAT");
+            // Or the slot rekordbox gave a track whose directory another
+            // track already had (`crate::anlz_slot`): its `PPTH`, checked
+            // below, is how a player tells the two apart. Any `ANLZnnnn` is
+            // accepted although the players read only `ANLZ0000` to
+            // `ANLZ0010` [OBS static: XDJ-R1 native reader]: whether
+            // rekordbox ever writes a slot above 0010 is [UNKNOWN] (a stick
+            // with eleven tracks hashing to one directory would settle it),
+            // and refusing one would fail every sync to a stick rekordbox
+            // wrote that way, while this export never writes a slot itself.
+            let in_slot = track.analysis.strip_prefix(directory.as_str()).and_then(|rest| rest.strip_prefix('/'))
+                .and_then(|name| name.strip_suffix(".DAT"))
+                .is_some_and(crate::anlz_slot);
+            if track.analysis != expected && !in_slot {
                 report.errors.push(format!("Analysis path is not discoverable by the CDJ: {} (expected {expected})", track.analysis));
             }
             let base = Path::new(&track.analysis);
