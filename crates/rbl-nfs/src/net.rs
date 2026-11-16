@@ -22,6 +22,56 @@ const DATAGRAM: usize = 65_535;
 /// `SO_SNDBUF` and `SO_RCVBUF`. The OS may clamp or account for these differently.
 const SOCKET_BUFFER: usize = 0x10000;
 
+/// A call that takes this long to answer is logged by name (fork diagnostics).
+const SLOW_CALL: Duration = Duration::from_millis(20);
+
+/// Replies larger than this (more than one Ethernet frame) go twice to a lossy peer.
+const DUPLICATE_ABOVE: usize = 1400;
+/// How long a peer counts as lossy after it last repeated a call.
+const LOSSY_FOR: Duration = Duration::from_secs(120);
+/// How many recent call xids are remembered per peer to spot a repeat.
+const RECENT_XIDS: usize = 64;
+
+/// Peers that repeated a call recently (fork): the player resends a call only when no reply reached it.
+#[derive(Default)]
+struct LossyPeers {
+    recent: std::collections::HashMap<std::net::Ipv4Addr, std::collections::VecDeque<u32>>,
+    until: std::collections::HashMap<std::net::Ipv4Addr, std::time::Instant>,
+}
+
+impl LossyPeers {
+    /// Records a call; true while `peer` counts as lossy (this call being a repeat makes it so).
+    fn note(&mut self, peer: std::net::Ipv4Addr, datagram: &[u8], now: std::time::Instant) -> bool {
+        // Only calls (message type 0) carry a fresh xid worth remembering.
+        if let (Some(x), Some([0, 0, 0, 0])) = (datagram.get(..4), datagram.get(4..8)) {
+            let xid = u32::from_be_bytes([x[0], x[1], x[2], x[3]]);
+            let recent = self.recent.entry(peer).or_default();
+            if recent.contains(&xid) {
+                let was = self.until.get(&peer).is_some_and(|t| *t > now);
+                self.until.insert(peer, now + LOSSY_FOR);
+                if !was {
+                    tracing::info!(%peer, xid, "a player repeated a call; its large replies go twice for a while");
+                }
+            } else {
+                if recent.len() == RECENT_XIDS {
+                    recent.pop_front();
+                }
+                recent.push_back(xid);
+            }
+        }
+        self.until.get(&peer).is_some_and(|t| *t > now)
+    }
+}
+
+/// `nfs READ xid=…` for a log line, from the call's RPC header.
+fn rpc_label(datagram: &[u8]) -> String {
+    let word = |at: usize| datagram.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    match (word(0), word(12), word(20)) {
+        (Some(xid), Some(program), Some(procedure)) => format!("{} xid={xid}", crate::call_name(program, procedure)),
+        _ => "unreadable".to_owned(),
+    }
+}
+
 /// How long a socket blocks before checking whether it has been asked to stop.
 const POLL: Duration = Duration::from_millis(100);
 
@@ -38,6 +88,8 @@ pub fn serve(server: &Arc<Server>, socket: &UdpSocket, stop: &Arc<AtomicBool>) -
     socket_ref.set_recv_buffer_size(SOCKET_BUFFER)?;
     socket_ref.set_send_buffer_size(SOCKET_BUFFER)?;
     let mut buffer = vec![0_u8; DATAGRAM];
+    let duplicate = std::env::var("RBXPORT_NFS_DUPLICATE").map_or(true, |v| v.trim() != "0");
+    let mut lossy_peers = LossyPeers::default();
     while !stop.load(Ordering::Relaxed) {
         let (len, from) = match socket.recv_from(&mut buffer) {
             Ok(received) => received,
@@ -55,17 +107,34 @@ pub fn serve(server: &Arc<Server>, socket: &UdpSocket, stop: &Arc<AtomicBool>) -
             SocketAddr::V4(v4) => *v4.ip(),
             SocketAddr::V6(v6) => v6.ip().to_ipv4_mapped().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
         };
+        let received = std::time::Instant::now();
+        let lossy = duplicate && lossy_peers.note(peer, buffer.get(..len).unwrap_or(&[]), received);
         let Some(reply) = server.handle_on(buffer.get(..len).unwrap_or(&[]), peer, from.port(), socket_id) else {
             continue;
         };
+        let handled = received.elapsed();
         let started = std::time::Instant::now();
+        let call = rpc_label(buffer.get(..len).unwrap_or(&[]));
         match socket.send_to(&reply, from) {
-            Ok(sent) => tracing::trace!(
-                %from,
-                sent,
-                elapsed_us = started.elapsed().as_micros(),
-                "RPC reply sent"
-            ),
+            Ok(sent) => {
+                let sending = started.elapsed();
+                // Fork diagnostics: one thread serves every player on this socket, so a single slow call holds all
+                // of them up; a CDJ-2000NXS2 then stops playing or reboots [OBS 2026-11-15]. Name each slow one.
+                if handled + sending >= SLOW_CALL {
+                    tracing::warn!(%from, call = %call, sent, handle_ms = handled.as_millis(), send_ms = sending.as_millis(), "slow RPC call");
+                }
+                tracing::trace!(%from, sent, elapsed_us = sending.as_micros(), "RPC reply sent");
+                // Fork: a peer that has had to repeat a call lately is on a line that drops datagrams; a large reply
+                // goes out as a dozen IP fragments and is lost with any one of them, and the player then waits a
+                // whole second before asking again. A second copy makes a loss need both copies to go [OBS
+                // 2026-11-16, CDJ-2000NXS2 on a bad cable: 1.5-19% of replies repeated, load never finished]. The
+                // player drops the copy it does not need by its xid, as it drops a late reply to a repeated call.
+                if lossy && reply.len() > DUPLICATE_ABOVE {
+                    if let Err(error) = socket.send_to(&reply, from) {
+                        tracing::debug!(%from, %error, "second copy of a reply not sent");
+                    }
+                }
+            }
             Err(error) => {
                 tracing::warn!(%from, %error, len = reply.len(), "could not send an RPC reply");
             }
@@ -219,4 +288,33 @@ fn bind_rpc(address: IpAddr, port: u16) -> io::Result<UdpSocket> {
     }
     #[cfg(not(target_vendor = "apple"))]
     UdpSocket::bind(SocketAddr::new(address, port))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn call(xid: u32) -> Vec<u8> {
+        let mut d = xid.to_be_bytes().to_vec();
+        d.extend([0_u8; 20]);
+        d
+    }
+
+    #[test]
+    fn a_peer_turns_lossy_when_it_repeats_a_call_and_recovers_after_a_while() {
+        let mut peers = LossyPeers::default();
+        let a = std::net::Ipv4Addr::new(192, 168, 8, 150);
+        let b = std::net::Ipv4Addr::new(192, 168, 8, 244);
+        let t = std::time::Instant::now();
+        assert!(!peers.note(a, &call(1), t));
+        assert!(!peers.note(a, &call(2), t));
+        assert!(peers.note(a, &call(2), t), "the repeat of xid 2 marks the peer lossy");
+        assert!(peers.note(a, &call(3), t + Duration::from_secs(60)));
+        assert!(!peers.note(a, &call(4), t + LOSSY_FOR + Duration::from_secs(1)), "and it wears off");
+        assert!(!peers.note(b, &call(2), t), "another peer's xid 2 is its own");
+        let mut reply = call(9);
+        reply[7] = 1;                    // a reply (message type 1) is never a repeated call
+        assert!(!peers.note(b, &reply, t) && !peers.note(b, &reply, t));
+    }
 }
